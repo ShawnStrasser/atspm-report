@@ -16,11 +16,11 @@ def main(use_parquet=True, connection_params=None):
     
     # Get data
     print("Reading data...")
-    maxout_df, actuations_df = get_data(use_parquet, connection_params)
-    if maxout_df is None or actuations_df is None:
+    maxout_df, actuations_df, signals_df = get_data(use_parquet, connection_params)
+    if maxout_df is None or actuations_df is None or signals_df is None:
         print("Failed to get data")
         return
-    print(f"Successfully read data. MaxOut shape: {maxout_df.shape}, Actuations shape: {actuations_df.shape}")
+    print(f"Successfully read data. MaxOut shape: {maxout_df.shape}, Actuations shape: {actuations_df.shape}, Signals shape: {signals_df.shape}")
 
     # Process max out data
     print("Processing max out data...")
@@ -45,19 +45,21 @@ def main(use_parquet=True, connection_params=None):
 
     # Create plots
     print("Creating visualization plots...")
-    phase_figures = create_device_plots(filtered_df)
-    detector_figures = create_device_plots(filtered_df_actuations)
+    phase_figures = create_device_plots(filtered_df, signals_df)
+    detector_figures = create_device_plots(filtered_df_actuations, signals_df)
     print("Plots created successfully")
 
-    # Generate PDF report
-    print("Generating PDF report...")
-    pdf_path = generate_pdf_report(
+    # Generate PDF reports for each region
+    print("Generating PDF reports...")
+    pdf_paths = generate_pdf_report(
         filtered_df=filtered_df,
         filtered_df_actuations=filtered_df_actuations,
         phase_figures=phase_figures,
         detector_figures=detector_figures
     )
-    print(f"PDF report generated at: {pdf_path}")
+    print(f"Generated {len(pdf_paths)} PDF reports:")
+    for path in pdf_paths:
+        print(f"- {path}")
 
 
 if __name__ == "__main__":
@@ -67,11 +69,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error running script: {e}")
         raise  # Re-raise the exception to see the full traceback
-
-    # Example usage with database connection
-    # connection_params = {
-    #     'server': 'kinsigsynapseprod-ondemand.sql.azuresynapse.net',
-    #     'database': 'PerformanceMetrics',
-    #     'username': 'user@domain.gov'
-    # }
-    # main(use_parquet=False, connection_params=connection_params)
