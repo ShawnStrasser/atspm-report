@@ -10,7 +10,12 @@ from io import BytesIO
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
-from typing import List
+from typing import List, Tuple, Union
+from table_generation import (
+    prepare_phase_termination_alerts_table,
+    prepare_detector_health_alerts_table,
+    create_reportlab_table
+)
 
 
 class PageNumCanvas(canvas.Canvas):
@@ -173,11 +178,29 @@ def generate_pdf_report(
         filtered_df_actuations: pd.DataFrame,
         phase_figures: List[tuple[plt.Figure, str]],
         detector_figures: List[tuple[plt.Figure, str]],
-        output_path: str = "ATSPM_Report_{region}.pdf") -> List[str]:
-    """Generate PDF reports for each region with the plots."""
+        signals_df: pd.DataFrame = None,
+        output_path: str = "ATSPM_Report_{region}.pdf",
+        save_to_disk: bool = True) -> Union[List[str], Tuple[List[BytesIO], List[str]]]:
+    """Generate PDF reports for each region with the plots.
+    
+    Args:
+        filtered_df: DataFrame with phase termination alerts
+        filtered_df_actuations: DataFrame with detector health alerts
+        phase_figures: List of (figure, region) tuples for phase termination
+        detector_figures: List of (figure, region) tuples for detector health
+        signals_df: DataFrame with signal information
+        output_path: Path template for saving reports
+        save_to_disk: If True, save reports to disk, otherwise return BytesIO objects
+        
+    Returns:
+        If save_to_disk is True: List of file paths where reports were saved
+        If save_to_disk is False: Tuple of (List of BytesIO objects, List of region names)
+    """
     # Get unique regions
     regions = set(region for _, region in phase_figures + detector_figures)
     generated_paths = []
+    buffer_objects = []
+    region_names = []
 
     for region in regions:
         # Filter figures for this region
@@ -202,16 +225,29 @@ def generate_pdf_report(
             )
             return canvas
 
-        doc = SimpleDocTemplate(
-            region_path,
-            pagesize=letter,
-            leftMargin=0.5*inch,
-            rightMargin=0.5*inch,
-            topMargin=1*inch,
-            bottomMargin=0.5*inch
-        )
+        # Determine if we're writing to disk or memory
+        if save_to_disk:
+            doc = SimpleDocTemplate(
+                region_path,
+                pagesize=letter,
+                leftMargin=0.5*inch,
+                rightMargin=0.5*inch,
+                topMargin=1*inch,
+                bottomMargin=0.5*inch
+            )
+        else:
+            # Create a BytesIO buffer for this report
+            buffer = BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                leftMargin=0.5*inch,
+                rightMargin=0.5*inch,
+                topMargin=1*inch,
+                bottomMargin=0.5*inch
+            )
 
-        # ... existing content building code ...
+        # Content building
         content = []
 
         # Add report title and date
@@ -225,6 +261,14 @@ def generate_pdf_report(
             parent=styles['Heading2'],
             fontSize=14,
             spaceAfter=8,
+            textColor=colors.navy
+        ))
+        
+        styles.add(ParagraphStyle(
+            name='SubsectionHeading',
+            parent=styles['Heading3'],
+            fontSize=12,
+            spaceAfter=6,
             textColor=colors.navy
         ))
 
@@ -242,12 +286,33 @@ def generate_pdf_report(
             content.append(Paragraph("1. Phase Termination Analysis", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
-            explanation = """The following charts display phase termination patterns that have been flagged as anomalous. 
-            Points marked with dots indicate periods where the system detected unusual max-out or force-off behavior."""
+            explanation = """The following tables and charts display phase termination patterns that have been flagged as anomalous. 
+            Points marked with dots in the charts indicate periods where the system detected unusual max-out or force-off behavior."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
-
-            # Add phase termination plots
+            
+            # Add phase termination alerts table
+            content.append(Paragraph("1.1 Phase Termination Alerts", styles['SubsectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            
+            # Filter signals for this region
+            region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
+            
+            if region_signals_df is not None:
+                # Create phase termination table
+                phase_alerts_df = prepare_phase_termination_alerts_table(filtered_df, region_signals_df)
+                table_content = create_reportlab_table(
+                    phase_alerts_df, 
+                    "Phase Termination Alerts", 
+                    styles
+                )
+                content.extend(table_content)
+                content.append(Spacer(1, 0.3*inch))
+            
+            # Add phase termination charts
+            content.append(Paragraph("1.2 Phase Termination Charts", styles['SubsectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            
             for fig in region_phase_figures:
                 content.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
                 content.append(Spacer(1, 0.15*inch))
@@ -258,12 +323,33 @@ def generate_pdf_report(
             content.append(Paragraph("2. Detector Health Analysis", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
-            explanation = """The following charts display detector health metrics that have been flagged as anomalous. 
-            Points marked with dots indicate periods where the system detected unusual detector behavior."""
+            explanation = """The following tables and charts display detector health metrics that have been flagged as anomalous. 
+            Points marked with dots in the charts indicate periods where the system detected unusual detector behavior."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
-
-            # Add detector health plots
+            
+            # Add detector health alerts table
+            content.append(Paragraph("2.1 Detector Health Alerts", styles['SubsectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            
+            # Filter signals for this region
+            region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
+            
+            if region_signals_df is not None:
+                # Create detector health table
+                detector_alerts_df = prepare_detector_health_alerts_table(filtered_df_actuations, region_signals_df)
+                table_content = create_reportlab_table(
+                    detector_alerts_df, 
+                    "Detector Health Alerts", 
+                    styles
+                )
+                content.extend(table_content)
+                content.append(Spacer(1, 0.3*inch))
+            
+            # Add detector health charts
+            content.append(Paragraph("2.2 Detector Health Charts", styles['SubsectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            
             for fig in region_detector_figures:
                 content.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
                 content.append(Spacer(1, 0.15*inch))
@@ -275,6 +361,13 @@ def generate_pdf_report(
                  onLaterPages=header_footer.laterPages,
                  canvasmaker=make_canvas)
         
-        generated_paths.append(region_path)
+        if save_to_disk:
+            generated_paths.append(region_path)
+        else:
+            buffer_objects.append(buffer)
+            region_names.append(region)
 
-    return generated_paths
+    if save_to_disk:
+        return generated_paths
+    else:
+        return buffer_objects, region_names

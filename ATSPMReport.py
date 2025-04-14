@@ -1,4 +1,5 @@
 from datetime import datetime
+import argparse
 from data_access import get_data
 from data_processing import (
     process_maxout_data,
@@ -8,10 +9,17 @@ from data_processing import (
 )
 from visualization import create_device_plots
 from report_generation import generate_pdf_report
+from email_module import email_reports
 
 
-def main(use_parquet=True, connection_params=None):
-    """Main function to run the signal analysis and generate report"""
+def main(use_parquet=True, connection_params=None, num_figures=1, email_reports_flag=False):
+    """Main function to run the signal analysis and generate report
+    Args:
+        use_parquet (bool): If True, read from parquet files, otherwise query database
+        connection_params (dict): Database connection parameters if use_parquet is False
+        num_figures (int): Number of figures to generate for each device
+        email_reports_flag (bool): If True, email reports instead of saving to disk
+    """
     print("Starting signal analysis...")
     
     # Get data
@@ -45,27 +53,71 @@ def main(use_parquet=True, connection_params=None):
 
     # Create plots
     print("Creating visualization plots...")
-    phase_figures = create_device_plots(filtered_df, signals_df)
-    detector_figures = create_device_plots(filtered_df_actuations, signals_df)
+    phase_figures = create_device_plots(filtered_df, signals_df, num_figures)
+    detector_figures = create_device_plots(filtered_df_actuations, signals_df, num_figures)
     print("Plots created successfully")
 
     # Generate PDF reports for each region
     print("Generating PDF reports...")
-    pdf_paths = generate_pdf_report(
-        filtered_df=filtered_df,
-        filtered_df_actuations=filtered_df_actuations,
-        phase_figures=phase_figures,
-        detector_figures=detector_figures
-    )
-    print(f"Generated {len(pdf_paths)} PDF reports:")
-    for path in pdf_paths:
-        print(f"- {path}")
+    
+    if email_reports_flag:
+        # Generate reports in memory and email them
+        print("Generating reports for email delivery...")
+        report_buffers, region_names = generate_pdf_report(
+            filtered_df=filtered_df,
+            filtered_df_actuations=filtered_df_actuations,
+            phase_figures=phase_figures,
+            detector_figures=detector_figures,
+            signals_df=signals_df,
+            save_to_disk=False
+        )
+        
+        # Email the reports
+        print("Emailing reports...")
+        success = email_reports(
+            region_reports=report_buffers,
+            regions=region_names,
+            report_in_memory=True
+        )
+        
+        if success:
+            print("All reports were successfully emailed.")
+        else:
+            print("There were issues emailing some reports. Check the logs above for details.")
+    else:
+        # Generate and save PDF reports to disk
+        pdf_paths = generate_pdf_report(
+            filtered_df=filtered_df,
+            filtered_df_actuations=filtered_df_actuations,
+            phase_figures=phase_figures,
+            detector_figures=detector_figures,
+            signals_df=signals_df,
+            save_to_disk=True
+        )
+        print(f"Generated {len(pdf_paths)} PDF reports:")
+        for path in pdf_paths:
+            print(f"- {path}")
 
 
 if __name__ == "__main__":
     try:
-        # Example usage with parquet files (default)
-        main()
+        # Set up argument parser
+        parser = argparse.ArgumentParser(description='ATSPM Report Generator')
+        parser.add_argument('--email', action='store_true', 
+                           help='Email reports instead of saving them to disk')
+        parser.add_argument('--figures', type=int, default=1,
+                           help='Number of figures to generate per device (default: 1)')
+        parser.add_argument('--use-database', action='store_true',
+                           help='Query database instead of using parquet files')
+        
+        args = parser.parse_args()
+        
+        # Example usage with command line arguments
+        main(
+            use_parquet=not args.use_database,
+            num_figures=args.figures,
+            email_reports_flag=args.email
+        )
     except Exception as e:
         print(f"Error running script: {e}")
         raise  # Re-raise the exception to see the full traceback
