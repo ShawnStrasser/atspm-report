@@ -14,6 +14,7 @@ from typing import List, Tuple, Union
 from table_generation import (
     prepare_phase_termination_alerts_table,
     prepare_detector_health_alerts_table,
+    prepare_missing_data_alerts_table,
     create_reportlab_table
 )
 
@@ -176,28 +177,34 @@ def draw_page_footer(canvas, page_num, num_pages, region=None):
 def generate_pdf_report(
         filtered_df: pd.DataFrame, 
         filtered_df_actuations: pd.DataFrame,
+        filtered_df_missing_data: pd.DataFrame,
         phase_figures: List[tuple[plt.Figure, str]],
         detector_figures: List[tuple[plt.Figure, str]],
+        missing_data_figures: List[tuple[plt.Figure, str]],
         signals_df: pd.DataFrame = None,
         output_path: str = "ATSPM_Report_{region}.pdf",
-        save_to_disk: bool = True) -> Union[List[str], Tuple[List[BytesIO], List[str]]]:
+        save_to_disk: bool = True,
+        max_table_rows: int = 10) -> Union[List[str], Tuple[List[BytesIO], List[str]]]:
     """Generate PDF reports for each region with the plots.
     
     Args:
         filtered_df: DataFrame with phase termination alerts
         filtered_df_actuations: DataFrame with detector health alerts
+        filtered_df_missing_data: DataFrame with missing data alerts
         phase_figures: List of (figure, region) tuples for phase termination
         detector_figures: List of (figure, region) tuples for detector health
+        missing_data_figures: List of (figure, region) tuples for missing data
         signals_df: DataFrame with signal information
         output_path: Path template for saving reports
         save_to_disk: If True, save reports to disk, otherwise return BytesIO objects
+        max_table_rows: Maximum number of rows to show in each alert table
         
     Returns:
         If save_to_disk is True: List of file paths where reports were saved
         If save_to_disk is False: Tuple of (List of BytesIO objects, List of region names)
     """
     # Get unique regions
-    regions = set(region for _, region in phase_figures + detector_figures)
+    regions = set(region for _, region in phase_figures + detector_figures + missing_data_figures)
     generated_paths = []
     buffer_objects = []
     region_names = []
@@ -206,6 +213,7 @@ def generate_pdf_report(
         # Filter figures for this region
         region_phase_figures = [fig for fig, reg in phase_figures if reg == region]
         region_detector_figures = [fig for fig, reg in detector_figures if reg == region]
+        region_missing_data_figures = [fig for fig, reg in missing_data_figures if reg == region]
         
         # Create the document
         region_path = output_path.format(region=region.replace(" ", "_"))
@@ -276,7 +284,7 @@ def generate_pdf_report(
         content.append(Spacer(1, 0.1*inch))
 
         # Introduction text
-        intro_text = f"""This report provides insights into traffic signal performance metrics and detector health for {region}. 
+        intro_text = f"""This report provides insights into traffic signal performance metrics, detector health, and data completeness for {region}. 
         The analysis highlights potential issues requiring attention based on statistical anomalies."""
         content.append(Paragraph(intro_text, styles['Normal']))
         content.append(Spacer(1, 0.2*inch))
@@ -299,12 +307,19 @@ def generate_pdf_report(
             region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
             
             if region_signals_df is not None:
-                # Create phase termination table
-                phase_alerts_df = prepare_phase_termination_alerts_table(filtered_df, region_signals_df)
+                # Create phase termination table with row limit
+                phase_alerts_df, total_phase_alerts = prepare_phase_termination_alerts_table(
+                    filtered_df, 
+                    region_signals_df,
+                    max_rows=max_table_rows
+                )
+                
                 table_content = create_reportlab_table(
                     phase_alerts_df, 
                     "Phase Termination Alerts", 
-                    styles
+                    styles,
+                    total_count=total_phase_alerts,
+                    max_rows=max_table_rows
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
@@ -336,12 +351,19 @@ def generate_pdf_report(
             region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
             
             if region_signals_df is not None:
-                # Create detector health table
-                detector_alerts_df = prepare_detector_health_alerts_table(filtered_df_actuations, region_signals_df)
+                # Create detector health table with row limit
+                detector_alerts_df, total_detector_alerts = prepare_detector_health_alerts_table(
+                    filtered_df_actuations, 
+                    region_signals_df,
+                    max_rows=max_table_rows
+                )
+                
                 table_content = create_reportlab_table(
                     detector_alerts_df, 
                     "Detector Health Alerts", 
-                    styles
+                    styles,
+                    total_count=total_detector_alerts,
+                    max_rows=max_table_rows
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
@@ -351,6 +373,51 @@ def generate_pdf_report(
             content.append(Spacer(1, 0.1*inch))
             
             for fig in region_detector_figures:
+                content.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                content.append(Spacer(1, 0.15*inch))
+                plt.close(fig)
+
+        # Section 3: Missing Data Analysis
+        if len(filtered_df_missing_data) > 0 and region_missing_data_figures:
+            content.append(Paragraph("3. Missing Data Analysis", styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+
+            explanation = """The following tables and charts display missing data patterns that have been flagged as anomalous. 
+            Higher values indicate a greater percentage of missing data. Points marked with dots in the charts indicate periods 
+            where the system detected significant data loss which may affect signal operation analysis."""
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+            
+            # Add missing data alerts table
+            content.append(Paragraph("3.1 Missing Data Alerts", styles['SubsectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            
+            # Filter signals for this region
+            region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
+            
+            if region_signals_df is not None:
+                # Create missing data table with row limit - each signal appears only once with its worst day
+                missing_data_alerts_df, total_missing_data_alerts = prepare_missing_data_alerts_table(
+                    filtered_df_missing_data, 
+                    region_signals_df,
+                    max_rows=max_table_rows
+                )
+                
+                table_content = create_reportlab_table(
+                    missing_data_alerts_df, 
+                    "Missing Data Alerts", 
+                    styles,
+                    total_count=total_missing_data_alerts,
+                    max_rows=max_table_rows
+                )
+                content.extend(table_content)
+                content.append(Spacer(1, 0.3*inch))
+            
+            # Add missing data charts
+            content.append(Paragraph("3.2 Missing Data Charts", styles['SubsectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            
+            for fig in region_missing_data_figures:
                 content.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
                 content.append(Spacer(1, 0.15*inch))
                 plt.close(fig)

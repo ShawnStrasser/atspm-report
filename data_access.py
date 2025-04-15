@@ -16,7 +16,7 @@ def get_database_connection(server: str, database: str, username: str) -> sa.eng
     )
     return sa.create_engine(connection_url)
 
-def get_data(use_parquet: bool = True, connection_params: dict = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def get_data(use_parquet: bool = True, connection_params: dict = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Get data either from parquet files or database
     
@@ -26,17 +26,18 @@ def get_data(use_parquet: bool = True, connection_params: dict = None) -> tuple[
             Required keys: server, database, username
             
     Returns:
-        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: (maxout_df, actuations_df, signals_df)
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]: (maxout_df, actuations_df, signals_df, has_data_df)
     """
     if use_parquet:
         try:
             maxout_df = pd.read_parquet('MaxOut.parquet')
             actuations_df = pd.read_parquet('Actuations.parquet')
             signals_df = pd.read_parquet('signals.parquet')
-            return maxout_df, actuations_df, signals_df
+            has_data_df = pd.read_parquet('has_data.parquet')
+            return maxout_df, actuations_df, signals_df, has_data_df
         except Exception as e:
             print(f"Error reading parquet files: {e}")
-            return None, None, None
+            return None, None, None, None
     else:
         if not connection_params:
             raise ValueError("Database connection parameters required when use_parquet is False")
@@ -69,4 +70,11 @@ def get_data(use_parquet: bool = True, connection_params: dict = None) -> tuple[
         signals_query = "SELECT * FROM signals"
         signals_df = pd.read_sql(signals_query, engine)
         
-        return maxout_df, actuations_df, signals_df
+        # Query has_data for missing data analysis
+        has_data_query = f"""
+        SELECT * FROM has_data
+        WHERE TimeStamp >= '{three_weeks_ago}'
+        """
+        has_data_df = pd.read_sql(has_data_query, engine)
+        
+        return maxout_df, actuations_df, signals_df, has_data_df

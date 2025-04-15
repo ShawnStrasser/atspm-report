@@ -4,6 +4,7 @@ from data_access import get_data
 from data_processing import (
     process_maxout_data,
     process_actuations_data,
+    process_missing_data,
     cusum,
     alert
 )
@@ -24,11 +25,11 @@ def main(use_parquet=True, connection_params=None, num_figures=1, email_reports_
     
     # Get data
     print("Reading data...")
-    maxout_df, actuations_df, signals_df = get_data(use_parquet, connection_params)
-    if maxout_df is None or actuations_df is None or signals_df is None:
+    maxout_df, actuations_df, signals_df, has_data_df = get_data(use_parquet, connection_params)
+    if maxout_df is None or actuations_df is None or signals_df is None or has_data_df is None:
         print("Failed to get data")
         return
-    print(f"Successfully read data. MaxOut shape: {maxout_df.shape}, Actuations shape: {actuations_df.shape}, Signals shape: {signals_df.shape}")
+    print(f"Successfully read data. MaxOut shape: {maxout_df.shape}, Actuations shape: {actuations_df.shape}, Signals shape: {signals_df.shape}, Has Data shape: {has_data_df.shape}")
 
     # Process max out data
     print("Processing max out data...")
@@ -39,22 +40,30 @@ def main(use_parquet=True, connection_params=None, num_figures=1, email_reports_
     print("Processing actuations data...")
     detector_health = process_actuations_data(actuations_df)
     print(f"Processed actuations data. Shape: {detector_health.shape}")
+    
+    # Process missing data
+    print("Processing missing data...")
+    missing_data = process_missing_data(has_data_df)
+    print(f"Processed missing data. Shape: {missing_data.shape}")
 
     # Calculate CUSUM and generate alerts
     print("Calculating CUSUM statistics...")
     t = cusum(df2, k_value=1)
     t_actuations = cusum(detector_health, k_value=1)
+    t_missing_data = cusum(missing_data, k_value=1)
     print("CUSUM calculation complete")
 
     print("Generating alerts...")
     filtered_df = alert(t).execute()
     filtered_df_actuations = alert(t_actuations).execute()
-    print(f"Alert generation complete. Found {len(filtered_df)} phase alerts and {len(filtered_df_actuations)} detector alerts")
+    filtered_df_missing_data = alert(t_missing_data).execute()
+    print(f"Alert generation complete. Found {len(filtered_df)} phase alerts, {len(filtered_df_actuations)} detector alerts, and {len(filtered_df_missing_data)} missing data alerts")
 
     # Create plots
     print("Creating visualization plots...")
     phase_figures = create_device_plots(filtered_df, signals_df, num_figures)
     detector_figures = create_device_plots(filtered_df_actuations, signals_df, num_figures)
+    missing_data_figures = create_device_plots(filtered_df_missing_data, signals_df, num_figures)
     print("Plots created successfully")
 
     # Generate PDF reports for each region
@@ -66,8 +75,10 @@ def main(use_parquet=True, connection_params=None, num_figures=1, email_reports_
         report_buffers, region_names = generate_pdf_report(
             filtered_df=filtered_df,
             filtered_df_actuations=filtered_df_actuations,
+            filtered_df_missing_data=filtered_df_missing_data,
             phase_figures=phase_figures,
             detector_figures=detector_figures,
+            missing_data_figures=missing_data_figures,
             signals_df=signals_df,
             save_to_disk=False
         )
@@ -89,8 +100,10 @@ def main(use_parquet=True, connection_params=None, num_figures=1, email_reports_
         pdf_paths = generate_pdf_report(
             filtered_df=filtered_df,
             filtered_df_actuations=filtered_df_actuations,
+            filtered_df_missing_data=filtered_df_missing_data,
             phase_figures=phase_figures,
             detector_figures=detector_figures,
+            missing_data_figures=missing_data_figures,
             signals_df=signals_df,
             save_to_disk=True
         )

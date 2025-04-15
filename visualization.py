@@ -6,22 +6,31 @@ def create_device_plots(df: 'pd.DataFrame', signals_df: 'pd.DataFrame', num_figu
     """Generate plots for each device's data
     
     Args:
-        df: DataFrame containing either phase termination or detector data
+        df: DataFrame containing either phase termination, detector data, or missing data
         signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
         num_figures: Number of top devices to generate plots for PER REGION
         
     Returns:
         List of tuples containing (matplotlib figure, region)
     """
-    # Check if Percent MaxOut column exists
+    # Determine the type of data and set appropriate columns
     if 'Percent MaxOut' in df.columns:
         group_column = 'Phase'
         value_column = 'Percent MaxOut'
         ranking_column = 'CUSUM_Percent MaxOut'
-    else:
+        plot_title = 'Phase Termination'
+    elif 'PercentAnomalous' in df.columns:
         group_column = 'Detector'
-        value_column = 'Total'
+        value_column = 'PercentAnomalous'
         ranking_column = 'CUSUM_PercentAnomalous'
+        plot_title = 'Detector Health'
+    elif 'MissingData' in df.columns:
+        group_column = None
+        value_column = 'MissingData'
+        ranking_column = 'CUSUM_MissingData'
+        plot_title = 'Missing Data'
+    else:
+        raise ValueError("Unknown data format in DataFrame")
     
     # Colors for different phases/detectors
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # blue, orange, green
@@ -48,29 +57,43 @@ def create_device_plots(df: 'pd.DataFrame', signals_df: 'pd.DataFrame', num_figu
             
             # Filter data for this device
             device_data = df[df['DeviceId'] == device]
-            numbers = device_data[group_column].unique()
             
             # Create the plot
             fig, ax = plt.subplots(figsize=(12, 6))
             
-            # Plot each phase/detector
-            for number, color in zip(sorted(numbers), colors):
-                # Filter data for this phase/detector
-                data = device_data[device_data[group_column] == number]
+            if group_column:
+                # For data with group columns (Phase or Detector)
+                numbers = device_data[group_column].unique()
                 
-                # Plot values
-                ax.plot(data['Date'], data[value_column], 
-                        color=color, linewidth=2, label=f'{group_column} {number}')
+                # Plot each phase/detector
+                for number, color in zip(sorted(numbers), colors):
+                    # Filter data for this phase/detector
+                    data = device_data[device_data[group_column] == number]
+                    
+                    # Plot values
+                    ax.plot(data['Date'], data[value_column], 
+                            color=color, linewidth=2, label=f'{group_column} {number}')
+                    
+                    # Add alert points if they exist
+                    alerts = data[data['Alert'] == 1]
+                    if len(alerts) > 0:
+                        ax.scatter(alerts['Date'], alerts[value_column], 
+                                  color=color, s=100, marker='.', 
+                                  label=f'{group_column} {number} Alerts')
+            else:
+                # For Missing Data (no group column)
+                ax.plot(device_data['Date'], device_data[value_column], 
+                        color='#1f77b4', linewidth=2, label='Missing Data')
                 
                 # Add alert points if they exist
-                alerts = data[data['Alert'] == 1]
+                alerts = device_data[device_data['Alert'] == 1]
                 if len(alerts) > 0:
                     ax.scatter(alerts['Date'], alerts[value_column], 
-                              color=color, s=100, marker='.', 
-                              label=f'{group_column} {number} Alerts')
+                              color='red', s=100, marker='.', 
+                              label='Alerts')
             
             # Customize the plot
-            ax.set_title(f'{group_column} Over Time\n{name}',
+            ax.set_title(f'{plot_title} Over Time\n{name}',
                         pad=20)
             ax.set_xlabel('Date')
             ax.set_ylabel(value_column)

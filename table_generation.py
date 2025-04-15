@@ -5,22 +5,23 @@ from io import BytesIO
 import base64
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Table, TableStyle, Paragraph, Image
+from reportlab.platypus import Table, TableStyle, Paragraph, Image, Spacer
 from reportlab.lib.units import inch
 
-def prepare_phase_termination_alerts_table(filtered_df, signals_df):
+def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10):
     """
     Prepare a sorted table of phase termination alerts with signal name, phase, and date
     
     Args:
         filtered_df: DataFrame containing phase termination alerts
         signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
+        max_rows: Maximum number of rows to include in the table
         
     Returns:
-        Sorted DataFrame with Signal Name, Phase, Date and Alert columns
+        Tuple of (Sorted DataFrame with Signal Name, Phase, Date and Alert columns, total_alerts_count)
     """
     if filtered_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
         
     # Join with signals data to get signal names
     alerts_df = filtered_df.copy()  # Use all data for sparklines, not just alerts
@@ -28,7 +29,7 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df):
     # Filter alerts for table display
     alert_rows = filtered_df[filtered_df['Alert'] == 1].copy()
     if alert_rows.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
         
     # Merge with signals dataframe to get names
     result = pd.merge(
@@ -42,7 +43,10 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df):
     result = result.dropna(subset=['Name'])
     
     if result.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
+    
+    # Get the total count of alerts after filtering but before limiting rows
+    total_alerts_count = len(result)
     
     # Rename and select columns
     result = result.rename(columns={'Name': 'Signal', 'Percent MaxOut': 'MaxOut %'})
@@ -77,21 +81,26 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df):
     # Sort by MaxOut % in descending order, then by Signal, Phase
     result = result.sort_values(by=['MaxOut %', 'Signal', 'Phase'], ascending=[False, True, True])
     
-    return result
+    # Limit the number of rows
+    if max_rows > 0 and len(result) > max_rows:
+        result = result.head(max_rows)
+    
+    return result, total_alerts_count
 
-def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df):
+def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max_rows=10):
     """
     Prepare a sorted table of detector health alerts with signal name, detector, and date
     
     Args:
         filtered_df_actuations: DataFrame containing detector health alerts
         signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
+        max_rows: Maximum number of rows to include in the table
         
     Returns:
-        Sorted DataFrame with Signal Name, Detector, Date and Alert columns
+        Tuple of (Sorted DataFrame with Signal Name, Detector, Date and Alert columns, total_alerts_count)
     """
     if filtered_df_actuations.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
         
     # Use all data for sparklines, not just alerts
     detector_df = filtered_df_actuations.copy()
@@ -99,7 +108,7 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df):
     # Filter alerts for table display
     alert_rows = filtered_df_actuations[filtered_df_actuations['Alert'] == 1].copy()
     if alert_rows.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
         
     # Merge with signals dataframe to get names
     result = pd.merge(
@@ -113,7 +122,10 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df):
     result = result.dropna(subset=['Name'])
     
     if result.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
+    
+    # Get the total count of alerts after filtering but before limiting rows
+    total_alerts_count = len(result)
     
     # Rename and select columns
     result = result.rename(columns={'Name': 'Signal', 'PercentAnomalous': 'Anomalous %'})
@@ -148,7 +160,11 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df):
     # Sort by Anomalous % in descending order, then by Signal, Detector
     result = result.sort_values(by=['Anomalous %', 'Signal', 'Detector'], ascending=[False, True, True])
     
-    return result
+    # Limit the number of rows
+    if max_rows > 0 and len(result) > max_rows:
+        result = result.head(max_rows)
+    
+    return result, total_alerts_count
 
 def create_sparkline(data, width=1.0, height=0.25, color='#1f77b4'):
     """
@@ -208,7 +224,7 @@ def create_sparkline(data, width=1.0, height=0.25, color='#1f77b4'):
     
     return Image(buf, width=width*inch, height=height*inch)
 
-def create_reportlab_table(df, title, styles):
+def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
     """
     Create a ReportLab table from a pandas DataFrame
     
@@ -216,6 +232,8 @@ def create_reportlab_table(df, title, styles):
         df: DataFrame containing table data
         title: Title for the table
         styles: ReportLab styles object
+        total_count: Total number of alerts (if different from the number of rows)
+        max_rows: Maximum number of rows displayed in the table
         
     Returns:
         List of ReportLab flowables (Title paragraph and Table)
@@ -225,6 +243,12 @@ def create_reportlab_table(df, title, styles):
     
     # Create a copy to avoid modifying the original
     df_display = df.copy()
+    
+    # Show message about total alerts vs. displayed alerts
+    if total_count is not None:
+        table_notice = f"Showing top {len(df)} of {total_count} total alerts"
+    else:
+        table_notice = f"Showing {len(df)} alerts"
     
     # Get sparkline data and remove it from display DataFrame
     sparkline_data = None
@@ -237,6 +261,8 @@ def create_reportlab_table(df, title, styles):
         df_display['MaxOut %'] = df_display['MaxOut %'].apply(lambda x: f"{x:.1%}")
     if 'Anomalous %' in df_display.columns:
         df_display['Anomalous %'] = df_display['Anomalous %'].apply(lambda x: f"{x:.1%}")
+    if 'Missing Data %' in df_display.columns:
+        df_display['Missing Data %'] = df_display['Missing Data %'].apply(lambda x: f"{x:.1%}")
     
     # Format date column
     df_display['Date'] = df_display['Date'].dt.strftime('%Y-%m-%d')
@@ -293,7 +319,99 @@ def create_reportlab_table(df, title, styles):
                 # Replace the content of the last column with the sparkline image
                 table._cellvalues[row_index][-1] = sparkline
     
-    return [
-        Paragraph(title, styles['SectionHeading']),
-        table
+    result_elements = [
+        Paragraph(title, styles['SectionHeading'])
     ]
+    
+    # Always add notice about total alerts
+    result_elements.append(Paragraph(table_notice, styles['Normal']))
+    result_elements.append(Spacer(1, 0.05*inch))
+    
+    result_elements.append(table)
+    
+    return result_elements
+
+def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_rows=10):
+    """
+    Prepare a sorted table of missing data alerts with signal name and date
+    
+    Args:
+        filtered_df_missing_data: DataFrame containing missing data alerts
+        signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
+        max_rows: Maximum number of rows to include in the table
+        
+    Returns:
+        Tuple of (Sorted DataFrame with Signal Name, Date and Alert columns, total_alerts_count)
+    """
+    if filtered_df_missing_data.empty:
+        return pd.DataFrame(), 0
+        
+    # Use all data for sparklines, not just alerts
+    missing_data_df = filtered_df_missing_data.copy()
+    
+    # Filter alerts for table display
+    alert_rows = filtered_df_missing_data[filtered_df_missing_data['Alert'] == 1].copy()
+    if alert_rows.empty:
+        return pd.DataFrame(), 0
+    
+    # Get the total count of unique devices with alerts before limiting rows
+    unique_devices_with_alerts = alert_rows['DeviceId'].nunique()
+        
+    # Merge with signals dataframe to get names
+    result = pd.merge(
+        alert_rows[['DeviceId', 'Date', 'Alert', 'MissingData']],
+        signals_df[['DeviceId', 'Name']],
+        on='DeviceId',
+        how='left'
+    )
+    
+    # Filter out rows where Signal is NaN
+    result = result.dropna(subset=['Name'])
+    
+    if result.empty:
+        return pd.DataFrame(), 0
+    
+    # Rename and select columns
+    result = result.rename(columns={'Name': 'Signal', 'MissingData': 'Missing Data %'})
+    
+    # For missing data, only show one row per device (the worst one)
+    # First, find the index of the maximum MissingData value for each device
+    idx = result.groupby('DeviceId')['Missing Data %'].idxmax()
+    
+    # Use these indices to filter the dataframe to get just one row per device
+    result = result.loc[idx]
+    
+    # Add sparkline column - Group by Signal and collect time series data
+    sparkline_data = {}
+    
+    # Get all DeviceIds that have alerts
+    device_ids = result['DeviceId'].unique()
+    
+    # For each device with alerts, collect all data for sparklines
+    for device_id in device_ids:
+        # Get all data for this device, not just alerts
+        device_data = missing_data_df[missing_data_df['DeviceId'] == device_id]
+        
+        if not device_data.empty:
+            # Sort by date to ensure correct time series
+            device_data = device_data.sort_values('Date')
+            # Store the MissingData values for sparklines
+            sparkline_data[device_id] = device_data['MissingData'].tolist()
+    
+    # Add the sparkline data to the result dataframe
+    result['Sparkline_Data'] = result.apply(
+        lambda row: sparkline_data.get(row['DeviceId'], []), 
+        axis=1
+    )
+    
+    # Select and order columns
+    result = result[['Signal', 'Date', 'Missing Data %', 'Sparkline_Data']]
+    
+    # Sort by Missing Data % in descending order, then by Signal
+    result = result.sort_values(by=['Missing Data %', 'Signal'], ascending=[False, True])
+    
+    # Limit the number of rows
+    if max_rows > 0 and len(result) > max_rows:
+        result = result.head(max_rows)
+    
+    return result, unique_devices_with_alerts
