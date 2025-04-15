@@ -230,16 +230,16 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
     
     Args:
         df: DataFrame containing table data
-        title: Title for the table
+        title: Title for the table (unused now, kept for backwards compatibility)
         styles: ReportLab styles object
         total_count: Total number of alerts (if different from the number of rows)
         max_rows: Maximum number of rows displayed in the table
         
     Returns:
-        List of ReportLab flowables (Title paragraph and Table)
+        List of ReportLab flowables (Table and row count notice)
     """
     if df.empty:
-        return [Paragraph(f"{title} - No alerts found", styles['Normal'])]
+        return [Paragraph("No alerts found", styles['Normal'])]
     
     # Create a copy to avoid modifying the original
     df_display = df.copy()
@@ -320,14 +320,10 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
                 table._cellvalues[row_index][-1] = sparkline
     
     result_elements = [
-        Paragraph(title, styles['SectionHeading'])
+        Paragraph(table_notice, styles['Normal']),
+        Spacer(1, 0.05*inch),
+        table
     ]
-    
-    # Always add notice about total alerts
-    result_elements.append(Paragraph(table_notice, styles['Normal']))
-    result_elements.append(Spacer(1, 0.05*inch))
-    
-    result_elements.append(table)
     
     return result_elements
 

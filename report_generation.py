@@ -2,7 +2,7 @@ import pandas as pd
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, FrameBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, FrameBreak, KeepTogether
 from reportlab.platypus.flowables import Flowable
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
@@ -68,33 +68,34 @@ class HeaderFooter:
         except Exception as e:
             print(f"Error loading logo: {e}")
 
-        # Title "ATSPM Report" on the right
+        # Title "Signals Weekly" - right aligned
         canvas.setFont('Helvetica-Bold', 24)
         canvas.setFillColor(colors.black)
-        title_text = "ATSPM Report"
+        title_text = "Signals Weekly"
         title_width = canvas.stringWidth(title_text, "Helvetica-Bold", 24)
-        canvas.drawString(doc.width + doc.leftMargin - title_width - 1.2*inch,
+        title_x = doc.width + doc.leftMargin - title_width - 0.5*inch  # Move title left to make room for icon
+        canvas.drawString(title_x,
                          doc.height + doc.topMargin - 0.3*inch, title_text)
 
-        # Traffic light image
+        # Traffic light image - to the right of the title and higher up
         try:
             if os.path.exists(self.signal_head_path):
                 canvas.drawImage(self.signal_head_path,
-                               doc.width + doc.leftMargin - 0.8*inch,
-                               doc.height + doc.topMargin - 0.7*inch,
-                               width=0.6*inch,
-                               height=0.7*inch,
+                               title_x + title_width + 0.1*inch,  # Position right after title text
+                               doc.height + doc.topMargin - 0.35*inch,  # Moved higher
+                               width=0.35*inch,  # Slightly smaller
+                               height=0.35*inch,  # Slightly smaller
                                preserveAspectRatio=True)
             else:
                 print(f"Warning: Signal image not found at {self.signal_head_path}")
         except Exception as e:
             print(f"Error loading signal image: {e}")
 
-        # Subtitle
-        canvas.setFont('Times-Italic', 12)
-        subtitle = "Automated Traffic Signal Performance Measures"
-        subtitle_width = canvas.stringWidth(subtitle, "Times-Italic", 12)
-        canvas.drawString(doc.width + doc.leftMargin - subtitle_width - 1.2*inch,
+        # Subtitle with bold and italic style - right aligned
+        canvas.setFont('Times-BoldItalic', 12)
+        subtitle = "Delivering Weekly Traffic Signal Insights"
+        subtitle_width = canvas.stringWidth(subtitle, "Times-BoldItalic", 12)
+        canvas.drawString(doc.width + doc.leftMargin - subtitle_width,
                          doc.height + doc.topMargin - 0.55*inch, subtitle)
 
         # Draw horizontal line
@@ -209,6 +210,7 @@ def generate_pdf_report(
     buffer_objects = []
     region_names = []
 
+    # Process each individual region first
     for region in regions:
         # Filter figures for this region
         region_phase_figures = [fig for fig, reg in phase_figures if reg == region]
@@ -240,7 +242,7 @@ def generate_pdf_report(
                 pagesize=letter,
                 leftMargin=0.5*inch,
                 rightMargin=0.5*inch,
-                topMargin=1*inch,
+                topMargin=1.2*inch,  # Increased top margin to prevent text encroachment
                 bottomMargin=0.5*inch
             )
         else:
@@ -251,7 +253,7 @@ def generate_pdf_report(
                 pagesize=letter,
                 leftMargin=0.5*inch,
                 rightMargin=0.5*inch,
-                topMargin=1*inch,
+                topMargin=1.2*inch,  # Increased top margin to prevent text encroachment
                 bottomMargin=0.5*inch
             )
 
@@ -280,8 +282,8 @@ def generate_pdf_report(
             textColor=colors.navy
         ))
 
-        content.append(Paragraph(f"ATSPM Report - {region}", styles['Title']))
-        content.append(Spacer(1, 0.1*inch))
+        # Add extra space after the header line
+        content.append(Spacer(1, 0.3*inch))
 
         # Introduction text
         intro_text = f"""This report provides insights into traffic signal performance metrics, detector health, and data completeness for {region}. 
@@ -289,19 +291,15 @@ def generate_pdf_report(
         content.append(Paragraph(intro_text, styles['Normal']))
         content.append(Spacer(1, 0.2*inch))
 
-        # Section 1: Phase Terminations
+        # Section: Phase Terminations - Changed to a single header
         if len(filtered_df) > 0 and region_phase_figures:
-            content.append(Paragraph("1. Phase Termination Analysis", styles['SectionHeading']))
+            content.append(Paragraph("Phase Termination Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
             explanation = """The following tables and charts display phase termination patterns that have been flagged as anomalous. 
             Points marked with dots in the charts indicate periods where the system detected unusual max-out or force-off behavior."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
-            
-            # Add phase termination alerts table
-            content.append(Paragraph("1.1 Phase Termination Alerts", styles['SubsectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
             
             # Filter signals for this region
             region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
@@ -324,28 +322,24 @@ def generate_pdf_report(
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
             
-            # Add phase termination charts
-            content.append(Paragraph("1.2 Phase Termination Charts", styles['SubsectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
-            
+            # Add phase termination charts without additional header
             for fig in region_phase_figures:
-                content.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                # Wrap each chart in a KeepTogether to ensure it stays on one page
+                chart_elements = []
+                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                content.append(KeepTogether(chart_elements))
                 content.append(Spacer(1, 0.15*inch))
                 plt.close(fig)
 
-        # Section 2: Detector Health
+        # Section: Detector Health - Changed to a single header
         if len(filtered_df_actuations) > 0 and region_detector_figures:
-            content.append(Paragraph("2. Detector Health Analysis", styles['SectionHeading']))
+            content.append(Paragraph("Detector Health Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
             explanation = """The following tables and charts display detector health metrics that have been flagged as anomalous. 
             Points marked with dots in the charts indicate periods where the system detected unusual detector behavior."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
-            
-            # Add detector health alerts table
-            content.append(Paragraph("2.1 Detector Health Alerts", styles['SubsectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
             
             # Filter signals for this region
             region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
@@ -368,18 +362,18 @@ def generate_pdf_report(
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
             
-            # Add detector health charts
-            content.append(Paragraph("2.2 Detector Health Charts", styles['SubsectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
-            
+            # Add detector health charts without additional header
             for fig in region_detector_figures:
-                content.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                # Wrap each chart in a KeepTogether to ensure it stays on one page
+                chart_elements = []
+                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                content.append(KeepTogether(chart_elements))
                 content.append(Spacer(1, 0.15*inch))
                 plt.close(fig)
 
-        # Section 3: Missing Data Analysis
+        # Section: Missing Data - Changed to a single header
         if len(filtered_df_missing_data) > 0 and region_missing_data_figures:
-            content.append(Paragraph("3. Missing Data Analysis", styles['SectionHeading']))
+            content.append(Paragraph("Missing Data Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
             explanation = """The following tables and charts display missing data patterns that have been flagged as anomalous. 
@@ -387,10 +381,6 @@ def generate_pdf_report(
             where the system detected significant data loss which may affect signal operation analysis."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
-            
-            # Add missing data alerts table
-            content.append(Paragraph("3.1 Missing Data Alerts", styles['SubsectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
             
             # Filter signals for this region
             region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
@@ -413,12 +403,12 @@ def generate_pdf_report(
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
             
-            # Add missing data charts
-            content.append(Paragraph("3.2 Missing Data Charts", styles['SubsectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
-            
+            # Add missing data charts without additional header
             for fig in region_missing_data_figures:
-                content.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                # Wrap each chart in a KeepTogether to ensure it stays on one page
+                chart_elements = []
+                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                content.append(KeepTogether(chart_elements))
                 content.append(Spacer(1, 0.15*inch))
                 plt.close(fig)
 
@@ -433,6 +423,342 @@ def generate_pdf_report(
         else:
             buffer_objects.append(buffer)
             region_names.append(region)
+
+    # Now create the All Regions report with consolidated tables and figures
+    all_region = "All Regions"
+    all_region_path = output_path.format(region=all_region.replace(" ", "_"))
+    
+    # Create header/footer handler for All Regions report
+    header_footer = HeaderFooter(
+        logo_path=os.path.join("images", "logo.jpg"),
+        signal_head_path=os.path.join("images", "signal_head.jpg"),
+        region=all_region
+    )
+
+    # Create document with custom canvas for All Regions
+    def make_all_regions_canvas(*args, **kwargs):
+        canvas = PageNumCanvas(*args, **kwargs)
+        canvas.set_footer_handler(
+            lambda c, page_num, num_pages: draw_page_footer(c, page_num, num_pages, all_region)
+        )
+        return canvas
+
+    # Determine if we're writing to disk or memory for All Regions report
+    if save_to_disk:
+        doc = SimpleDocTemplate(
+            all_region_path,
+            pagesize=letter,
+            leftMargin=0.5*inch,
+            rightMargin=0.5*inch,
+            topMargin=1.2*inch,  # Increased top margin to match individual region reports
+            bottomMargin=0.5*inch
+        )
+    else:
+        # Create a BytesIO buffer for this report
+        all_buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            all_buffer,
+            pagesize=letter,
+            leftMargin=0.5*inch,
+            rightMargin=0.5*inch,
+            topMargin=1.2*inch,  # Increased top margin to match individual region reports
+            bottomMargin=0.5*inch
+        )
+
+    # Content building for All Regions
+    content = []
+
+    # Add report title and date for All Regions
+    styles = getSampleStyleSheet()
+    styles['Title'].fontSize = 16
+    styles['Title'].spaceAfter = 12
+    styles['Title'].leading = 18
+    
+    styles.add(ParagraphStyle(
+        name='SectionHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        spaceAfter=8,
+        textColor=colors.navy
+    ))
+    
+    styles.add(ParagraphStyle(
+        name='SubsectionHeading',
+        parent=styles['Heading3'],
+        fontSize=12,
+        spaceAfter=6,
+        textColor=colors.navy
+    ))
+
+    # Add extra space after the header line
+    content.append(Spacer(1, 0.3*inch))
+
+    # Introduction text for All Regions
+    intro_text = f"""This comprehensive report provides insights into traffic signal performance metrics, detector health, and data completeness across all regions. 
+    The analysis consolidates data from all signals and highlights potential issues requiring attention based on statistical anomalies."""
+    content.append(Paragraph(intro_text, styles['Normal']))
+    content.append(Spacer(1, 0.2*inch))
+    
+    # Section: Consolidated Phase Termination Analysis - Changed to a single header
+    if len(filtered_df) > 0:
+        content.append(Paragraph("Phase Termination Alerts", styles['SectionHeading']))
+        content.append(Spacer(1, 0.1*inch))
+
+        explanation = """The following tables and charts display phase termination patterns that have been flagged as anomalous across all regions. 
+        Points marked with dots in the charts indicate periods where the system detected unusual max-out or force-off behavior."""
+        content.append(Paragraph(explanation, styles['Normal']))
+        content.append(Spacer(1, 0.2*inch))
+        
+        worst_device_id = None
+        worst_phase = None
+        worst_device_region = None
+        
+        if signals_df is not None:
+            # Use all signals regardless of region for the All Regions report
+            # Create phase termination table with row limit
+            phase_alerts_df, total_phase_alerts = prepare_phase_termination_alerts_table(
+                filtered_df, 
+                signals_df,  # Using all signals
+                max_rows=max_table_rows * 2  # Allow more rows for the combined report
+            )
+            
+            table_content = create_reportlab_table(
+                phase_alerts_df, 
+                "Phase Termination Alerts", # Removed "- All Regions" to avoid duplication
+                styles,
+                total_count=total_phase_alerts,
+                max_rows=max_table_rows * 2
+            )
+            content.extend(table_content)
+            content.append(Spacer(1, 0.3*inch))
+            
+            # Get the worst device and phase from the first row of the table
+            if not phase_alerts_df.empty:
+                # Need to find DeviceId and Phase for the first row
+                first_row = phase_alerts_df.iloc[0]
+                signal_name = first_row['Signal']
+                phase_num = first_row['Phase']
+                
+                # Get DeviceId for this signal name
+                matching_device_rows = signals_df[signals_df['Name'] == signal_name]
+                if not matching_device_rows.empty:
+                    worst_device_id = matching_device_rows.iloc[0]['DeviceId']
+                    worst_phase = phase_num
+                    worst_device_region = matching_device_rows.iloc[0]['Region']
+        
+        # First, add a note indicating which device/phase this chart represents
+        if worst_device_id is not None and worst_phase is not None and worst_device_region is not None:
+            device_info = f"Chart for the most critical issue:"
+            chart_description = Paragraph(device_info, styles['Normal'])
+            
+            # Try to find a matching figure for this worst device
+            worst_figure = None
+            worst_device_figures = []
+            
+            # First collect all figures that match the region
+            for fig, reg in phase_figures:
+                if reg == worst_device_region:
+                    worst_device_figures.append(fig)
+            
+            chart_elements = []
+            chart_elements.append(chart_description)
+            chart_elements.append(Spacer(1, 0.1*inch))
+            
+            # If we have figures for this region, use the first one
+            if worst_device_figures:
+                chart_elements.append(MatplotlibFigure(worst_device_figures[0], width=6.5*inch, height=2.8*inch))
+            elif phase_figures:
+                # If no figures match the region, fall back to the first figure
+                chart_elements.append(MatplotlibFigure(phase_figures[0][0], width=6.5*inch, height=2.8*inch))
+                
+                # Add an explanatory note about the fallback
+                fallback_note = "Note: The chart shown may not represent the exact device in the first table row due to data availability."
+                chart_elements.append(Paragraph(fallback_note, styles['Normal']))
+            
+            # Keep the description and chart together
+            content.append(KeepTogether(chart_elements))
+            content.append(Spacer(1, 0.15*inch))
+        elif phase_figures:
+            # Fallback if we couldn't get worst device info
+            content.append(MatplotlibFigure(phase_figures[0][0], width=6.5*inch, height=2.8*inch))
+            content.append(Spacer(1, 0.15*inch))
+
+    # Section: Consolidated Detector Health - Changed to a single header
+    if len(filtered_df_actuations) > 0:
+        content.append(Paragraph("Detector Health Alerts", styles['SectionHeading']))
+        content.append(Spacer(1, 0.1*inch))
+
+        explanation = """The following tables and charts display detector health metrics that have been flagged as anomalous across all regions. 
+        Points marked with dots in the charts indicate periods where the system detected unusual detector behavior."""
+        content.append(Paragraph(explanation, styles['Normal']))
+        content.append(Spacer(1, 0.2*inch))
+        
+        worst_device_id = None
+        worst_detector = None
+        worst_device_region = None
+        
+        if signals_df is not None:
+            # Use all signals regardless of region for the All Regions report
+            # Create detector health table with row limit
+            detector_alerts_df, total_detector_alerts = prepare_detector_health_alerts_table(
+                filtered_df_actuations, 
+                signals_df,  # Using all signals
+                max_rows=max_table_rows * 2  # Allow more rows for the combined report
+            )
+            
+            table_content = create_reportlab_table(
+                detector_alerts_df, 
+                "Detector Health Alerts", # Removed "- All Regions" to avoid duplication
+                styles,
+                total_count=total_detector_alerts,
+                max_rows=max_table_rows * 2
+            )
+            content.extend(table_content)
+            content.append(Spacer(1, 0.3*inch))
+            
+            # Get the worst device and detector from the first row of the table
+            if not detector_alerts_df.empty:
+                # Need to find DeviceId and Detector for the first row
+                first_row = detector_alerts_df.iloc[0]
+                signal_name = first_row['Signal']
+                detector_num = first_row['Detector']
+                
+                # Get DeviceId for this signal name
+                matching_device_rows = signals_df[signals_df['Name'] == signal_name]
+                if not matching_device_rows.empty:
+                    worst_device_id = matching_device_rows.iloc[0]['DeviceId']
+                    worst_detector = detector_num
+                    worst_device_region = matching_device_rows.iloc[0]['Region']
+        
+        # First, add a note indicating which device/detector this chart represents
+        if worst_device_id is not None and worst_detector is not None and worst_device_region is not None:
+            device_info = f"Chart for the most critical issue:"
+            chart_description = Paragraph(device_info, styles['Normal'])
+            
+            # Try to find a matching figure for this worst device
+            worst_device_figures = []
+            
+            # First collect all figures that match the region
+            for fig, reg in detector_figures:
+                if reg == worst_device_region:
+                    worst_device_figures.append(fig)
+            
+            chart_elements = []
+            chart_elements.append(chart_description)
+            chart_elements.append(Spacer(1, 0.1*inch))
+            
+            # If we have figures for this region, use the first one
+            if worst_device_figures:
+                chart_elements.append(MatplotlibFigure(worst_device_figures[0], width=6.5*inch, height=2.8*inch))
+            elif detector_figures:
+                # If no figures match the region, fall back to the first figure
+                chart_elements.append(MatplotlibFigure(detector_figures[0][0], width=6.5*inch, height=2.8*inch))
+                
+                # Add an explanatory note about the fallback
+                fallback_note = "Note: The chart shown may not represent the exact device in the first table row due to data availability."
+                chart_elements.append(Paragraph(fallback_note, styles['Normal']))
+            
+            # Keep the description and chart together
+            content.append(KeepTogether(chart_elements))
+            content.append(Spacer(1, 0.15*inch))
+        elif detector_figures:
+            # Fallback if we couldn't get worst device info
+            content.append(MatplotlibFigure(detector_figures[0][0], width=6.5*inch, height=2.8*inch))
+            content.append(Spacer(1, 0.15*inch))
+    
+    # Section: Consolidated Missing Data - Changed to a single header
+    if len(filtered_df_missing_data) > 0:
+        content.append(Paragraph("Missing Data Alerts", styles['SectionHeading']))
+        content.append(Spacer(1, 0.1*inch))
+
+        explanation = """The following tables and charts display missing data patterns that have been flagged as anomalous across all regions. 
+        Higher values indicate a greater percentage of missing data. Points marked with dots in the charts indicate periods 
+        where the system detected significant data loss which may affect signal operation analysis."""
+        content.append(Paragraph(explanation, styles['Normal']))
+        content.append(Spacer(1, 0.2*inch))
+        
+        worst_device_id = None
+        worst_device_region = None
+        
+        if signals_df is not None:
+            # Use all signals regardless of region for the All Regions report
+            # Create missing data table with row limit
+            missing_data_alerts_df, total_missing_data_alerts = prepare_missing_data_alerts_table(
+                filtered_df_missing_data, 
+                signals_df,  # Using all signals
+                max_rows=max_table_rows * 2  # Allow more rows for the combined report
+            )
+            
+            table_content = create_reportlab_table(
+                missing_data_alerts_df, 
+                "Missing Data Alerts",  # Removed "- All Regions" to avoid duplication
+                styles,
+                total_count=total_missing_data_alerts,
+                max_rows=max_table_rows * 2
+            )
+            content.extend(table_content)
+            content.append(Spacer(1, 0.3*inch))
+            
+            # Get the worst device from the first row of the table
+            if not missing_data_alerts_df.empty:
+                # Need to find DeviceId for the first row
+                first_row = missing_data_alerts_df.iloc[0]
+                signal_name = first_row['Signal']
+                
+                # Get DeviceId for this signal name
+                matching_device_rows = signals_df[signals_df['Name'] == signal_name]
+                if not matching_device_rows.empty:
+                    worst_device_id = matching_device_rows.iloc[0]['DeviceId']
+                    worst_device_region = matching_device_rows.iloc[0]['Region']
+        
+        # First, add a note indicating which device this chart represents
+        if worst_device_id is not None and worst_device_region is not None:
+            device_info = f"Chart for the most critical issue:"
+            chart_description = Paragraph(device_info, styles['Normal'])
+            
+            # Try to find a matching figure for this worst device
+            worst_device_figures = []
+            
+            # First collect all figures that match the region
+            for fig, reg in missing_data_figures:
+                if reg == worst_device_region:
+                    worst_device_figures.append(fig)
+            
+            chart_elements = []
+            chart_elements.append(chart_description)
+            chart_elements.append(Spacer(1, 0.1*inch))
+            
+            # If we have figures for this region, use the first one
+            if worst_device_figures:
+                chart_elements.append(MatplotlibFigure(worst_device_figures[0], width=6.5*inch, height=2.8*inch))
+            elif missing_data_figures:
+                # If no figures match the region, fall back to the first figure
+                chart_elements.append(MatplotlibFigure(missing_data_figures[0][0], width=6.5*inch, height=2.8*inch))
+                
+                # Add an explanatory note about the fallback
+                fallback_note = "Note: The chart shown may not represent the exact device in the first table row due to data availability."
+                chart_elements.append(Paragraph(fallback_note, styles['Normal']))
+            
+            # Keep the description and chart together
+            content.append(KeepTogether(chart_elements))
+            content.append(Spacer(1, 0.15*inch))
+        elif missing_data_figures:
+            # Fallback if we couldn't get worst device info
+            content.append(MatplotlibFigure(missing_data_figures[0][0], width=6.5*inch, height=2.8*inch))
+            content.append(Spacer(1, 0.15*inch))
+
+    # Build the All Regions PDF with custom canvas
+    doc.build(content,
+             onFirstPage=header_footer.firstPage,
+             onLaterPages=header_footer.laterPages,
+             canvasmaker=make_all_regions_canvas)
+    
+    # Add the All Regions report to the output
+    if save_to_disk:
+        generated_paths.append(all_region_path)
+    else:
+        buffer_objects.append(all_buffer)
+        region_names.append("All")  # Use "All" to match the emails.csv entry
 
     if save_to_disk:
         return generated_paths
