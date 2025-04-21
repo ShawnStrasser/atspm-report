@@ -205,18 +205,18 @@ def alert(table):
         # Alert condition for PercentAnomalous
         result = result.mutate(
             Alert=(
-                (result[cusum_column_name] > 0.25) &
-                (result['z_score'] > 4) &
-                (result[column] > 0.15)
+                (result[cusum_column_name] > 0.20) &
+                (result['z_score'] > 3.5) &
+                (result[column] > 0.10)
             ).cast('int32')  # Convert boolean to 0/1
         )
     else:
         # Alert condition for MissingData
         result = result.mutate(
             Alert=(
-                (result[cusum_column_name] > 0.25) &
-                (result['z_score'] > 4) &
-                (result[column] > 0.1)  # Missing more than 50% of data
+                (result[cusum_column_name] > 0.1) &
+                (result['z_score'] > 3) &
+                (result[column] > 0.05) 
             ).cast('int32')  # Convert boolean to 0/1
         )
 

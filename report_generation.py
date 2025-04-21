@@ -18,6 +18,15 @@ from table_generation import (
     create_reportlab_table
 )
 
+# Load jokes of the week
+JOKES_CSV_PATH = os.path.join(os.path.dirname(__file__), "jokes.csv")
+try:
+    jokes_df = pd.read_csv(JOKES_CSV_PATH, parse_dates=['Date'])
+    jokes_df.sort_values('Date', inplace=True)
+except Exception as e:
+    print(f"Warning: Could not load jokes.csv: {e}")
+    jokes_df = pd.DataFrame(columns=['Date', 'Joke'])
+
 
 class PageNumCanvas(canvas.Canvas):
     """Canvas that knows its page count for numbering"""
@@ -285,12 +294,26 @@ def generate_pdf_report(
         # Add extra space after the header line
         content.append(Spacer(1, 0.3*inch))
 
+        # Header: Report for this region
+        content.append(Paragraph(f"{region}", styles['Title']))
+        content.append(Spacer(1, 0.2*inch))
+
         # Introduction text
-        intro_text = f"""This report provides insights into traffic signal performance metrics, detector health, and data completeness for {region}. 
-        The analysis highlights potential issues requiring attention based on statistical anomalies."""
+        intro_text = f"""This report for {region} includes alerts for detector health, increased percent maxout, and data completeness. 
+        These are new alerts, focusing on the most critical issues within the last week. Signals Weekly is still in development, so please provide feedback.
+        Development will continue, with plans to add ped detector monitoring next."""
         content.append(Paragraph(intro_text, styles['Normal']))
         content.append(Spacer(1, 0.2*inch))
 
+        # Joke of the Week section
+        content.append(Paragraph("Joke of the Week", styles['SectionHeading']))
+        # Select most recent joke up to today
+        today_date = datetime.today().date()
+        recent = jokes_df[jokes_df['Date'].dt.date <= today_date]
+        joke_text = recent.iloc[-1]['Joke'] if not recent.empty else "No joke available this week."
+        content.append(Paragraph(joke_text, styles['Normal']))
+        content.append(Spacer(1, 0.3*inch))
+        
         # Section: Phase Terminations - Changed to a single header
         if len(filtered_df) > 0 and region_phase_figures:
             content.append(Paragraph("Phase Termination Alerts", styles['SectionHeading']))
@@ -493,12 +516,25 @@ def generate_pdf_report(
     # Add extra space after the header line
     content.append(Spacer(1, 0.3*inch))
 
-    # Introduction text for All Regions
-    intro_text = f"""This comprehensive report provides insights into traffic signal performance metrics, detector health, and data completeness across all regions. 
-    The analysis consolidates data from all signals and highlights potential issues requiring attention based on statistical anomalies."""
+    # Header: Report for All Regions
+    content.append(Paragraph(f"Report for {all_region}", styles['Title']))
+    content.append(Spacer(1, 0.2*inch))
+
+    # Introduction text
+    intro_text = f"""This report for {all_region} includes alerts for detector health, increased percent maxout, and data completeness. 
+    These are new alerts, focusing on the most critical issues within the last week. Signals Weekly is still in development, so please provide feedback.
+    Development will continue, with plans to add ped detector monitoring next."""
     content.append(Paragraph(intro_text, styles['Normal']))
     content.append(Spacer(1, 0.2*inch))
     
+    # Joke of the Week section for All Regions
+    content.append(Paragraph("Joke of the Week", styles['SectionHeading']))
+    today_date = datetime.today().date()
+    recent = jokes_df[jokes_df['Date'].dt.date <= today_date]
+    joke_text = recent.iloc[-1]['Joke'] if not recent.empty else "No joke available this week."
+    content.append(Paragraph(joke_text, styles['Normal']))
+    content.append(Spacer(1, 0.3*inch))
+
     # Section: Consolidated Phase Termination Analysis - Changed to a single header
     if len(filtered_df) > 0:
         content.append(Paragraph("Phase Termination Alerts", styles['SectionHeading']))
