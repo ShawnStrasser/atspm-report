@@ -38,7 +38,7 @@ def get_database_connection(server: str, database: str, username: str, verbosity
     
     return engine
 
-def get_data(use_parquet: bool = True, connection_params: dict = None, signals_query: str = None, verbosity: int = 1, days_back: int = 21) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def get_data(use_parquet: bool = True, connection_params: dict = None, signals_query: str = None, verbosity: int = 1, days_back: int = 21) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Get data either from parquet files or database
     
@@ -54,7 +54,7 @@ def get_data(use_parquet: bool = True, connection_params: dict = None, signals_q
         days_back (int): Number of days back to query raw data.
             
     Returns:
-        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]: (maxout_df, actuations_df, signals_df, has_data_df)
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]: (maxout_df, actuations_df, signals_df, has_data_df, ped_df)
     """
     if use_parquet:
         try:
@@ -62,10 +62,11 @@ def get_data(use_parquet: bool = True, connection_params: dict = None, signals_q
             actuations_df = pd.read_parquet('raw_data/detector_health.parquet') # Updated path and filename
             signals_df = pd.read_parquet('raw_data/signals.parquet') # Updated path
             has_data_df = pd.read_parquet('raw_data/has_data.parquet') # Updated path
-            return maxout_df, actuations_df, signals_df, has_data_df
+            ped_df = pd.read_parquet('raw_data/full_ped.parquet')
+            return maxout_df, actuations_df, signals_df, has_data_df, ped_df
         except Exception as e:
             log_message(f"Error reading parquet files: {e}", 1, verbosity)
-            return None, None, None, None
+            return None, None, None, None, None
     else:
         if not connection_params:
             raise ValueError("Database connection parameters required when use_parquet is False")
@@ -82,7 +83,7 @@ def get_data(use_parquet: bool = True, connection_params: dict = None, signals_q
             )
         except Exception as e:
             log_message(f"Failed to connect to database: {str(e)}", 1, verbosity)
-            return None, None, None, None
+            return None, None, None, None, None
             
         # Get today's date (midnight) and the start date
         today_midnight = date.today() # Use date for midnight comparison
@@ -126,7 +127,7 @@ def get_data(use_parquet: bool = True, connection_params: dict = None, signals_q
             except Exception as e:
                 log_message(f"Error executing custom signals query: {str(e)}", 1, verbosity)
                 log_message("Make sure your query returns DeviceId, Name, and Region columns", 1, verbosity)
-                return None, None, None, None
+                return None, None, None, None, None
             
             # Query has_data for missing data analysis
             log_message("\nQuerying has_data...", 1, verbosity)
@@ -138,9 +139,9 @@ def get_data(use_parquet: bool = True, connection_params: dict = None, signals_q
             has_data_df = pd.read_sql(has_data_query, engine)
             log_message(f"Retrieved {len(has_data_df)} has_data records", 1, verbosity)
             
-            return maxout_df, actuations_df, signals_df, has_data_df
+            return maxout_df, actuations_df, signals_df, has_data_df, None
             
         except Exception as e:
             log_message(f"\nError executing queries: {str(e)}", 1, verbosity)
             log_message(f"Query that failed: {e.__context__.args[1] if hasattr(e, '__context__') else 'Unknown query'}", 2, verbosity) # Debug level
-            return None, None, None, None
+            return None, None, None, None, None

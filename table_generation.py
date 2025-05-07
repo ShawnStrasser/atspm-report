@@ -26,6 +26,10 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10)
     # Join with signals data to get signal names
     alerts_df = filtered_df.copy()  # Use all data for sparklines, not just alerts
     
+    # Ensure DeviceId is string type to avoid merge issues
+    signals_df = signals_df.copy()
+    signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
+    
     # Filter alerts for table display
     alert_rows = filtered_df[filtered_df['Alert'] == 1].copy()
     if alert_rows.empty:
@@ -34,7 +38,7 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10)
     # Merge with signals dataframe to get names
     result = pd.merge(
         alert_rows[['DeviceId', 'Phase', 'Date', 'Alert', 'Percent MaxOut']],
-        signals_df[['DeviceId', 'Name']],
+        signals_df[['DeviceId', 'Name', 'Region']], # Added Region for consistency 
         on='DeviceId',
         how='left'
     )
@@ -105,6 +109,10 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max
     # Use all data for sparklines, not just alerts
     detector_df = filtered_df_actuations.copy()
     
+    # Ensure DeviceId is string type to avoid merge issues
+    signals_df = signals_df.copy()
+    signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
+    
     # Filter alerts for table display
     alert_rows = filtered_df_actuations[filtered_df_actuations['Alert'] == 1].copy()
     if alert_rows.empty:
@@ -113,7 +121,7 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max
     # Merge with signals dataframe to get names
     result = pd.merge(
         alert_rows[['DeviceId', 'Detector', 'Date', 'Alert', 'PercentAnomalous', 'Total']],
-        signals_df[['DeviceId', 'Name']],
+        signals_df[['DeviceId', 'Name', 'Region']],  # Updated column names to match signals_df
         on='DeviceId',
         how='left'
     )
@@ -345,6 +353,10 @@ def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_
     # Use all data for sparklines, not just alerts
     missing_data_df = filtered_df_missing_data.copy()
     
+    # Ensure DeviceId is string type to avoid merge issues
+    signals_df = signals_df.copy()
+    signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
+    
     # Filter alerts for table display
     alert_rows = filtered_df_missing_data[filtered_df_missing_data['Alert'] == 1].copy()
     if alert_rows.empty:
@@ -356,7 +368,7 @@ def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_
     # Merge with signals dataframe to get names
     result = pd.merge(
         alert_rows[['DeviceId', 'Date', 'Alert', 'MissingData']],
-        signals_df[['DeviceId', 'Name']],
+        signals_df[['DeviceId', 'Name', 'Region']],  # Updated to include Region for consistency
         on='DeviceId',
         how='left'
     )
@@ -411,3 +423,78 @@ def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_
         result = result.head(max_rows)
     
     return result, unique_devices_with_alerts
+
+def prepare_ped_alerts_table(filtered_df_ped, signals_df, max_rows=10):
+    """
+    Prepare a sorted table of pedestrian alerts with signal name, phase, and date
+    
+    Args:
+        filtered_df_ped: DataFrame containing pedestrian alerts
+        signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
+        max_rows: Maximum number of rows to include in the table
+        
+    Returns:
+        Tuple of (Sorted DataFrame with Signal Name, Phase, Date and Alert columns, total_alerts_count)
+    """
+    if filtered_df_ped.empty:
+        return pd.DataFrame(), 0
+    
+    # Ensure DeviceId is string type to avoid merge issues
+    signals_df = signals_df.copy()
+    signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
+        
+    # Join with signals data to get signal names
+    result = pd.merge(
+        filtered_df_ped[['DeviceId', 'Phase', 'Date']],
+        signals_df[['DeviceId', 'Name', 'Region']], # Added Region for consistency
+        on='DeviceId',
+        how='left'
+    )
+    
+    # Filter out rows where Signal is NaN
+    result = result.dropna(subset=['Name'])
+    
+    if result.empty:
+        return pd.DataFrame(), 0
+    
+    # Get the total count of alerts after filtering but before limiting rows
+    total_alerts_count = len(result)
+    
+    # Rename columns
+    result = result.rename(columns={'Name': 'Signal'})
+    
+    # Add sparkline column - Group by Signal and Phase and collect time series data
+    sparkline_data = {}
+    
+    # Get all DeviceId and Phase pairs
+    device_phase_pairs = result[['DeviceId', 'Phase']].drop_duplicates().values.tolist()
+    
+    # For each device/phase pair, collect all data for sparklines
+    for device_id, phase in device_phase_pairs:
+        # Get all data for this device/phase pair
+        device_data = filtered_df_ped[(filtered_df_ped['DeviceId'] == device_id) & 
+                                (filtered_df_ped['Phase'] == phase)]
+        
+        if not device_data.empty:
+            # Sort by date to ensure correct time series
+            device_data = device_data.sort_values('Date')
+            # Store the full time series data
+            sparkline_data[(device_id, phase)] = [1] * len(device_data)  # Just show presence of alerts
+    
+    # Add the sparkline data to the result dataframe
+    result['Sparkline_Data'] = result.apply(
+        lambda row: sparkline_data.get((row['DeviceId'], row['Phase']), []), 
+        axis=1
+    )
+    
+    # Select and order columns
+    result = result[['Signal', 'Phase', 'Date', 'Sparkline_Data']]
+    
+    # Sort by Signal and Phase
+    result = result.sort_values(by=['Signal', 'Phase'])
+    
+    # Limit the number of rows
+    if max_rows > 0 and len(result) > max_rows:
+        result = result.head(max_rows)
+    
+    return result, total_alerts_count

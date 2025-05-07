@@ -161,7 +161,7 @@ def load_config(config_path=None, config_dict=None):
 
 
 def main(use_parquet=None, connection_params=None, num_figures=None, 
-         email_reports=None, config_path=None, config_dict=None): # Renamed parameter
+         email_reports=None, config_path=None, config_dict=None):
     """
     Main function to run the signal analysis and generate report
     
@@ -196,6 +196,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     alert_retention_weeks = cfg.get('alert_retention_weeks', 104)
     past_alerts_folder = cfg.get('past_alerts_folder', 'Past_Alerts')
     alert_flagging_days = cfg.get('alert_flagging_days', 7) # Load the new parameter
+    use_past_alerts = cfg.get('use_past_alerts', True)  # Default to True for backwards compatibility
 
     # Validate connection params if using database
     if not use_parquet and (not connection_params or 
@@ -208,20 +209,23 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     log_message("Starting signal analysis...", 1, verbosity)
 
     # Create past alerts folder if it doesn't exist
-    try:
-        Path(past_alerts_folder).mkdir(parents=True, exist_ok=True)
-        log_message(f"Ensured past alerts directory exists: {past_alerts_folder}", 2, verbosity)
-    except Exception as e:
-        log_message(f"Error creating past alerts directory {past_alerts_folder}: {e}", 1, verbosity)
-        # Decide if we should stop or continue without saving/loading past alerts
-        # For now, continue, but suppression/history won't work
+    past_alerts = {}
+    if use_past_alerts:
+        try:
+            Path(past_alerts_folder).mkdir(parents=True, exist_ok=True)
+            log_message(f"Ensured past alerts directory exists: {past_alerts_folder}", 2, verbosity)
+            past_alerts = load_past_alerts(past_alerts_folder, output_format, verbosity)
+        except Exception as e:
+            log_message(f"Error handling past alerts: {e}", 1, verbosity)
+    else:
+        log_message("Past alerts handling is disabled", 1, verbosity)
+        # Initialize empty DataFrames for past alerts
+        for alert_type in ALERT_CONFIG:
+            past_alerts[alert_type] = pd.DataFrame(columns=ALERT_CONFIG[alert_type]['id_cols'] + ['Date'])
 
-    # Load past alerts
-    past_alerts = load_past_alerts(past_alerts_folder, output_format, verbosity)
-    
     # Get data
     log_message("Reading data...", 1, verbosity)
-    maxout_df, actuations_df, signals_df, has_data_df = get_data(
+    maxout_df, actuations_df, signals_df, has_data_df, ped_df = get_data(
         use_parquet=use_parquet, 
         connection_params=connection_params,
         signals_query=signals_query,
@@ -235,13 +239,16 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
 
     # Process max out data
     log_message("Processing max out data...", 1, verbosity)
-    df2 = process_maxout_data(maxout_df)
-    log_message(f"Processed max out data. Shape: {df2.shape}", 1, verbosity)
+    maxout_daily, maxout_hourly = process_maxout_data(maxout_df)
+    log_message(f"Processed max out data. Shape: {maxout_daily.shape}", 1, verbosity)
+    log_message(f"Maxout Hourly Data: {maxout_hourly.shape}", 1, verbosity)
     
     # Process actuations data
     log_message("Processing actuations data...", 1, verbosity)
-    detector_health = process_actuations_data(actuations_df)
-    log_message(f"Processed actuations data. Shape: {detector_health.shape}", 1, verbosity)
+    detector_daily, detector_hourly = process_actuations_data(actuations_df)
+    log_message(f"Processed actuations data. Shape: {detector_daily.shape}", 1, verbosity)
+    log_message(f"Detector Hourly Data: {detector_hourly.shape}", 1, verbosity)
+    
     
     # Process missing data
     log_message("Processing missing data...", 1, verbosity)
@@ -250,8 +257,8 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
 
     # Calculate CUSUM and generate alerts
     log_message("Calculating CUSUM statistics...", 1, verbosity)
-    t = cusum(df2, k_value=1)
-    t_actuations = cusum(detector_health, k_value=1)
+    t = cusum(maxout_daily, k_value=1)
+    t_actuations = cusum(detector_daily, k_value=1)
     t_missing_data = cusum(missing_data, k_value=1)
     log_message("CUSUM calculation complete", 1, verbosity)
 
@@ -266,12 +273,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     flagging_cutoff_date = datetime.now() - timedelta(days=alert_flagging_days)
     flagging_cutoff_date_naive = flagging_cutoff_date.replace(tzinfo=None)
 
-    # Ensure 'Date' column is datetime before filtering
-    # Use .copy() to avoid SettingWithCopyWarning
-    new_maxout_alerts['Date'] = pd.to_datetime(new_maxout_alerts['Date']).dt.tz_localize(None)
-    new_actuations_alerts['Date'] = pd.to_datetime(new_actuations_alerts['Date']).dt.tz_localize(None)
-    new_missing_data_alerts['Date'] = pd.to_datetime(new_missing_data_alerts['Date']).dt.tz_localize(None)
-    
+    # Use .copy() to avoid SettingWithCopyWarning   
     recent_new_maxout_alerts = new_maxout_alerts[new_maxout_alerts['Date'] >= flagging_cutoff_date_naive].copy()
     recent_new_actuations_alerts = new_actuations_alerts[new_actuations_alerts['Date'] >= flagging_cutoff_date_naive].copy()
     recent_new_missing_data_alerts = new_missing_data_alerts[new_missing_data_alerts['Date'] >= flagging_cutoff_date_naive].copy()
@@ -280,33 +282,40 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
 
     # Suppress alerts using the RECENT NEW alerts
     log_message("Applying alert suppression...", 1, verbosity)
-    final_maxout_alerts = suppress_alerts(
-        recent_new_maxout_alerts, # Use date-filtered new alerts
-        past_alerts.get('maxout', pd.DataFrame()), 
-        alert_suppression_days, 
-        ALERT_CONFIG['maxout']['id_cols'],
-        verbosity
-    )
-    final_actuations_alerts = suppress_alerts(
-        recent_new_actuations_alerts, # Use date-filtered new alerts
-        past_alerts.get('actuations', pd.DataFrame()), 
-        alert_suppression_days, 
-        ALERT_CONFIG['actuations']['id_cols'],
-        verbosity
-    )
-    final_missing_data_alerts = suppress_alerts(
-        recent_new_missing_data_alerts, # Use date-filtered new alerts
-        past_alerts.get('missing_data', pd.DataFrame()), 
-        alert_suppression_days, 
-        ALERT_CONFIG['missing_data']['id_cols'],
-        verbosity
-    )
+    if use_past_alerts:
+        final_maxout_alerts = suppress_alerts(
+            recent_new_maxout_alerts, # Use date-filtered new alerts
+            past_alerts.get('maxout', pd.DataFrame()), 
+            alert_suppression_days, 
+            ALERT_CONFIG['maxout']['id_cols'],
+            verbosity
+        )
+        final_actuations_alerts = suppress_alerts(
+            recent_new_actuations_alerts, # Use date-filtered new alerts
+            past_alerts.get('actuations', pd.DataFrame()), 
+            alert_suppression_days, 
+            ALERT_CONFIG['actuations']['id_cols'],
+            verbosity
+        )
+        final_missing_data_alerts = suppress_alerts(
+            recent_new_missing_data_alerts, # Use date-filtered new alerts
+            past_alerts.get('missing_data', pd.DataFrame()), 
+            alert_suppression_days, 
+            ALERT_CONFIG['missing_data']['id_cols'],
+            verbosity
+        )
+    else:
+        final_maxout_alerts = recent_new_maxout_alerts
+        final_actuations_alerts = recent_new_actuations_alerts
+        final_missing_data_alerts = recent_new_missing_data_alerts
+        log_message("Alert suppression skipped (past alerts disabled)", 1, verbosity)
+
     log_message(f"Suppression complete. Reporting {len(final_maxout_alerts)} phase alerts, {len(final_actuations_alerts)} detector alerts, {len(final_missing_data_alerts)} missing data alerts.", 1, verbosity) # Updated log message
 
     # Create plots using FINAL (date-filtered and suppressed) alerts
     log_message("Creating visualization plots...", 1, verbosity)
-    phase_figures = create_device_plots(final_maxout_alerts, signals_df, num_figures)
-    detector_figures = create_device_plots(final_actuations_alerts, signals_df, num_figures)
+    phase_figures = create_device_plots(final_maxout_alerts, signals_df, num_figures, df_hourly=maxout_hourly)
+    detector_figures = create_device_plots(final_actuations_alerts, signals_df, num_figures, df_hourly=detector_hourly)
     missing_data_figures = create_device_plots(final_missing_data_alerts, signals_df, num_figures)
     log_message("Plots created successfully", 1, verbosity)
 
@@ -317,7 +326,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
         # Generate reports in memory and email them
         log_message("Generating reports for email delivery...", 1, verbosity)
         report_buffers, region_names = generate_pdf_report(
-            filtered_df=final_maxout_alerts, # Use final
+            filtered_df_maxouts=final_maxout_alerts, # Use final
             filtered_df_actuations=final_actuations_alerts, # Use final
             filtered_df_missing_data=final_missing_data_alerts, # Use final
             phase_figures=phase_figures,
@@ -346,7 +355,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     else:
         # Generate and save PDF reports to disk using final alerts
         pdf_paths = generate_pdf_report(
-            filtered_df=final_maxout_alerts, # Use final
+            filtered_df_maxouts=final_maxout_alerts, # Use final
             filtered_df_actuations=final_actuations_alerts, # Use final
             filtered_df_missing_data=final_missing_data_alerts, # Use final
             phase_figures=phase_figures,
@@ -363,35 +372,38 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
         report_result = pdf_paths
 
     # Update and save past alerts using RECENT NEW alerts (date-filtered, pre-suppression)
-    log_message("Updating and saving past alerts history...", 1, verbosity)
-    update_and_save_alerts(
-        recent_new_maxout_alerts, # Use date-filtered new alerts
-        past_alerts.get('maxout', pd.DataFrame()), 
-        past_alerts_folder, 
-        output_format, 
-        'maxout', 
-        alert_retention_weeks,
-        verbosity
-    )
-    update_and_save_alerts(
-        recent_new_actuations_alerts, # Use date-filtered new alerts
-        past_alerts.get('actuations', pd.DataFrame()), 
-        past_alerts_folder, 
-        output_format, 
-        'actuations', 
-        alert_retention_weeks,
-        verbosity
-    )
-    update_and_save_alerts(
-        recent_new_missing_data_alerts, # Use date-filtered new alerts
-        past_alerts.get('missing_data', pd.DataFrame()), 
-        past_alerts_folder, 
-        output_format, 
-        'missing_data', 
-        alert_retention_weeks,
-        verbosity
-    )
-    log_message("Past alerts history updated.", 1, verbosity)
+    if use_past_alerts:
+        log_message("Updating and saving past alerts history...", 1, verbosity)
+        update_and_save_alerts(
+            recent_new_maxout_alerts, # Use date-filtered new alerts
+            past_alerts.get('maxout', pd.DataFrame()), 
+            past_alerts_folder, 
+            output_format, 
+            'maxout', 
+            alert_retention_weeks,
+            verbosity
+        )
+        update_and_save_alerts(
+            recent_new_actuations_alerts, # Use date-filtered new alerts
+            past_alerts.get('actuations', pd.DataFrame()), 
+            past_alerts_folder, 
+            output_format, 
+            'actuations', 
+            alert_retention_weeks,
+            verbosity
+        )
+        update_and_save_alerts(
+            recent_new_missing_data_alerts, # Use date-filtered new alerts
+            past_alerts.get('missing_data', pd.DataFrame()), 
+            past_alerts_folder, 
+            output_format, 
+            'missing_data', 
+            alert_retention_weeks,
+            verbosity
+        )
+        log_message("Past alerts history updated.", 1, verbosity)
+    else:
+        log_message("Skipped updating past alerts (disabled in config)", 1, verbosity)
 
     return report_result
 
