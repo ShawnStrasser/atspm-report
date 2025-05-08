@@ -28,7 +28,18 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
     })
     
     # Determine the type of data and set appropriate columns
-    if 'Percent MaxOut' in df_daily.columns:
+    if 'PedActuation' in df_hourly.columns if df_hourly is not None else False:
+        # Pedestrian data handling
+        group_column = 'Phase'
+        left_value_column = 'PedServices'
+        right_value_column = 'PedActuation'
+        plot_title = 'Pedestrian Services and Actuations'
+        y_label_left = 'Ped Services'
+        y_label_right = 'Ped Actuations'
+        use_percent_format = False
+        fixed_y_limits = None
+        is_ped_data = True
+    elif 'Percent MaxOut' in df_daily.columns:
         group_column = 'Phase'
         value_column = 'Percent MaxOut'
         ranking_column = 'CUSUM_Percent MaxOut'
@@ -36,6 +47,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
         y_label = 'Percent MaxOut'
         use_percent_format = True
         fixed_y_limits = (-0.02, 1.02)
+        is_ped_data = False
     elif 'PercentAnomalous' in df_daily.columns:
         group_column = 'Detector'
         value_column = 'Total'  # Changed from PercentAnomalous to Total
@@ -46,6 +58,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
         y_label_hourly = 'Hourly Total'
         use_percent_format = False
         fixed_y_limits = None
+        is_ped_data = False
     elif 'MissingData' in df_daily.columns:
         group_column = None
         value_column = 'MissingData'
@@ -54,7 +67,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
         y_label = 'Missing Data'
         use_percent_format = True
         fixed_y_limits = (-0.02, 1.02)
-        is_missing_data = True  # Flag to identify missing data charts
+        is_ped_data = False
     else:
         raise ValueError("Unknown data format in DataFrame")
     
@@ -170,6 +183,115 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 figures.append((fig, region))
             
             continue  # Skip the rest of the loop for missing data charts
+            
+        # For pedestrian data, process differently
+        if is_ped_data:
+            # Use the first num_figures devices from df_daily for this region
+            region_data = df_daily[df_daily['DeviceId'].isin(region_devices)]
+            unique_devices = region_data['DeviceId'].unique()
+            top_devices = unique_devices[:min(num_figures, len(unique_devices))]
+            devices_info = region_signals[region_signals['DeviceId'].isin(top_devices)]
+            
+            # Create a plot for each DeviceId
+            for device_id in top_devices:
+                device_info = devices_info[devices_info['DeviceId'] == device_id].iloc[0]
+                device = device_info['DeviceId']
+                name = device_info['Name']
+                
+                # Filter hourly data for this device
+                plot_data = df_hourly[df_hourly['DeviceId'] == device]
+                time_column = 'TimeStamp'
+                
+                # Skip if no data
+                if plot_data.empty:
+                    continue
+                
+                # Create the plot with a bigger figure size for better readability
+                fig, ax1 = plt.subplots(figsize=(10, 5))
+                ax2 = ax1.twinx()  # Create a second y-axis
+                
+                # Get the min and max dates for the device data to set x-axis limits
+                min_date = plot_data[time_column].min()
+                max_date = plot_data[time_column].max()
+                
+                # Get all phases for this device
+                phases = sorted(plot_data[group_column].unique())
+                
+                # Plot each phase with both services and actuations
+                for i, phase in enumerate(phases):
+                    # Filter data for this phase
+                    phase_data = plot_data[plot_data[group_column] == phase]
+                    color = colors[i % len(colors)]
+                    
+                    # Plot PedServices on left y-axis with solid line
+                    ax1.plot(phase_data[time_column], phase_data[left_value_column], 
+                             color=color, linewidth=2.5, 
+                             label=f'Phase {phase} - Services',
+                             linestyle='-')
+                    
+                    # Plot PedActuation on right y-axis with dashed line
+                    ax2.plot(phase_data[time_column], phase_data[right_value_column], 
+                             color=color, linewidth=2.0, 
+                             label=f'Phase {phase} - Actuations',
+                             linestyle='--', 
+                             dashes=(4, 2))  # Custom dash pattern for better visibility
+                
+                # Set axes labels
+                ax1.set_ylabel(y_label_left, fontweight='bold', color='black')
+                ax2.set_ylabel(y_label_right, fontweight='bold', color='black')
+                
+                # Set the x-axis limits to match the data range exactly
+                ax1.set_xlim(min_date, max_date)
+                
+                # Customize the plot with improved styling
+                ax1.set_title(f'Hourly {plot_title}\n{name}',
+                              pad=20, fontweight='bold')
+                
+                ax1.grid(True, alpha=0.3, linestyle='--')
+                
+                # Combine legends from both axes
+                lines1, labels1 = ax1.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                
+                # Create custom legend entries to show solid/dashed line styles for services/actuations
+                from matplotlib.lines import Line2D
+                legend_elements = []
+                for i, phase in enumerate(phases):
+                    color = colors[i % len(colors)]
+                    # Add services line (solid)
+                    legend_elements.append(Line2D([0], [0], color=color, linewidth=2.5,
+                                                  label=f'Phase {phase} - Services'))
+                    # Add actuations line (dashed)
+                    legend_elements.append(Line2D([0], [0], color=color, linewidth=2.0,
+                                                  linestyle='--', dashes=(4, 2),
+                                                  label=f'Phase {phase} - Actuations'))
+                
+                # Add the combined legend
+                ax1.legend(handles=legend_elements, frameon=True, fancybox=True, framealpha=0.9,
+                           loc='upper left', bbox_to_anchor=(0.01, 1))
+                
+                # Rotate x-axis labels for better readability and add padding
+                plt.xticks(rotation=45, ha='right')
+                
+                # Add light gray background
+                ax1.set_facecolor('#f8f8f8')  # Very light gray background
+                
+                # Add border around plot
+                for spine in ax1.spines.values():
+                    spine.set_linewidth(1.2)
+                
+                # Format ticks on both y-axes to show integers
+                ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                
+                # Adjust layout to prevent label cutoff with more padding
+                plt.tight_layout(pad=2.0)
+                
+                # Add to figures list
+                figures.append((fig, region))
+                
+            # Continue to the next region after processing pedestrian data
+            continue
             
         # For other chart types, find top N devices for this region based on maximum ranking values
         device_rankings = region_data.groupby('DeviceId')[ranking_column].max().sort_values(ascending=False)

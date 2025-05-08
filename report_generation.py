@@ -14,6 +14,7 @@ from typing import List, Tuple, Union
 from table_generation import (
     prepare_phase_termination_alerts_table,
     prepare_detector_health_alerts_table,
+    prepare_ped_alerts_table,
     prepare_missing_data_alerts_table,
     create_reportlab_table
 )
@@ -188,9 +189,12 @@ def draw_page_footer(canvas, page_num, num_pages, region=None):
 def generate_pdf_report(
         filtered_df_maxouts: pd.DataFrame, 
         filtered_df_actuations: pd.DataFrame,
+        filtered_df_ped: pd.DataFrame,
+        ped_hourly_df: pd.DataFrame,
         filtered_df_missing_data: pd.DataFrame,
         phase_figures: List[tuple[plt.Figure, str]],
         detector_figures: List[tuple[plt.Figure, str]],
+        ped_figures: List[tuple[plt.Figure, str]],
         missing_data_figures: List[tuple[plt.Figure, str]],
         signals_df: pd.DataFrame = None,
         output_path: str = "ATSPM_Report_{region}.pdf",
@@ -228,6 +232,7 @@ def generate_pdf_report(
         # Filter figures for this region
         region_phase_figures = [fig for fig, reg in phase_figures if reg == region]
         region_detector_figures = [fig for fig, reg in detector_figures if reg == region]
+        region_ped_figures = [fig for fig, reg in ped_figures if reg == region]
         region_missing_data_figures = [fig for fig, reg in missing_data_figures if reg == region]
 
         # Filter signals
@@ -309,9 +314,9 @@ def generate_pdf_report(
         content.append(Spacer(1, 0.2*inch))
 
         # Introduction text
-        intro_text = f"""This report for {region} includes alerts for detector health, increased percent maxout, and data completeness. 
+        intro_text = f"""This report for {region} includes alerts for increased percent maxout, vehicle & pedestrian detector alerts, and data completeness. 
         These are new alerts, focusing on the most critical issues within the last week. Signals Weekly is still in development, so please provide feedback.
-        Development will continue, with plans to add ped detector monitoring soon."""
+        """
         content.append(Paragraph(intro_text, styles['Normal']))
         content.append(Spacer(1, 0.2*inch))
 
@@ -391,6 +396,44 @@ def generate_pdf_report(
             
             # Add detector health charts without additional header
             for fig in region_detector_figures:
+                # Wrap each chart in a KeepTogether to ensure it stays on one page
+                chart_elements = []
+                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                content.append(KeepTogether(chart_elements))
+                content.append(Spacer(1, 0.15*inch))
+                plt.close(fig)
+
+
+        # Section: Ped Detector Health
+        if len(filtered_df_ped) > 0 and region_ped_figures:
+            content.append(Paragraph("Pedestrian Detector Alerts", styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+
+            explanation = """Pedestrian detector alerts are are generated when an anomaly in ped services and/or actuations is detected."""
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+            
+            if region_signals_df is not None:
+                # Create detector health table with row limit
+                detector_alerts_df, total_detector_alerts = prepare_ped_alerts_table(
+                    filtered_df_ped, 
+                    ped_hourly_df,
+                    region_signals_df,
+                    max_rows=max_table_rows
+                )
+                
+                table_content = create_reportlab_table(
+                    detector_alerts_df, 
+                    "Ped Detector Alerts", 
+                    styles,
+                    total_count=total_detector_alerts,
+                    max_rows=max_table_rows
+                )
+                content.extend(table_content)
+                content.append(Spacer(1, 0.3*inch))
+            
+            # Add detector health charts without additional header
+            for fig in region_ped_figures:
                 # Wrap each chart in a KeepTogether to ensure it stays on one page
                 chart_elements = []
                 chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))

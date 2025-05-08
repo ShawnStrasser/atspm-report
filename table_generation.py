@@ -233,19 +233,7 @@ def create_sparkline(data, width=1.0, height=0.25, color='#1f77b4'):
     return Image(buf, width=width*inch, height=height*inch)
 
 def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
-    """
-    Create a ReportLab table from a pandas DataFrame
-    
-    Args:
-        df: DataFrame containing table data
-        title: Title for the table (unused now, kept for backwards compatibility)
-        styles: ReportLab styles object
-        total_count: Total number of alerts (if different from the number of rows)
-        max_rows: Maximum number of rows displayed in the table
-        
-    Returns:
-        List of ReportLab flowables (Table and row count notice)
-    """
+    """Create a ReportLab table from a pandas DataFrame"""
     if df.empty:
         return [Paragraph("No alerts found", styles['Normal'])]
     
@@ -263,6 +251,9 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
     if 'Sparkline_Data' in df_display.columns:
         sparkline_data = df_display['Sparkline_Data'].tolist()
         df_display = df_display.drop(columns=['Sparkline_Data'])
+    elif 'Hourly Services Trend' in df_display.columns:
+        sparkline_data = df_display['Hourly Services Trend'].tolist()
+        df_display = df_display.drop(columns=['Hourly Services Trend'])
     
     # Format percentage columns if they exist
     if 'MaxOut %' in df_display.columns:
@@ -272,8 +263,9 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
     if 'Missing Data %' in df_display.columns:
         df_display['Missing Data %'] = df_display['Missing Data %'].apply(lambda x: f"{x:.1%}")
     
-    # Format date column
-    df_display['Date'] = df_display['Date'].dt.strftime('%Y-%m-%d')
+    # Convert non-sparkline columns to strings
+    for col in df_display.columns:
+        df_display[col] = df_display[col].astype(str)
     
     # Add Trend column header
     df_display['Trend'] = ""
@@ -282,7 +274,7 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
     header = df_display.columns.tolist()
     data = [header]
     
-    # Add rows 
+    # Add rows
     for _, row in df_display.iterrows():
         data.append(row.tolist())
     
@@ -304,7 +296,7 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
         ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
         ('FONTSIZE', (0, 1), (-1, -1), 9),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),  # Vertically center all content
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
     ])
     
     # Add alternating row colors
@@ -424,17 +416,18 @@ def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_
     
     return result, unique_devices_with_alerts
 
-def prepare_ped_alerts_table(filtered_df_ped, signals_df, max_rows=10):
+def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_rows=10):
     """
-    Prepare a sorted table of pedestrian alerts with signal name, phase, and date
+    Prepare a sorted table of pedestrian alerts with signal name, phase, and hourly ped services
     
     Args:
-        filtered_df_ped: DataFrame containing pedestrian alerts
+        filtered_df_ped: DataFrame containing pedestrian alerts (with DeviceId, Phase, Date)
+        ped_hourly_df: DataFrame containing hourly pedestrian data (with DeviceId, Phase, TimeStamp, PedServices)
         signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
         max_rows: Maximum number of rows to include in the table
         
     Returns:
-        Tuple of (Sorted DataFrame with Signal Name, Phase, Date and Alert columns, total_alerts_count)
+        Tuple of (Sorted DataFrame with Signal Name, Phase, Alert Dates and Sparkline columns, total_alerts_count)
     """
     if filtered_df_ped.empty:
         return pd.DataFrame(), 0
@@ -442,10 +435,20 @@ def prepare_ped_alerts_table(filtered_df_ped, signals_df, max_rows=10):
     # Ensure DeviceId is string type to avoid merge issues
     signals_df = signals_df.copy()
     signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
-        
+    filtered_df_ped = filtered_df_ped.copy()
+    filtered_df_ped['DeviceId'] = filtered_df_ped['DeviceId'].astype(str)
+    ped_hourly_df = ped_hourly_df.copy()
+    ped_hourly_df['DeviceId'] = ped_hourly_df['DeviceId'].astype(str)
+    
+    # Get the total count of unique ped detectors with alerts (distinct DeviceId/Phase combinations)
+    total_alerts_count = filtered_df_ped[['DeviceId', 'Phase']].drop_duplicates().shape[0]
+    
+    # Group all dates for each DeviceId/Phase combination
+    dates_grouped = filtered_df_ped.groupby(['DeviceId', 'Phase'])['Date'].agg(list).reset_index()
+    
     # Join with signals data to get signal names
     result = pd.merge(
-        filtered_df_ped[['DeviceId', 'Phase', 'Date']],
+        dates_grouped,
         signals_df[['DeviceId', 'Name', 'Region']], # Added Region for consistency
         on='DeviceId',
         how='left'
@@ -457,44 +460,51 @@ def prepare_ped_alerts_table(filtered_df_ped, signals_df, max_rows=10):
     if result.empty:
         return pd.DataFrame(), 0
     
-    # Get the total count of alerts after filtering but before limiting rows
-    total_alerts_count = len(result)
+    # Format dates as strings and join with newlines for stacked appearance
+    result['Date'] = result['Date'].apply(
+        lambda dates: '\n'.join(d.strftime('%Y-%m-%d') for d in sorted(dates))
+    )
     
     # Rename columns
-    result = result.rename(columns={'Name': 'Signal'})
+    result = result.rename(columns={
+        'Name': 'Signal',
+        'Date': 'Alert Dates'
+    })
     
-    # Add sparkline column - Group by Signal and Phase and collect time series data
+    # Add sparkline column using ped_hourly_df data
     sparkline_data = {}
     
     # Get all DeviceId and Phase pairs
     device_phase_pairs = result[['DeviceId', 'Phase']].drop_duplicates().values.tolist()
     
-    # For each device/phase pair, collect all data for sparklines
+    # For each device/phase pair, collect hourly ped services data for sparklines
     for device_id, phase in device_phase_pairs:
-        # Get all data for this device/phase pair
-        device_data = filtered_df_ped[(filtered_df_ped['DeviceId'] == device_id) & 
-                                (filtered_df_ped['Phase'] == phase)]
+        # Get hourly data for this device/phase pair
+        hourly_data = ped_hourly_df[
+            (ped_hourly_df['DeviceId'] == device_id) & 
+            (ped_hourly_df['Phase'] == phase)
+        ]
         
-        if not device_data.empty:
-            # Sort by date to ensure correct time series
-            device_data = device_data.sort_values('Date')
-            # Store the full time series data
-            sparkline_data[(device_id, phase)] = [1] * len(device_data)  # Just show presence of alerts
+        if not hourly_data.empty:
+            # Sort by timestamp to ensure correct time series
+            hourly_data = hourly_data.sort_values('TimeStamp')
+            # Store the PedServices data for sparklines
+            sparkline_data[(device_id, phase)] = hourly_data['PedServices'].tolist()
     
     # Add the sparkline data to the result dataframe
-    result['Sparkline_Data'] = result.apply(
+    result['Hourly Services Trend'] = result.apply(
         lambda row: sparkline_data.get((row['DeviceId'], row['Phase']), []), 
         axis=1
     )
     
     # Select and order columns
-    result = result[['Signal', 'Phase', 'Date', 'Sparkline_Data']]
+    result = result[['Signal', 'Phase', 'Alert Dates', 'Hourly Services Trend']]
     
     # Sort by Signal and Phase
     result = result.sort_values(by=['Signal', 'Phase'])
     
-    # Limit the number of rows
-    if max_rows > 0 and len(result) > max_rows:
+    # Limit the number of rows if needed
+    if len(result) > max_rows:
         result = result.head(max_rows)
     
     return result, total_alerts_count

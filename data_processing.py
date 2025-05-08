@@ -115,7 +115,6 @@ def process_missing_data(has_data_df):
     
     return result.execute()
 
-import pandas as pd
 def process_ped(df_ped, df_maxout, df_intersections):
     """Process the max out data to calculate daily aggregates"""
     sql = """
@@ -208,7 +207,7 @@ def process_ped(df_ped, df_maxout, df_intersections):
 
     select Date, DeviceId, Phase
     from t6
-    WHERE Ped_Combined_ZScore <=-9 OR Ped_Actuations_Alert = 1
+    WHERE Ped_Combined_ZScore <=-11-- OR Ped_Actuations_Alert = 1--eratic alerts is broken for now need to fix!
     ORDER BY ALL
     """
 

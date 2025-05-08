@@ -163,7 +163,7 @@ def load_config(config_path=None, config_dict=None):
 
 
 def main(use_parquet=None, connection_params=None, num_figures=None, 
-         email_reports=None, config_path=None, config_dict=None):
+         should_email_reports=None, config_path=None, config_dict=None):
     """
     Main function to run the signal analysis and generate report
     
@@ -171,13 +171,13 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
         use_parquet (bool): If True, read from parquet files, otherwise query database
         connection_params (dict): Database connection parameters if use_parquet is False
         num_figures (int): Number of figures to generate for each device
-        email_reports (bool): If True, email reports instead of saving to disk # Renamed parameter
+        should_email_reports (bool): If True, email reports instead of saving to disk
         config_path (str): Path to JSON config file
         config_dict (dict): Directly provided config dictionary
         
     Returns:
-        tuple or None: If email_reports is True, returns (success, report_buffers, region_names)
-                      If email_reports is False, returns (pdf_paths)
+        tuple or None: If should_email_reports is True, returns (success, report_buffers, region_names)
+                      If should_email_reports is False, returns (pdf_paths)
                       Returns None if data loading fails
     """
     # Load configuration
@@ -187,7 +187,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     use_parquet = use_parquet if use_parquet is not None else cfg.get('use_parquet', True)
     connection_params = connection_params or cfg.get('connection_params')
     num_figures = num_figures if num_figures is not None else cfg.get('num_figures', 1)
-    email_reports = email_reports if email_reports is not None else cfg.get('email_reports', False) # Updated key and variable name
+    should_email_reports = should_email_reports if should_email_reports is not None else cfg.get('email_reports', False)
     signals_query = cfg.get('signals_query')
     verbosity = cfg.get('verbosity', 1) # Get verbosity from config, default to 1
     days_back = cfg.get('days_back', 21) # Get days_back from config, default to 21
@@ -335,20 +335,24 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     phase_figures = create_device_plots(final_maxout_alerts, signals_df, num_figures, df_hourly=maxout_hourly)
     detector_figures = create_device_plots(final_actuations_alerts, signals_df, num_figures, df_hourly=detector_hourly)
     missing_data_figures = create_device_plots(final_missing_data_alerts, signals_df, num_figures)
+    ped_figures = create_device_plots(final_ped_alerts, signals_df, num_figures, ped_hourly)
     log_message("Plots created successfully", 1, verbosity)
 
     # Generate PDF reports using FINAL (date-filtered and suppressed) alerts
     log_message("Generating PDF reports...", 1, verbosity)
     report_result = None
-    if email_reports: # Updated variable name
+    if should_email_reports:
         # Generate reports in memory and email them
         log_message("Generating reports for email delivery...", 1, verbosity)
         report_buffers, region_names = generate_pdf_report(
             filtered_df_maxouts=final_maxout_alerts, # Use final
             filtered_df_actuations=final_actuations_alerts, # Use final
+            filtered_df_ped=final_ped_alerts, # Include pedestrian alerts
+            ped_hourly_df=ped_hourly, # Include pedestrian hourly data
             filtered_df_missing_data=final_missing_data_alerts, # Use final
             phase_figures=phase_figures,
             detector_figures=detector_figures,
+            ped_figures=ped_figures, # Include pedestrian figures
             missing_data_figures=missing_data_figures,
             signals_df=signals_df,
             save_to_disk=False,
@@ -375,9 +379,12 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
         pdf_paths = generate_pdf_report(
             filtered_df_maxouts=final_maxout_alerts, # Use final
             filtered_df_actuations=final_actuations_alerts, # Use final
+            filtered_df_ped=final_ped_alerts, # Include pedestrian alerts
+            ped_hourly_df=ped_hourly, # Include pedestrian hourly data
             filtered_df_missing_data=final_missing_data_alerts, # Use final
             phase_figures=phase_figures,
             detector_figures=detector_figures,
+            ped_figures=ped_figures, # Include pedestrian figures
             missing_data_figures=missing_data_figures,
             signals_df=signals_df,
             save_to_disk=True,
@@ -419,6 +426,15 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             alert_retention_weeks,
             verbosity
         )
+        update_and_save_alerts(
+            recent_new_ped_alerts, # Use date-filtered new pedestrian alerts
+            past_alerts.get('pedestrian', pd.DataFrame()),
+            past_alerts_folder,
+            output_format,
+            'pedestrian',
+            alert_retention_weeks,
+            verbosity
+        )
         log_message("Past alerts history updated.", 1, verbosity)
     else:
         log_message("Skipped updating past alerts (disabled in config)", 1, verbosity)
@@ -449,7 +465,7 @@ def run_from_command_line():
         main(
             config_path=args.config,
             use_parquet=use_parquet,
-            email_reports=email_reports_override, # Pass the override value
+            should_email_reports=email_reports_override, # Pass the override value
             num_figures=num_figures
             # Verbosity will be loaded inside main
         )

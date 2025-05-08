@@ -1,0 +1,9 @@
+env_report/
+__pycache__/
+config.json
+*.pdf
+developing.ipynb
+raw_data/
+Past_Alerts/
+emails.csv
+emails_test.csv
