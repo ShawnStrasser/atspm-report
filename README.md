@@ -58,9 +58,7 @@ The application is configured using a JSON configuration file (default: `config.
 
 ### Data Requirements
 
-#### Signals Data Format
-
-When using the database connection mode, your `signals_query` must return exactly these columns:
+Performance data must match the structure produced by the Python atspm package, and the list of traffic signals must include:
 
 - `DeviceId`: The unique identifier for each signal
 - `Name`: A human-readable name for the signal
@@ -69,7 +67,7 @@ When using the database connection mode, your `signals_query` must return exactl
 
 #### Email Configuration
 
-For email functionality, create an `emails.csv` file with the following format:
+Emails are automatically sent from Outlook using the account on the machine where the script is run. For email functionality, create an `emails.csv` file with the following format:
 
 ```
 Region,Email
@@ -97,12 +95,9 @@ Specify a different configuration file:
 python ATSPMReport.py --config path/to/config.json
 ```
 
-Override configuration settings:
-```
-python ATSPMReport.py --use-database --email --figures 3
-```
 
-### Import as Module
+
+### Import as Module (not tested yet)
 
 The script can also be imported and used programmatically:
 
