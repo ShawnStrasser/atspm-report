@@ -10,7 +10,8 @@ from data_processing import (
     process_actuations_data,
     process_missing_data,
     cusum,
-    alert
+    alert,
+    process_ped
 )
 from visualization import create_device_plots
 from report_generation import generate_pdf_report
@@ -21,7 +22,8 @@ from utils import log_message # Import the utility function
 ALERT_CONFIG = {
     'maxout': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'maxout_alerts'},
     'actuations': {'id_cols': ['DeviceId', 'Detector'], 'file_suffix': 'actuations_alerts'},
-    'missing_data': {'id_cols': ['DeviceId'], 'file_suffix': 'missing_data_alerts'}
+    'missing_data': {'id_cols': ['DeviceId'], 'file_suffix': 'missing_data_alerts'},
+    'pedestrian': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'pedestrian_alerts'}
 }
 
 def load_past_alerts(folder: str, file_format: str, verbosity: int) -> dict:
@@ -249,11 +251,18 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     log_message(f"Processed actuations data. Shape: {detector_daily.shape}", 1, verbosity)
     log_message(f"Detector Hourly Data: {detector_hourly.shape}", 1, verbosity)
     
-    
     # Process missing data
     log_message("Processing missing data...", 1, verbosity)
     missing_data = process_missing_data(has_data_df)
     log_message(f"Processed missing data. Shape: {missing_data.shape}", 1, verbosity)
+
+    # Process ped data
+    log_message("Processing pedestrian data...", 1, verbosity)
+    ped_alerts, ped_hourly = process_ped(df_ped=ped_df, df_maxout=maxout_daily, df_intersections=signals_df)
+    log_message(f"Processed pedestrian data. Shape: {ped_alerts.shape}", 1, verbosity)
+    print(f"Pedestrian Hourly Data: {ped_hourly.shape}", 1, verbosity)
+    print(ped_hourly.head())
+    print(ped_hourly.tail())
 
     # Calculate CUSUM and generate alerts
     log_message("Calculating CUSUM statistics...", 1, verbosity)
@@ -277,6 +286,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     recent_new_maxout_alerts = new_maxout_alerts[new_maxout_alerts['Date'] >= flagging_cutoff_date_naive].copy()
     recent_new_actuations_alerts = new_actuations_alerts[new_actuations_alerts['Date'] >= flagging_cutoff_date_naive].copy()
     recent_new_missing_data_alerts = new_missing_data_alerts[new_missing_data_alerts['Date'] >= flagging_cutoff_date_naive].copy()
+    recent_new_ped_alerts = ped_alerts[ped_alerts['Date'] >= flagging_cutoff_date_naive].copy()
     
     log_message(f"Filtered new alerts. Keeping {len(recent_new_maxout_alerts)} phase, {len(recent_new_actuations_alerts)} detector, {len(recent_new_missing_data_alerts)} missing data alerts for suppression and saving.", 2, verbosity)
 
@@ -304,10 +314,18 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             ALERT_CONFIG['missing_data']['id_cols'],
             verbosity
         )
+        final_ped_alerts = suppress_alerts(
+            recent_new_ped_alerts, # Use date-filtered new alerts
+            past_alerts.get('pedestrian', pd.DataFrame()), 
+            alert_suppression_days, 
+            ALERT_CONFIG['pedestrian']['id_cols'],
+            verbosity
+        )
     else:
         final_maxout_alerts = recent_new_maxout_alerts
         final_actuations_alerts = recent_new_actuations_alerts
         final_missing_data_alerts = recent_new_missing_data_alerts
+        final_ped_alerts = recent_new_ped_alerts
         log_message("Alert suppression skipped (past alerts disabled)", 1, verbosity)
 
     log_message(f"Suppression complete. Reporting {len(final_maxout_alerts)} phase alerts, {len(final_actuations_alerts)} detector alerts, {len(final_missing_data_alerts)} missing data alerts.", 1, verbosity) # Updated log message

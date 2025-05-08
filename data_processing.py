@@ -115,6 +115,7 @@ def process_missing_data(has_data_df):
     
     return result.execute()
 
+import pandas as pd
 def process_ped(df_ped, df_maxout, df_intersections):
     """Process the max out data to calculate daily aggregates"""
     sql = """
@@ -210,4 +211,61 @@ def process_ped(df_ped, df_maxout, df_intersections):
     WHERE Ped_Combined_ZScore <=-9 OR Ped_Actuations_Alert = 1
     ORDER BY ALL
     """
-    return duckdb.sql(sql).df()
+
+    start_date = duckdb.sql("SELECT max(TimeStamp::date) - interval '6 days' as startdate from df_ped").fetchone()[0]
+    sql2 = f"""
+    WITH t1 AS (
+        SELECT
+            time_bucket(interval '60 minutes', TimeStamp) as TimeStamp,
+            DeviceId,
+            Phase,
+            SUM(PedServices) as PedServices,
+            SUM(PedActuation) as PedActuation
+        FROM df_ped
+        WHERE TimeStamp >= '{start_date}'
+        GROUP BY ALL
+    ),
+    devices_phases AS (
+        SELECT DISTINCT DeviceId, Phase FROM t1
+    ),
+    time_boundaries AS (
+        SELECT 
+            MIN(TimeStamp) AS min_time,
+            MAX(TimeStamp) AS max_time
+        FROM t1
+    ),
+    time_series AS (
+        SELECT
+            generate_series AS TimeStamp
+        FROM generate_series(
+            (SELECT min_time FROM time_boundaries),
+            (SELECT max_time FROM time_boundaries),
+            INTERVAL '1 HOUR'
+        )
+    ),
+    scaffold AS (
+        SELECT 
+            ts.TimeStamp,
+            dp.DeviceId,
+            dp.Phase
+        FROM time_series ts
+        CROSS JOIN devices_phases dp
+    ),
+    filled_data AS (
+        SELECT
+            s.TimeStamp,
+            s.DeviceId,
+            s.Phase,
+            COALESCE(t1.PedServices, 0) AS PedServices,
+            COALESCE(t1.PedActuation, 0) AS PedActuation
+        FROM scaffold s
+        LEFT JOIN t1 ON 
+            s.TimeStamp = t1.TimeStamp
+            AND s.DeviceId = t1.DeviceId
+            AND s.Phase = t1.Phase
+    )
+    SELECT * FROM filled_data
+    ORDER BY TimeStamp, DeviceId, Phase
+    """
+    
+    return duckdb.sql(sql).df(), duckdb.sql(sql2).df()
