@@ -232,7 +232,7 @@ def create_sparkline(data, width=1.0, height=0.25, color='#1f77b4'):
     
     return Image(buf, width=width*inch, height=height*inch)
 
-def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
+def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, include_trend=True):
     """Create a ReportLab table from a pandas DataFrame"""
     if df.empty:
         return [Paragraph("No alerts found", styles['Normal'])]
@@ -262,13 +262,13 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
         df_display['Anomalous %'] = df_display['Anomalous %'].apply(lambda x: f"{x:.1%}")
     if 'Missing Data %' in df_display.columns:
         df_display['Missing Data %'] = df_display['Missing Data %'].apply(lambda x: f"{x:.1%}")
-    
-    # Convert non-sparkline columns to strings
+      # Convert non-sparkline columns to strings
     for col in df_display.columns:
         df_display[col] = df_display[col].astype(str)
     
-    # Add Trend column header
-    df_display['Trend'] = ""
+    # Add Trend column header only if requested
+    if include_trend:
+        df_display['Trend'] = ""
     
     # Create header and data for the table
     header = df_display.columns.tolist()
@@ -277,9 +277,11 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
     # Add rows
     for _, row in df_display.iterrows():
         data.append(row.tolist())
-    
-    # Create the table
-    colWidths = [None] * (len(header) - 1) + [1.2*inch]  # Make the Trend column wider
+      # Create the table
+    if include_trend:
+        colWidths = [None] * (len(header) - 1) + [1.2*inch]  # Make the Trend column wider
+    else:
+        colWidths = [None] * len(header)  # Equal width for all columns
     table = Table(data, colWidths=colWidths)
     
     # Style the table
@@ -305,9 +307,8 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10):
     
     # Apply the table style
     table.setStyle(table_style)
-    
-    # If we have sparklines, add them to the last column after the table is created
-    if sparkline_data is not None:
+      # If we have sparklines and trend column is included, add them to the last column after the table is created
+    if sparkline_data is not None and include_trend:
         for i, data_points in enumerate(sparkline_data):
             row_index = i + 1  # +1 because row 0 is the header
             
@@ -353,11 +354,7 @@ def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_
     alert_rows = filtered_df_missing_data[filtered_df_missing_data['Alert'] == 1].copy()
     if alert_rows.empty:
         return pd.DataFrame(), 0
-    
-    # Get the total count of unique devices with alerts before limiting rows
-    unique_devices_with_alerts = alert_rows['DeviceId'].nunique()
-        
-    # Merge with signals dataframe to get names
+      # Merge with signals dataframe to get names
     result = pd.merge(
         alert_rows[['DeviceId', 'Date', 'Alert', 'MissingData']],
         signals_df[['DeviceId', 'Name', 'Region']],  # Updated to include Region for consistency
@@ -370,6 +367,9 @@ def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_
     
     if result.empty:
         return pd.DataFrame(), 0
+    
+    # Get the total count of unique devices with alerts after region filtering
+    unique_devices_with_alerts = result['DeviceId'].nunique()
     
     # Rename and select columns
     result = result.rename(columns={'Name': 'Signal', 'MissingData': 'Missing Data %'})
@@ -439,11 +439,7 @@ def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_row
     filtered_df_ped['DeviceId'] = filtered_df_ped['DeviceId'].astype(str)
     ped_hourly_df = ped_hourly_df.copy()
     ped_hourly_df['DeviceId'] = ped_hourly_df['DeviceId'].astype(str)
-    
-    # Get the total count of unique ped detectors with alerts (distinct DeviceId/Phase combinations)
-    total_alerts_count = filtered_df_ped[['DeviceId', 'Phase']].drop_duplicates().shape[0]
-    
-    # Group all dates for each DeviceId/Phase combination
+      # Group all dates for each DeviceId/Phase combination
     dates_grouped = filtered_df_ped.groupby(['DeviceId', 'Phase'])['Date'].agg(list).reset_index()
     
     # Join with signals data to get signal names
@@ -459,6 +455,9 @@ def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_row
     
     if result.empty:
         return pd.DataFrame(), 0
+    
+    # Get the total count of unique ped detectors with alerts after region filtering (distinct DeviceId/Phase combinations)
+    total_alerts_count = result[['DeviceId', 'Phase']].drop_duplicates().shape[0]
     
     # Format dates as strings and join with newlines for stacked appearance
     result['Date'] = result['Date'].apply(
@@ -508,3 +507,36 @@ def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_row
         result = result.head(max_rows)
     
     return result, total_alerts_count
+
+def prepare_system_outages_table(system_outages_df, max_rows=10):
+    """
+    Prepare a sorted table of system outages showing dates and regions with >30% missing data
+    
+    Args:
+        system_outages_df: DataFrame containing system outages (Date, Region, MissingData)
+        max_rows: Maximum number of rows to include in the table
+        
+    Returns:
+        Tuple of (Sorted DataFrame with Date, Region, Missing Data % columns, total_outages_count)
+    """
+    if system_outages_df.empty:
+        return pd.DataFrame(), 0
+    
+    # Make a copy to avoid modifying the original
+    result = system_outages_df.copy()
+    
+    # Get the total count before limiting rows
+    total_outages_count = len(result)
+    
+    # Convert MissingData to percentage and rename columns
+    result['Missing Data %'] = result['MissingData']
+    result = result[['Date', 'Region', 'Missing Data %']]
+    
+    # Sort by Date descending (most recent first), then by Region
+    result = result.sort_values(by=['Date', 'Region'], ascending=[False, True])
+    
+    # Limit the number of rows if needed
+    if max_rows > 0 and len(result) > max_rows:
+        result = result.head(max_rows)
+    
+    return result, total_outages_count

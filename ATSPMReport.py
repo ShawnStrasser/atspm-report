@@ -2,6 +2,7 @@ import os
 import json
 import argparse
 import pandas as pd # Add pandas import
+import duckdb
 from datetime import datetime, timedelta # Add timedelta
 from pathlib import Path # Add pathlib
 from data_access import get_data
@@ -23,59 +24,69 @@ ALERT_CONFIG = {
     'maxout': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'maxout_alerts'},
     'actuations': {'id_cols': ['DeviceId', 'Detector'], 'file_suffix': 'actuations_alerts'},
     'missing_data': {'id_cols': ['DeviceId'], 'file_suffix': 'missing_data_alerts'},
-    'pedestrian': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'pedestrian_alerts'}
+    'pedestrian': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'pedestrian_alerts'},
+    'system_outages': {'id_cols': ['Region'], 'file_suffix': 'system_outages_alerts'}
 }
 
-def load_past_alerts(folder: str, file_format: str, verbosity: int) -> dict:
+def load_past_alerts(folder: str, file_format: str, verbosity: int, signals_df: pd.DataFrame) -> dict:
     """Loads past alerts from files. Simplified version."""
     past_alerts = {}
     folder_path = Path(folder)
+    signal_count = len(signals_df) * 0.30  # Calculate 30% of total signals
     log_message(f"Loading past alerts from {folder_path}...", 1, verbosity)
     for alert_type, config in ALERT_CONFIG.items():
-        expected_cols = config['id_cols'] + ['Date']
         file_path = folder_path / f"past_{config['file_suffix']}.{file_format}"
         
-        if file_path.exists():
-            if file_format == 'parquet':
-                df = pd.read_parquet(file_path)
-            elif file_format == 'csv':
-                df = pd.read_csv(file_path, parse_dates=['Date'])
-            else: # Should not happen based on config validation, but default to empty
-                df = pd.DataFrame(columns=expected_cols)
-            
-            # Ensure Date column is datetime and select expected columns
-            if 'Date' in df.columns:
-                 df['Date'] = pd.to_datetime(df['Date'])
-                 # Ensure all expected columns are present, fill missing if necessary (though unlikely)
-                 for col in expected_cols:
-                     if col not in df.columns:
-                         df[col] = pd.NA # Or appropriate default
-                 past_alerts[alert_type] = df[expected_cols].copy()
-                 log_message(f"Loaded {len(df)} past '{alert_type}' alerts from {file_path}", 2, verbosity)
+        if file_path.exists():           
+            if alert_type == 'missing_data':
+                # Filter out past alert dates with more than 30% signals included
+                sql = f"""
+                with d as (
+                select Date from '{file_path}'
+                group by Date
+                having count(*) < {signal_count}
+                )
+                select * from '{file_path}'
+                natural join d
+                """
             else:
-                 log_message(f"Warning: 'Date' column missing in {file_path}. Creating empty DataFrame.", 1, verbosity)
-                 past_alerts[alert_type] = pd.DataFrame(columns=expected_cols)
+                sql = f"select * from '{file_path}'"
+
+            past_alerts[alert_type] = duckdb.query(sql).df()
+            log_message(f"Loaded {len(past_alerts[alert_type])} past '{alert_type}' alerts from {file_path}.", 1, verbosity)
+            
         else:
-            log_message(f"Past alerts file not found: {file_path}. Creating empty DataFrame.", 2, verbosity)
-            past_alerts[alert_type] = pd.DataFrame(columns=expected_cols)
+            log_message(f"Past alerts file not found: {file_path}.", 2, verbosity)
+            past_alerts[alert_type] = pd.DataFrame()
             
     return past_alerts
 
 def suppress_alerts(new_alerts_df: pd.DataFrame, past_alerts_df: pd.DataFrame, suppression_days: int, id_cols: list, verbosity: int) -> pd.DataFrame:
-    """Filters new alerts based on recent past alerts. Simplified version."""
+    """Filters new alerts based on recent past alerts."""
+    print("\n", "*"*50)
+    print("inside suppress_alerts")
+    print(f"New alerts DataFrame shape: {new_alerts_df.shape}")
+    print(f"New alerts DataFrame columns: {new_alerts_df.columns.tolist()}")
+    print(f"Past alerts DataFrame shape: {past_alerts_df.shape}")
     if past_alerts_df.empty:
+        print("?"*200)
         return new_alerts_df
 
     cutoff_date = datetime.now() - timedelta(days=suppression_days)
+    print(f'Cutoff date for suppression: {cutoff_date}')
     
     # Ensure dates are comparable (naive)
     past_dates_naive = pd.to_datetime(past_alerts_df['Date']).dt.tz_localize(None)
+    print(f"Past dates (naive): {past_dates_naive.head()}")  # Debugging line
     cutoff_date_naive = cutoff_date.replace(tzinfo=None)
+    print(f"Cutoff date (naive): {cutoff_date_naive}")  # Debugging line
 
     # Filter past alerts to find recent ones
     recent_past_alerts = past_alerts_df[past_dates_naive >= cutoff_date_naive]
+    print(f"Recent past alerts shape: {recent_past_alerts.shape}")
     
     if recent_past_alerts.empty:
+        print("IT's EMPTY!")
         return new_alerts_df
 
     # Get unique keys (DeviceId, Phase/Detector) from recent alerts
@@ -83,8 +94,14 @@ def suppress_alerts(new_alerts_df: pd.DataFrame, past_alerts_df: pd.DataFrame, s
     log_message(f"Found {len(suppression_keys)} unique items for suppression based on the last {suppression_days} days.", 2, verbosity)
 
     # Perform suppression using merge
+    print("mergin now on id_cols")
+    print(f"ID columns for suppression: {id_cols}")
     merged = new_alerts_df.merge(suppression_keys, on=id_cols, how='left', indicator=True)
+    print(f"Merged DataFrame shape: {merged.shape}")
+    print(merged.head())  # Debugging line
     suppressed_alerts_df = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+    print(f"Suppressed alerts DataFrame shape: {suppressed_alerts_df.shape}")
+    print(suppressed_alerts_df.head())  # Debugging line
     
     num_suppressed = len(new_alerts_df) - len(suppressed_alerts_df)
     log_message(f"Suppressed {num_suppressed} new alerts.", 1, verbosity)
@@ -210,21 +227,6 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
 
     log_message("Starting signal analysis...", 1, verbosity)
 
-    # Create past alerts folder if it doesn't exist
-    past_alerts = {}
-    if use_past_alerts:
-        try:
-            Path(past_alerts_folder).mkdir(parents=True, exist_ok=True)
-            log_message(f"Ensured past alerts directory exists: {past_alerts_folder}", 2, verbosity)
-            past_alerts = load_past_alerts(past_alerts_folder, output_format, verbosity)
-        except Exception as e:
-            log_message(f"Error handling past alerts: {e}", 1, verbosity)
-    else:
-        log_message("Past alerts handling is disabled", 1, verbosity)
-        # Initialize empty DataFrames for past alerts
-        for alert_type in ALERT_CONFIG:
-            past_alerts[alert_type] = pd.DataFrame(columns=ALERT_CONFIG[alert_type]['id_cols'] + ['Date'])
-
     # Get data
     log_message("Reading data...", 1, verbosity)
     maxout_df, actuations_df, signals_df, has_data_df, ped_df = get_data(
@@ -255,7 +257,37 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     log_message("Processing missing data...", 1, verbosity)
     missing_data = process_missing_data(has_data_df)
     log_message(f"Processed missing data. Shape: {missing_data.shape}", 1, verbosity)
+    # Filter out dates with system-wide missing data
+    print(signals_df.head())
+    missing_data_filtered = duckdb.sql("""
+        with a as (
+        select Date, Region
+        from missing_data
+        natural join signals_df
+        group by all
+        having avg(MissingData) < 0.3
+        ),
+        b as (
+        select a.Date, signals_df.DeviceId
+        from a
+        natural join signals_df
+        )
+        select * from missing_data
+        natural join b
+        order by Date, DeviceId                               
+        """
+    ).df()
 
+    system_outages = duckdb.sql("""
+        select Date, Region, avg(MissingData) as MissingData
+        from missing_data
+        natural join signals_df
+        group by all
+        having avg(MissingData) >= 0.3
+        order by all
+        """
+    ).df()
+    
     # Process ped data
     log_message("Processing pedestrian data...", 1, verbosity)
     ped_alerts, ped_hourly = process_ped(df_ped=ped_df, df_maxout=maxout_daily, df_intersections=signals_df)
@@ -268,7 +300,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     log_message("Calculating CUSUM statistics...", 1, verbosity)
     t = cusum(maxout_daily, k_value=1)
     t_actuations = cusum(detector_daily, k_value=1)
-    t_missing_data = cusum(missing_data, k_value=1)
+    t_missing_data = cusum(missing_data_filtered, k_value=1)
     log_message("CUSUM calculation complete", 1, verbosity)
 
     log_message("Generating alerts...", 1, verbosity)
@@ -277,6 +309,15 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     new_missing_data_alerts = alert(t_missing_data).execute()
     log_message(f"Generated alerts. Found {len(new_maxout_alerts)} phase alerts, {len(new_actuations_alerts)} detector alerts, and {len(new_missing_data_alerts)} missing data alerts", 1, verbosity)
 
+    # Add debug logging for missing data alerts
+    if verbosity >= 2:
+        log_message("Missing data alerts before filtering:", 2, verbosity)
+        log_message(f"Total rows in missing data CUSUM: {len(t_missing_data.execute())}", 2, verbosity)
+        log_message(f"Rows with Alert=1: {len(new_missing_data_alerts[new_missing_data_alerts['Alert'] == 1])}", 2, verbosity)
+        if len(new_missing_data_alerts[new_missing_data_alerts['Alert'] == 1]) > 0:
+            log_message("Sample missing data alerts:", 2, verbosity)
+            log_message(f"{new_missing_data_alerts[new_missing_data_alerts['Alert'] == 1].head()}", 2, verbosity)
+    
     # Filter NEW alerts based on alert_flagging_days BEFORE suppression and saving
     log_message(f"Filtering newly generated alerts to the last {alert_flagging_days} days...", 1, verbosity)
     flagging_cutoff_date = datetime.now() - timedelta(days=alert_flagging_days)
@@ -290,9 +331,33 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     
     log_message(f"Filtered new alerts. Keeping {len(recent_new_maxout_alerts)} phase, {len(recent_new_actuations_alerts)} detector, {len(recent_new_missing_data_alerts)} missing data alerts for suppression and saving.", 2, verbosity)
 
+    # Add debug logging for date filtering impact
+    if verbosity >= 2:
+        log_message(f"Missing data alerts before date filtering: {len(new_missing_data_alerts)}", 2, verbosity)
+        log_message(f"Missing data alerts after date filtering: {len(recent_new_missing_data_alerts)}", 2, verbosity)
+        if len(recent_new_missing_data_alerts) > 0:
+            log_message("Recent missing data alerts sample:", 2, verbosity)
+            log_message(f"{recent_new_missing_data_alerts.head()}", 2, verbosity)
+    
     # Suppress alerts using the RECENT NEW alerts
     log_message("Applying alert suppression...", 1, verbosity)
     if use_past_alerts:
+        # Create past alerts folder if it doesn't exist
+        past_alerts = {}
+        if use_past_alerts:
+            try:
+                Path(past_alerts_folder).mkdir(parents=True, exist_ok=True)
+                log_message(f"Ensured past alerts directory exists: {past_alerts_folder}", 1, verbosity)
+                past_alerts = load_past_alerts(past_alerts_folder, output_format, verbosity, signals_df=signals_df)
+                print(past_alerts.keys())
+                print(past_alerts['maxout'].head())
+            except Exception as e:
+                log_message(f"Error handling past alerts: {e}", 1, verbosity)
+                raise e
+        else:
+            log_message("Past alerts handling is disabled", 1, verbosity)            # Initialize empty DataFrames for past alerts
+            for alert_type in ALERT_CONFIG:
+                past_alerts[alert_type] = pd.DataFrame(columns=ALERT_CONFIG[alert_type]['id_cols'] + ['Date'])
         final_maxout_alerts = suppress_alerts(
             recent_new_maxout_alerts, # Use date-filtered new alerts
             past_alerts.get('maxout', pd.DataFrame()), 
@@ -321,14 +386,22 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             ALERT_CONFIG['pedestrian']['id_cols'],
             verbosity
         )
+        final_system_outages = suppress_alerts(
+            system_outages, # Use system outages
+            past_alerts.get('system_outages', pd.DataFrame()), 
+            alert_suppression_days, 
+            ALERT_CONFIG['system_outages']['id_cols'],
+            verbosity
+        )
     else:
         final_maxout_alerts = recent_new_maxout_alerts
         final_actuations_alerts = recent_new_actuations_alerts
         final_missing_data_alerts = recent_new_missing_data_alerts
         final_ped_alerts = recent_new_ped_alerts
+        final_system_outages = system_outages
         log_message("Alert suppression skipped (past alerts disabled)", 1, verbosity)
 
-    log_message(f"Suppression complete. Reporting {len(final_maxout_alerts)} phase alerts, {len(final_actuations_alerts)} detector alerts, {len(final_missing_data_alerts)} missing data alerts.", 1, verbosity) # Updated log message
+    log_message(f"Suppression complete. Reporting {len(final_maxout_alerts)} phase alerts, {len(final_actuations_alerts)} detector alerts, {len(final_missing_data_alerts)} missing data alerts, {len(final_system_outages)} system outages.", 1, verbosity)
 
     # Create plots using FINAL (date-filtered and suppressed) alerts
     log_message("Creating visualization plots...", 1, verbosity)
@@ -341,15 +414,14 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     # Generate PDF reports using FINAL (date-filtered and suppressed) alerts
     log_message("Generating PDF reports...", 1, verbosity)
     report_result = None
-    if should_email_reports:
-        # Generate reports in memory and email them
-        log_message("Generating reports for email delivery...", 1, verbosity)
+    if should_email_reports:        # Generate reports in memory and email them        log_message("Generating reports for email delivery...", 1, verbosity)
         report_buffers, region_names = generate_pdf_report(
             filtered_df_maxouts=final_maxout_alerts, # Use final
             filtered_df_actuations=final_actuations_alerts, # Use final
             filtered_df_ped=final_ped_alerts, # Include pedestrian alerts
             ped_hourly_df=ped_hourly, # Include pedestrian hourly data
             filtered_df_missing_data=final_missing_data_alerts, # Use final
+            system_outages_df=final_system_outages, # Include final system outages data
             phase_figures=phase_figures,
             detector_figures=detector_figures,
             ped_figures=ped_figures, # Include pedestrian figures
@@ -358,14 +430,18 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             save_to_disk=False,
             verbosity=verbosity # Pass verbosity
         )
-        
-        # Email the reports
+          # Email the reports
         log_message("Emailing reports...", 1, verbosity)
+        
+        # Determine which regions have alerts by checking the generated reports
+        regions_with_alerts = region_names.copy() if region_names else []
+        
         success = email_reports(
             region_reports=report_buffers,
             regions=region_names,
             report_in_memory=True,
-            verbosity=verbosity # Pass verbosity
+            verbosity=verbosity, # Pass verbosity
+            regions_with_alerts=regions_with_alerts
         )
         
         if success:
@@ -374,14 +450,14 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             log_message("There were issues emailing some reports. Check the logs above for details.", 1, verbosity)
         
         report_result = success, report_buffers, region_names
-    else:
-        # Generate and save PDF reports to disk using final alerts
+    else:        # Generate and save PDF reports to disk using final alerts
         pdf_paths = generate_pdf_report(
             filtered_df_maxouts=final_maxout_alerts, # Use final
             filtered_df_actuations=final_actuations_alerts, # Use final
             filtered_df_ped=final_ped_alerts, # Include pedestrian alerts
             ped_hourly_df=ped_hourly, # Include pedestrian hourly data
             filtered_df_missing_data=final_missing_data_alerts, # Use final
+            system_outages_df=final_system_outages, # Include final system outages data
             phase_figures=phase_figures,
             detector_figures=detector_figures,
             ped_figures=ped_figures, # Include pedestrian figures
@@ -422,8 +498,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             past_alerts.get('missing_data', pd.DataFrame()), 
             past_alerts_folder, 
             output_format, 
-            'missing_data', 
-            alert_retention_weeks,
+            'missing_data',            alert_retention_weeks,
             verbosity
         )
         update_and_save_alerts(
@@ -432,6 +507,15 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             past_alerts_folder,
             output_format,
             'pedestrian',
+            alert_retention_weeks,
+            verbosity
+        )
+        update_and_save_alerts(
+            system_outages, # Use system outages 
+            past_alerts.get('system_outages', pd.DataFrame()),
+            past_alerts_folder,
+            output_format,
+            'system_outages',
             alert_retention_weeks,
             verbosity
         )

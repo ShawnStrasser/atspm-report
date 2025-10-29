@@ -1,4 +1,5 @@
 import pandas as pd
+import requests
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -10,12 +11,16 @@ from io import BytesIO
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
-from typing import List, Tuple, Union
+import calendar
+import random
+import PIL.Image
+from typing import List, Tuple, Union, Dict, Any
 from table_generation import (
     prepare_phase_termination_alerts_table,
     prepare_detector_health_alerts_table,
     prepare_ped_alerts_table,
     prepare_missing_data_alerts_table,
+    prepare_system_outages_table,
     create_reportlab_table
 )
 from utils import log_message # Import the utility function
@@ -28,6 +33,90 @@ try:
 except Exception as e:
     print(f"Warning: Could not load jokes.csv: {e}")
     jokes_df = pd.DataFrame(columns=['Date', 'Joke'])
+
+
+def get_joke_from_api():
+    """Get a joke from the JokeAPI."""
+    try:
+        url = 'https://v2.jokeapi.dev/joke/any?&safe-mode'
+        response = requests.get(url, verify=False)
+        if response.ok:
+            joke_data = response.json()
+            if joke_data['type'] == 'single':
+                return {'text': joke_data['joke'], 'source': 'JokeAPI'}
+            else:  # twopart
+                return {'text': f"{joke_data['setup']}\n{joke_data['delivery']}", 'source': 'JokeAPI'}
+    except Exception as e:
+        print(f"Warning: Could not fetch joke from JokeAPI: {e}")
+    return None
+
+def get_dad_joke():
+    """Get a joke from icanhazdadjoke API."""
+    try:
+        headers = {'Accept': 'application/json'}
+        response = requests.get('https://icanhazdadjoke.com/', headers=headers, verify=False)
+        if response.ok:
+            joke_data = response.json()
+            return {'text': joke_data['joke'], 'source': 'icanhazdadjoke'}
+    except Exception as e:
+        print(f"Warning: Could not fetch joke from icanhazdadjoke: {e}")
+    return None
+
+# Curated list of approved XKCD comic numbers
+APPROVED_XKCD_COMICS = [
+    26, 55, 58, 149, 162, 208, 221, 227, 237, 246, 272, 281, 284, 285,
+    302, 303, 325, 327, 386, 390, 421, 435, 451, 470, 483, 552, 557,
+    605, 610, 612, 616, 626, 627, 833, 844, 927, 979, 1162, 1172, 1425,
+    1667, 1741, 1831, 1906, 2054, 2228, 2347, 2610
+]
+
+def get_xkcd_comic():
+    """Get a random XKCD comic from the approved list."""
+    try:
+        # Pick a random comic number from our approved list
+        random_num = random.choice(APPROVED_XKCD_COMICS)
+        
+        # Get the comic
+        response = requests.get(f'https://xkcd.com/{random_num}/info.0.json')
+        if response.ok:
+            comic_data = response.json()
+            
+            # Download the image to check its size
+            img_response = requests.get(comic_data['img'])
+            if img_response.ok:
+                img_data = BytesIO(img_response.content)
+                with PIL.Image.open(img_data) as img:
+                    width, height = img.size
+                    
+                    # If the image is too large (more than 800px in either dimension),
+                    # try again with a different comic
+                    if width > 800 or height > 800:
+                        return get_xkcd_comic()  # Recursive call for a different comic
+                    
+                    return {
+                        'text': comic_data['title'],
+                        'source': 'XKCD',
+                        'image': img_data.getvalue(),
+                        'alt': comic_data['alt'],
+                        'dimensions': (width, height)
+                    }
+    except Exception as e:
+        print(f"Warning: Could not fetch XKCD comic: {e}")
+    return None
+
+def get_random_joke():
+    """Get a random joke from any available source."""
+    joke_sources = [get_joke_from_api, get_dad_joke, get_xkcd_comic]
+    random.shuffle(joke_sources)
+    
+    # Try each source until we get a successful response
+    for source in joke_sources:
+        joke_data = source()
+        if joke_data:
+            return joke_data
+            
+    # If all sources fail, return a fallback message
+    return {'text': "No joke available today.", 'source': None}
 
 
 class PageNumCanvas(canvas.Canvas):
@@ -79,10 +168,10 @@ class HeaderFooter:
         except Exception as e:
             print(f"Error loading logo: {e}")
 
-        # Title "Signals Weekly" - right aligned
+        # Title 
         canvas.setFont('Helvetica-Bold', 24)
         canvas.setFillColor(colors.black)
-        title_text = "Signals Weekly"
+        title_text = "ATSPM Report"
         title_width = canvas.stringWidth(title_text, "Helvetica-Bold", 24)
         title_x = doc.width + doc.leftMargin - title_width - 0.5*inch  # Move title left to make room for icon
         canvas.drawString(title_x,
@@ -104,7 +193,7 @@ class HeaderFooter:
 
         # Subtitle with bold and italic style - right aligned
         canvas.setFont('Times-BoldItalic', 12)
-        subtitle = "Delivering Weekly Traffic Signal Insights"
+        subtitle = "More Problems You Didn't Know You Had"
         subtitle_width = canvas.stringWidth(subtitle, "Times-BoldItalic", 12)
         canvas.drawString(doc.width + doc.leftMargin - subtitle_width,
                          doc.height + doc.topMargin - 0.55*inch, subtitle)
@@ -192,23 +281,27 @@ def generate_pdf_report(
         filtered_df_ped: pd.DataFrame,
         ped_hourly_df: pd.DataFrame,
         filtered_df_missing_data: pd.DataFrame,
+        system_outages_df: pd.DataFrame,
         phase_figures: List[tuple[plt.Figure, str]],
         detector_figures: List[tuple[plt.Figure, str]],
         ped_figures: List[tuple[plt.Figure, str]],
         missing_data_figures: List[tuple[plt.Figure, str]],
         signals_df: pd.DataFrame = None,
         output_path: str = "ATSPM_Report_{region}.pdf",
-        save_to_disk: bool = True,
-        max_table_rows: int = 10,
+        save_to_disk: bool = True,        max_table_rows: int = 10,
         verbosity: int = 1) -> Union[List[str], Tuple[List[BytesIO], List[str]]]:
     """Generate PDF reports for each region with the plots.
     
     Args:
         filtered_df_maxouts: DataFrame with phase termination alerts
         filtered_df_actuations: DataFrame with detector health alerts
+        filtered_df_ped: DataFrame with pedestrian alerts
+        ped_hourly_df: DataFrame with pedestrian hourly data
         filtered_df_missing_data: DataFrame with missing data alerts
+        system_outages_df: DataFrame with system-wide outages (Date, Region, MissingData)
         phase_figures: List of (figure, region) tuples for phase termination
         detector_figures: List of (figure, region) tuples for detector health
+        ped_figures: List of (figure, region) tuples for pedestrian alerts
         missing_data_figures: List of (figure, region) tuples for missing data
         signals_df: DataFrame with signal information
         output_path: Path template for saving reports
@@ -224,7 +317,28 @@ def generate_pdf_report(
     regions = set(region for _, region in phase_figures + detector_figures + missing_data_figures)
     generated_paths = []
     buffer_objects = []
-    region_names = []
+    region_names = []    # Get the joke once, outside the region loop
+    today_date = datetime.today().date()
+    is_monday = calendar.day_name[today_date.weekday()] == 'Monday'
+    exact_match = jokes_df[jokes_df['Date'].dt.date == today_date]
+    if not exact_match.empty:
+        # Use scheduled joke from CSV
+        joke_data = {'text': exact_match.iloc[0]['Joke'], 'source': None}
+        joke_title = "Joke of the Week"  # Always use this for scheduled jokes
+    else:
+        # If no exact match, get a random joke
+        joke_data = get_random_joke()
+        joke_title = "Joke of the Week" if is_monday else "Daily Dose of Humor"
+    
+    # Set attribution based on source
+    if joke_data['source'] == 'JokeAPI':
+        joke_attribution = "Joke provided by JokeAPI (https://jokeapi.dev)"
+    elif joke_data['source'] == 'icanhazdadjoke':
+        joke_attribution = "Dad joke provided by icanhazdadjoke.com"
+    elif joke_data['source'] == 'XKCD':
+        joke_attribution = f"XKCD Comic: {joke_data['alt']}"
+    else:
+        joke_attribution = None
 
     # Process each individual region first
     for region in regions:
@@ -315,20 +429,41 @@ def generate_pdf_report(
 
         # Introduction text
         intro_text = f"""This report for {region} includes alerts for increased percent maxout, vehicle & pedestrian detector alerts, and data completeness. 
-        These are new alerts, focusing on the most critical issues within the last week. Signals Weekly is still in development, so please provide feedback.
+        These are new alerts only, recurring issues are not shown but will be added in a future update.
         """
         content.append(Paragraph(intro_text, styles['Normal']))
-        content.append(Spacer(1, 0.2*inch))
-
-        # Joke of the Week section
-        content.append(Paragraph("Joke of the Week", styles['SectionHeading']))
-        # Select most recent joke up to today
-        today_date = datetime.today().date()
-        recent = jokes_df[jokes_df['Date'].dt.date <= today_date]
-        joke_text = recent.iloc[-1]['Joke'] if not recent.empty else "No joke available this week."
-        content.append(Paragraph(joke_text, styles['Normal']))
-        content.append(Spacer(1, 0.3*inch))
+        content.append(Spacer(1, 0.2*inch))        # Joke section
+        content.append(Paragraph(joke_title, styles['SectionHeading']))
         
+        # Handle different types of jokes
+        if joke_data.get('source') == 'XKCD':
+            # For XKCD comics, add the title and then the image
+            content.append(Paragraph(joke_data['text'], styles['Normal']))
+            content.append(Spacer(1, 0.1*inch))
+            
+            # Create and add the image
+            img_data = BytesIO(joke_data['image'])
+            width, height = joke_data['dimensions']
+            # Scale image to fit page width while maintaining aspect ratio
+            scale_factor = min(6*inch / width, 4*inch / height)
+            img = Image(img_data, width=width*scale_factor, height=height*scale_factor)
+            content.append(img)
+        else:
+            # For text-based jokes
+            content.append(Paragraph(joke_data['text'], styles['Normal']))
+            
+        if joke_attribution:
+            # Add joke attribution in italics and gray
+            content.append(Spacer(1, 0.1*inch))
+            content.append(Paragraph(joke_attribution, ParagraphStyle(
+                'Attribution',
+                parent=styles['Normal'],
+                fontSize=8,
+                textColor=colors.gray,
+                italic=True
+            )))
+        content.append(Spacer(1, 0.3*inch))
+
         # Section: Phase Terminations - Changed to a single header
         if len(filtered_df_maxouts) > 0 and region_phase_figures:
             content.append(Paragraph("Phase Termination Alerts", styles['SectionHeading']))
@@ -469,15 +604,45 @@ def generate_pdf_report(
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
-            
-            # Add missing data charts without additional header
+              # Add missing data charts without additional header
             for fig in region_missing_data_figures:
                 # Wrap each chart in a KeepTogether to ensure it stays on one page
                 chart_elements = []
                 chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
                 content.append(KeepTogether(chart_elements))
                 content.append(Spacer(1, 0.15*inch))
-                plt.close(fig)
+                plt.close(fig)        # Section: System Outages
+        # Filter system outages for this region (or show all for "All Regions")
+        if region == "All Regions":
+            region_system_outages = system_outages_df if not system_outages_df.empty else pd.DataFrame()
+        else:
+            region_system_outages = system_outages_df[system_outages_df['Region'] == region] if not system_outages_df.empty else pd.DataFrame()
+        
+        if not region_system_outages.empty:
+            content.append(Paragraph("System-Wide Outages", styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+
+            explanation = """The following table shows dates when more than 30% of devices in this region experienced missing data, 
+            indicating a system-wide outage. During these periods, individual device missing data alerts are suppressed as they 
+            likely represent infrastructure or date pipeline issues, not device-specific problems."""
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+              # Create system outages table
+            system_outages_table_df, total_system_outages = prepare_system_outages_table(
+                region_system_outages,
+                max_rows=max_table_rows
+            )
+            
+            table_content = create_reportlab_table(
+                system_outages_table_df, 
+                "System-Wide Outages", 
+                styles,
+                total_count=total_system_outages,
+                max_rows=max_table_rows,
+                include_trend=False
+            )
+            content.extend(table_content)
+            content.append(Spacer(1, 0.3*inch))
 
         # Build the PDF with custom canvas for proper page numbering
         doc.build(content,

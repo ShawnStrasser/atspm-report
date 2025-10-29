@@ -70,9 +70,15 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
         is_ped_data = False
     else:
         raise ValueError("Unknown data format in DataFrame")
-    
-    # Colors for different phases/detectors - using more distinct colors
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+      # Colors for different phases/detectors - using more distinct colors
+    # Colorblind-friendly palette, avoiding yellow for better contrast on white
+    colors = ['#E41A1C', '#377EB8', '#4DAF4A', '#984EA3', '#FF7F00', '#A65628', '#F781BF', '#17BECF']
+    # Create a consistent color mapping for phases
+    if group_column == 'Phase':
+        daily_phases = set(df_daily[group_column].unique())
+        hourly_phases = set(df_hourly[group_column].unique()) if df_hourly is not None and group_column in df_hourly.columns else set()
+        all_phases = sorted(daily_phases.union(hourly_phases))
+        phase_color_map = {phase: colors[i % len(colors)] for i, phase in enumerate(all_phases)}
     figures = []  # Store figures for PDF generation
     figures_with_rank = []  # Store figures with ranking information for sorting
 
@@ -221,7 +227,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 for i, phase in enumerate(phases):
                     # Filter data for this phase
                     phase_data = plot_data[plot_data[group_column] == phase]
-                    color = colors[i % len(colors)]
+                    color = phase_color_map[phase]
                     
                     # Plot PedServices on left y-axis with solid line
                     ax1.plot(phase_data[time_column], phase_data[left_value_column], 
@@ -257,7 +263,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 from matplotlib.lines import Line2D
                 legend_elements = []
                 for i, phase in enumerate(phases):
-                    color = colors[i % len(colors)]
+                    color = phase_color_map[phase]
                     # Add services line (solid)
                     legend_elements.append(Line2D([0], [0], color=color, linewidth=2.5,
                                                   label=f'Phase {phase} - Services'))
@@ -391,31 +397,80 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                     # Add the legend
                     ax.legend(frameon=True, fancybox=True, framealpha=0.9, 
                               loc='upper left', bbox_to_anchor=(0.01, 1))
-                    
-                    # Add a note about forecasts below the plot
+                      # Add a note about forecasts below the plot
                     if 'Forecast' in plot_data.columns:
                         fig.text(0.5, 0.01, 'Note: Dotted lines represent forecasted values from historical data', 
                                  ha='center', fontsize=10, color='gray')
                 else:
-                    # For all other chart types, plot normally
-                    numbers = plot_data[group_column].unique()
-                    
-                    # Plot each phase/detector
-                    for i, number in enumerate(sorted(numbers)):
-                        # Filter data for this phase/detector
-                        data = plot_data[plot_data[group_column] == number]
+                    # For phase termination plots, apply the same gray treatment as detector health
+                    if group_column == 'Phase' and 'Percent MaxOut' in df_daily.columns:
+                        # For phase termination charts, identify phases with alerts in daily data
+                        daily_data = df_daily[df_daily['DeviceId'] == device]
+                        phases_with_alerts = set(daily_data[daily_data['Alert'] == 1][group_column].unique())
                         
-                        # Plot values with thicker lines
-                        ax.plot(data[time_column], data[value_column], 
-                                color=colors[i % len(colors)], linewidth=2.5, 
-                                label=f'{group_column} {number}')
+                        # Get all phases in hourly/plot data
+                        all_phases = sorted(plot_data[group_column].unique())
                         
-                        # Add markers where alerts occur (only if using daily data)
-                        if df_hourly is None and 'Alert' in data.columns:
-                            alerts = data[data['Alert'] == 1]
-                            if not alerts.empty:
-                                ax.scatter(alerts[time_column], alerts[value_column], 
-                                          color=colors[i % len(colors)], s=80, zorder=10)
+                        # First plot all 'other' phases with low zorder to ensure they're below alert phases
+                        other_phase_lines = []
+                        for number in all_phases:
+                            if number not in phases_with_alerts:
+                                # Plot other phases in light gray, thinner line, with low zorder
+                                data = plot_data[plot_data[group_column] == number]
+                                line = ax.plot(data[time_column], data[value_column], 
+                                        color='#cccccc', linewidth=1.5, alpha=0.7, zorder=1)
+                                other_phase_lines.append(line[0])
+                        
+                        # Create a list to store all legend handles and labels
+                        handles, labels = [], []
+                        
+                        # Then plot phases with alerts with higher zorder to ensure they're on top
+                        for i, number in enumerate(sorted(list(phases_with_alerts))):
+                            # Filter data for this phase
+                            data = plot_data[plot_data[group_column] == number]
+                            color = phase_color_map[number]
+                            
+                            # Plot actual values with solid line
+                            line = ax.plot(data[time_column], data[value_column], 
+                                    color=color, linewidth=2.5, zorder=5,
+                                    label=f'{group_column} {number}')
+                            handles.append(line[0])
+                            labels.append(f'{group_column} {number}')
+                            
+                            # Add markers where alerts occur (only if using daily data)
+                            if df_hourly is None and 'Alert' in data.columns:
+                                alerts = data[data['Alert'] == 1]
+                                if not alerts.empty:
+                                    ax.scatter(alerts[time_column], alerts[value_column], 
+                                              color=color, s=80, zorder=10)
+                        
+                        # Add "Other Phases" to the legend
+                        if other_phase_lines:
+                            other_phase_lines[0].set_label("Other Phases")
+                    else:
+                        # For all other chart types, plot normally
+                        numbers = plot_data[group_column].unique()
+                        
+                        # Plot each phase/detector
+                        for i, number in enumerate(sorted(numbers)):
+                            # Filter data for this phase/detector
+                            data = plot_data[plot_data[group_column] == number]
+                            
+                            # Determine color: use consistent phase mapping or default
+                            if group_column == 'Phase':
+                                color = phase_color_map[number]
+                            else:
+                                color = colors[i % len(colors)]
+                            ax.plot(data[time_column], data[value_column], 
+                                    color=color, linewidth=2.5, 
+                                    label=f'{group_column} {number}')
+                            
+                            # Add markers where alerts occur (only if using daily data)
+                            if df_hourly is None and 'Alert' in data.columns:
+                                alerts = data[data['Alert'] == 1]
+                                if not alerts.empty:
+                                    ax.scatter(alerts[time_column], alerts[value_column], 
+                                              color=colors[i % len(colors)], s=80, zorder=10)
             else:
                 # For Missing Data (no group column)
                 ax.plot(plot_data[time_column], plot_data[value_column], 

@@ -7,3 +7,5 @@ raw_data/
 Past_Alerts/
 emails.csv
 emails_test.csv
+emails_copy.csv
+.claude/settings.local.json
