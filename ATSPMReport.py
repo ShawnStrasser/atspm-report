@@ -14,7 +14,7 @@ from data_processing import (
     alert,
     process_ped
 )
-from visualization import create_device_plots
+from visualization import create_device_plots, create_phase_skip_plots
 from report_generation import generate_pdf_report
 from email_module import email_reports
 from utils import log_message # Import the utility function
@@ -25,8 +25,14 @@ ALERT_CONFIG = {
     'actuations': {'id_cols': ['DeviceId', 'Detector'], 'file_suffix': 'actuations_alerts'},
     'missing_data': {'id_cols': ['DeviceId'], 'file_suffix': 'missing_data_alerts'},
     'pedestrian': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'pedestrian_alerts'},
+    'phase_skips': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'phase_skips_alerts'},
     'system_outages': {'id_cols': ['Region'], 'file_suffix': 'system_outages_alerts'}
 }
+
+PHASE_SKIP_PHASE_WAITS_COLUMNS = ['DeviceId', 'Timestamp', 'Phase', 'PhaseWaitTime', 'PreemptFlag', 'MaxCycleLength']
+PHASE_SKIP_ALERT_HISTORY_COLUMNS = ['DeviceId', 'Phase', 'Date', 'MaxCycleLength', 'MaxWaitTime', 'TotalSkips']
+PHASE_SKIP_SUMMARY_COLUMNS = ['DeviceId', 'Phase', 'AggregatedSkips', 'LatestDate']
+PHASE_SKIP_ALERT_CANDIDATE_COLUMNS = ['DeviceId', 'Phase', 'Date', 'AggregatedSkips']
 
 def load_past_alerts(folder: str, file_format: str, verbosity: int, signals_df: pd.DataFrame) -> dict:
     """Loads past alerts from files. Simplified version."""
@@ -60,6 +66,89 @@ def load_past_alerts(folder: str, file_format: str, verbosity: int, signals_df: 
             past_alerts[alert_type] = pd.DataFrame()
             
     return past_alerts
+
+
+def load_phase_skip_phase_waits(file_path: str, verbosity: int) -> pd.DataFrame:
+    """Load phase waits data generated during raw data extraction."""
+    if not file_path:
+        return pd.DataFrame(columns=PHASE_SKIP_PHASE_WAITS_COLUMNS)
+
+    path = Path(file_path)
+    if not path.exists():
+        log_message(f"Phase Skip phase waits file not found at {path}", 1, verbosity)
+        return pd.DataFrame(columns=PHASE_SKIP_PHASE_WAITS_COLUMNS)
+
+    try:
+        df = pd.read_parquet(path)
+        if df.empty:
+            return pd.DataFrame(columns=PHASE_SKIP_PHASE_WAITS_COLUMNS)
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df['DeviceId'] = df['DeviceId'].astype(str)
+        df['Phase'] = df['Phase'].astype(int)
+        return df
+    except Exception as e:
+        log_message(f"Error reading phase waits file {path}: {e}", 1, verbosity)
+        return pd.DataFrame(columns=PHASE_SKIP_PHASE_WAITS_COLUMNS)
+
+
+def load_phase_skip_history(folder: str, retention_days: int, verbosity: int) -> pd.DataFrame:
+    """Load historical alert rows and optionally prune files beyond retention."""
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        log_message(f"Phase Skip alert folder not found: {folder_path}", 1, verbosity)
+        return pd.DataFrame(columns=PHASE_SKIP_ALERT_HISTORY_COLUMNS)
+
+    if retention_days and retention_days > 0:
+        cutoff_date = datetime.now().date() - timedelta(days=retention_days)
+        for file_path in folder_path.glob("*.parquet"):
+            try:
+                file_date = datetime.strptime(file_path.stem, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if file_date < cutoff_date:
+                file_path.unlink(missing_ok=True)
+
+    frames = []
+    for file_path in sorted(folder_path.glob("*.parquet")):
+        try:
+            frames.append(pd.read_parquet(file_path))
+        except Exception as e:
+            log_message(f"Warning: Could not read Phase Skip file {file_path}: {e}", 1, verbosity)
+
+    if not frames:
+        return pd.DataFrame(columns=PHASE_SKIP_ALERT_HISTORY_COLUMNS)
+
+    combined = pd.concat(frames, ignore_index=True)
+    if combined.empty:
+        return pd.DataFrame(columns=PHASE_SKIP_ALERT_HISTORY_COLUMNS)
+
+    combined['Date'] = pd.to_datetime(combined['Date']).dt.normalize()
+    combined['DeviceId'] = combined['DeviceId'].astype(str)
+    combined['Phase'] = combined['Phase'].astype(int)
+    return combined
+
+
+def summarize_phase_skip_alerts(alert_rows_all: pd.DataFrame, threshold: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Aggregate alert rows by device/phase and flag those exceeding the skip threshold."""
+    if alert_rows_all is None or alert_rows_all.empty:
+        return (
+            pd.DataFrame(columns=PHASE_SKIP_SUMMARY_COLUMNS),
+            pd.DataFrame(columns=PHASE_SKIP_ALERT_CANDIDATE_COLUMNS)
+        )
+
+    grouped = (
+        alert_rows_all.groupby(['DeviceId', 'Phase'], as_index=False)
+        .agg(
+            AggregatedSkips=('TotalSkips', 'sum'),
+            LatestDate=('Date', 'max')
+        )
+    )
+    grouped['LatestDate'] = pd.to_datetime(grouped['LatestDate']).dt.normalize()
+
+    alerts = grouped[grouped['AggregatedSkips'] > threshold].copy()
+    alerts = alerts.rename(columns={'LatestDate': 'Date'})
+
+    return grouped, alerts.reindex(columns=PHASE_SKIP_ALERT_CANDIDATE_COLUMNS)
 
 def suppress_alerts(new_alerts_df: pd.DataFrame, past_alerts_df: pd.DataFrame, suppression_days: int, id_cols: list, verbosity: int) -> pd.DataFrame:
     """Filters new alerts based on recent past alerts."""
@@ -107,6 +196,8 @@ def suppress_alerts(new_alerts_df: pd.DataFrame, past_alerts_df: pd.DataFrame, s
     log_message(f"Suppressed {num_suppressed} new alerts.", 1, verbosity)
     
     return suppressed_alerts_df
+
+
 
 def update_and_save_alerts(new_alerts_df: pd.DataFrame, past_alerts_df: pd.DataFrame, folder: str, file_format: str, alert_type: str, retention_weeks: int, verbosity: int):
     """Combines new and past alerts, applies retention, and saves. Simplified version."""
@@ -216,6 +307,10 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     past_alerts_folder = cfg.get('past_alerts_folder', 'Past_Alerts')
     alert_flagging_days = cfg.get('alert_flagging_days', 7) # Load the new parameter
     use_past_alerts = cfg.get('use_past_alerts', True)  # Default to True for backwards compatibility
+    phase_skip_alert_rows_folder = cfg.get('phase_skip_alert_rows_folder', 'alert_rows')
+    phase_skip_phase_waits_file = cfg.get('phase_skip_phase_waits_file', 'raw_data/phase_skip_phase_waits.parquet')
+    phase_skip_retention_days = cfg.get('phase_skip_retention_days', 14)
+    phase_skip_alert_threshold = cfg.get('phase_skip_alert_threshold', 2)
 
     # Validate connection params if using database
     if not use_parquet and (not connection_params or 
@@ -240,6 +335,13 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
         log_message("Failed to get data", 1, verbosity)
         return None
     log_message(f"Successfully read data. MaxOut shape: {maxout_df.shape}, Actuations shape: {actuations_df.shape}, Signals shape: {signals_df.shape}, Has Data shape: {has_data_df.shape}", 1, verbosity)
+
+    phase_skip_waits = load_phase_skip_phase_waits(phase_skip_phase_waits_file, verbosity)
+    phase_skip_all_rows = load_phase_skip_history(phase_skip_alert_rows_folder, phase_skip_retention_days, verbosity)
+    phase_skip_summary, phase_skip_alert_candidates = summarize_phase_skip_alerts(
+        phase_skip_all_rows,
+        phase_skip_alert_threshold
+    )
 
     # Process max out data
     log_message("Processing max out data...", 1, verbosity)
@@ -328,8 +430,15 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     recent_new_actuations_alerts = new_actuations_alerts[new_actuations_alerts['Date'] >= flagging_cutoff_date_naive].copy()
     recent_new_missing_data_alerts = new_missing_data_alerts[new_missing_data_alerts['Date'] >= flagging_cutoff_date_naive].copy()
     recent_new_ped_alerts = ped_alerts[ped_alerts['Date'] >= flagging_cutoff_date_naive].copy()
+    recent_phase_skip_alerts = phase_skip_alert_candidates[phase_skip_alert_candidates['Date'] >= flagging_cutoff_date_naive].copy()
     
-    log_message(f"Filtered new alerts. Keeping {len(recent_new_maxout_alerts)} phase, {len(recent_new_actuations_alerts)} detector, {len(recent_new_missing_data_alerts)} missing data alerts for suppression and saving.", 2, verbosity)
+    log_message(
+        f"Filtered new alerts. Keeping {len(recent_new_maxout_alerts)} phase, "
+        f"{len(recent_new_actuations_alerts)} detector, {len(recent_new_missing_data_alerts)} missing data, "
+        f"{len(recent_phase_skip_alerts)} phase skip alerts for suppression and saving.",
+        2,
+        verbosity
+    )
 
     # Add debug logging for date filtering impact
     if verbosity >= 2:
@@ -386,6 +495,13 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             ALERT_CONFIG['pedestrian']['id_cols'],
             verbosity
         )
+        final_phase_skip_alerts = suppress_alerts(
+            recent_phase_skip_alerts,
+            past_alerts.get('phase_skips', pd.DataFrame()),
+            alert_suppression_days,
+            ALERT_CONFIG['phase_skips']['id_cols'],
+            verbosity
+        )
         final_system_outages = suppress_alerts(
             system_outages, # Use system outages
             past_alerts.get('system_outages', pd.DataFrame()), 
@@ -398,10 +514,28 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
         final_actuations_alerts = recent_new_actuations_alerts
         final_missing_data_alerts = recent_new_missing_data_alerts
         final_ped_alerts = recent_new_ped_alerts
+        final_phase_skip_alerts = recent_phase_skip_alerts
         final_system_outages = system_outages
         log_message("Alert suppression skipped (past alerts disabled)", 1, verbosity)
 
-    log_message(f"Suppression complete. Reporting {len(final_maxout_alerts)} phase alerts, {len(final_actuations_alerts)} detector alerts, {len(final_missing_data_alerts)} missing data alerts, {len(final_system_outages)} system outages.", 1, verbosity)
+    log_message(
+        f"Suppression complete. Reporting {len(final_maxout_alerts)} phase alerts, "
+        f"{len(final_actuations_alerts)} detector alerts, {len(final_missing_data_alerts)} missing data alerts, "
+        f"{len(final_phase_skip_alerts)} phase skip alerts, {len(final_system_outages)} system outages.",
+        1,
+        verbosity
+    )
+
+    phase_skip_rankings = pd.DataFrame()
+    if not final_phase_skip_alerts.empty and not phase_skip_summary.empty:
+        active_pairs = final_phase_skip_alerts[['DeviceId', 'Phase']].drop_duplicates()
+        ranking_source = phase_skip_summary.merge(active_pairs, on=['DeviceId', 'Phase'], how='inner')
+        if not ranking_source.empty:
+            phase_skip_rankings = (
+                ranking_source.groupby('DeviceId', as_index=False)['AggregatedSkips']
+                .sum()
+                .rename(columns={'AggregatedSkips': 'TotalSkips'})
+            )
 
     # Create plots using FINAL (date-filtered and suppressed) alerts
     log_message("Creating visualization plots...", 1, verbosity)
@@ -409,6 +543,17 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     detector_figures = create_device_plots(final_actuations_alerts, signals_df, num_figures, df_hourly=detector_hourly)
     missing_data_figures = create_device_plots(final_missing_data_alerts, signals_df, num_figures)
     ped_figures = create_device_plots(final_ped_alerts, signals_df, num_figures, ped_hourly)
+    phase_skip_alert_pairs = None
+    if not final_phase_skip_alerts.empty:
+        phase_skip_alert_pairs = final_phase_skip_alerts[['DeviceId', 'Phase']].drop_duplicates()
+    if (
+        phase_skip_alert_pairs is not None
+        and not phase_skip_waits.empty
+    ):
+        plot_phase_skip_waits = phase_skip_waits.merge(phase_skip_alert_pairs, on=['DeviceId', 'Phase'], how='inner')
+    else:
+        plot_phase_skip_waits = pd.DataFrame()
+    phase_skip_figures = create_phase_skip_plots(plot_phase_skip_waits, signals_df, phase_skip_rankings, num_figures)
     log_message("Plots created successfully", 1, verbosity)
 
     # Generate PDF reports using FINAL (date-filtered and suppressed) alerts
@@ -428,7 +573,11 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             missing_data_figures=missing_data_figures,
             signals_df=signals_df,
             save_to_disk=False,
-            verbosity=verbosity # Pass verbosity
+            verbosity=verbosity, # Pass verbosity
+            phase_skip_rows=phase_skip_all_rows,
+            phase_skip_figures=phase_skip_figures,
+            phase_skip_alerts_df=final_phase_skip_alerts,
+            phase_skip_threshold=phase_skip_alert_threshold
         )
           # Email the reports
         log_message("Emailing reports...", 1, verbosity)
@@ -464,7 +613,11 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             missing_data_figures=missing_data_figures,
             signals_df=signals_df,
             save_to_disk=True,
-            verbosity=verbosity # Pass verbosity
+            verbosity=verbosity, # Pass verbosity
+            phase_skip_rows=phase_skip_all_rows,
+            phase_skip_figures=phase_skip_figures,
+            phase_skip_alerts_df=final_phase_skip_alerts,
+            phase_skip_threshold=phase_skip_alert_threshold
         )
         log_message(f"Generated {len(pdf_paths)} PDF reports:", 1, verbosity)
         for path in pdf_paths:
@@ -507,6 +660,15 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             past_alerts_folder,
             output_format,
             'pedestrian',
+            alert_retention_weeks,
+            verbosity
+        )
+        update_and_save_alerts(
+            recent_phase_skip_alerts,
+            past_alerts.get('phase_skips', pd.DataFrame()),
+            past_alerts_folder,
+            output_format,
+            'phase_skips',
             alert_retention_weeks,
             verbosity
         )

@@ -91,6 +91,68 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10)
     
     return result, total_alerts_count
 
+def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, allowed_pairs=None, min_total_skips=0):
+    """
+    Prepare the Phase Skip table showing all rows ordered by Signal then Phase.
+
+    Args:
+        phase_skip_rows: DataFrame with DeviceId, Phase, Date, MaxCycleLength, MaxWaitTime, TotalSkips
+        signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
+        region: Optional region filter. When provided (and not "All Regions") the table is limited to that region.
+
+    Returns:
+        DataFrame ready for rendering in the report (no row limit applied)
+    """
+    if phase_skip_rows is None or phase_skip_rows.empty:
+        return pd.DataFrame()
+
+    df = phase_skip_rows.copy()
+    df['DeviceId'] = df['DeviceId'].astype(str)
+
+    if allowed_pairs is not None and not allowed_pairs.empty:
+        allowed = allowed_pairs[['DeviceId', 'Phase']].drop_duplicates().copy()
+        allowed['DeviceId'] = allowed['DeviceId'].astype(str)
+        allowed['Phase'] = allowed['Phase'].astype(int)
+        df = df.merge(allowed, on=['DeviceId', 'Phase'], how='inner')
+
+    if min_total_skips and min_total_skips > 0:
+        df = df[df['TotalSkips'] >= min_total_skips]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    signals_df = signals_df.copy()
+    signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
+
+    result = df.merge(
+        signals_df[['DeviceId', 'Name', 'Region']],
+        on='DeviceId',
+        how='left'
+    )
+
+    result = result.dropna(subset=['Name'])
+    if result.empty:
+        return pd.DataFrame()
+
+    result['Date'] = pd.to_datetime(result['Date']).dt.date
+    result = result.rename(columns={
+        'Name': 'Signal',
+        'TotalSkips': 'Total Skips',
+        'MaxWaitTime': 'Max Wait (s)',
+        'MaxCycleLength': 'Max Cycle Length'
+    })
+
+    if region and region != "All Regions":
+        result = result[result['Region'] == region]
+        if result.empty:
+            return pd.DataFrame()
+
+    result = result[['Signal', 'Phase', 'Date', 'Total Skips', 'Max Wait (s)', 'Max Cycle Length']]
+    result = result.sort_values(by=['Signal', 'Phase', 'Date'])
+
+    return result
+
+
 def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max_rows=10):
     """
     Prepare a sorted table of detector health alerts with signal name, detector, and date

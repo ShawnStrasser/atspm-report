@@ -14,9 +14,10 @@ import os
 import calendar
 import random
 import PIL.Image
-from typing import List, Tuple, Union, Dict, Any
+from typing import List, Tuple, Union, Dict, Any, Optional
 from table_generation import (
     prepare_phase_termination_alerts_table,
+    prepare_phase_skip_alerts_table,
     prepare_detector_health_alerts_table,
     prepare_ped_alerts_table,
     prepare_missing_data_alerts_table,
@@ -288,8 +289,14 @@ def generate_pdf_report(
         missing_data_figures: List[tuple[plt.Figure, str]],
         signals_df: pd.DataFrame = None,
         output_path: str = "ATSPM_Report_{region}.pdf",
-        save_to_disk: bool = True,        max_table_rows: int = 10,
-        verbosity: int = 1) -> Union[List[str], Tuple[List[BytesIO], List[str]]]:
+        save_to_disk: bool = True,
+        max_table_rows: int = 10,
+        verbosity: int = 1,
+        phase_skip_rows: pd.DataFrame = None,
+        phase_skip_figures: List[tuple[plt.Figure, str]] = None,
+        phase_skip_alerts_df: Optional[pd.DataFrame] = None,
+        phase_skip_threshold: Optional[float] = None
+) -> Union[List[str], Tuple[List[BytesIO], List[str]]]:
     """Generate PDF reports for each region with the plots.
     
     Args:
@@ -308,13 +315,52 @@ def generate_pdf_report(
         save_to_disk: If True, save reports to disk, otherwise return BytesIO objects
         max_table_rows: Maximum number of rows to show in each alert table
         verbosity: Verbosity level (0=silent, 1=info, 2=debug)
+        phase_skip_rows: DataFrame containing combined Phase Skip alert rows (for tables)
+        phase_skip_figures: List of (figure, region) tuples for Phase Skip charts
+        phase_skip_alerts_df: DataFrame with Phase Skip alerts after suppression (DeviceId, Phase, Date)
+        phase_skip_threshold: Minimum per-row skips to display in the Phase Skip table
         
     Returns:
         If save_to_disk is True: List of file paths where reports were saved
         If save_to_disk is False: Tuple of (List of BytesIO objects, List of region names)
     """
-    # Get unique regions
-    regions = set(region for _, region in phase_figures + detector_figures + missing_data_figures)
+    # Get unique regions from figure collections and Phase Skip tables
+    figure_collections = [
+        phase_figures or [],
+        detector_figures or [],
+        ped_figures or [],
+        missing_data_figures or [],
+        phase_skip_figures or []
+    ]
+    regions = set()
+    for collection in figure_collections:
+        regions.update(region for _, region in collection)
+
+    if phase_skip_rows is not None and not phase_skip_rows.empty and signals_df is not None:
+        region_lookup = (
+            phase_skip_rows[['DeviceId']]
+            .drop_duplicates()
+            .merge(signals_df[['DeviceId', 'Region']], on='DeviceId', how='left')
+        )
+        regions.update(region_lookup['Region'].dropna().tolist())
+
+    if phase_skip_alerts_df is not None and not phase_skip_alerts_df.empty and signals_df is not None:
+        alert_region_lookup = (
+            phase_skip_alerts_df[['DeviceId']]
+            .drop_duplicates()
+            .merge(signals_df[['DeviceId', 'Region']], on='DeviceId', how='left')
+        )
+        regions.update(alert_region_lookup['Region'].dropna().tolist())
+
+    if not regions and signals_df is not None:
+        regions.update(signals_df['Region'].unique().tolist())
+
+    if regions:
+        regions.add("All Regions")
+        regions = sorted(regions)
+    allowed_phase_skip_pairs = None
+    if phase_skip_alerts_df is not None and not phase_skip_alerts_df.empty:
+        allowed_phase_skip_pairs = phase_skip_alerts_df[['DeviceId', 'Phase']].drop_duplicates()
     generated_paths = []
     buffer_objects = []
     region_names = []    # Get the joke once, outside the region loop
@@ -428,7 +474,7 @@ def generate_pdf_report(
         content.append(Spacer(1, 0.2*inch))
 
         # Introduction text
-        intro_text = f"""This report for {region} includes alerts for increased percent maxout, vehicle & pedestrian detector alerts, and data completeness. 
+        intro_text = f"""This report for {region} includes alerts for phase skips, increased percent maxout, vehicle & pedestrian detector performance, and data completeness. 
         These are new alerts only, recurring issues are not shown but will be added in a future update.
         """
         content.append(Paragraph(intro_text, styles['Normal']))
@@ -495,6 +541,50 @@ def generate_pdf_report(
             # Add phase termination charts without additional header
             for fig in region_phase_figures:
                 # Wrap each chart in a KeepTogether to ensure it stays on one page
+                chart_elements = []
+                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
+                content.append(KeepTogether(chart_elements))
+                content.append(Spacer(1, 0.15*inch))
+                plt.close(fig)
+
+        region_phase_skip_figures = [fig for fig, reg in (phase_skip_figures or []) if reg == region]
+        if (
+            phase_skip_rows is not None and not phase_skip_rows.empty and
+            signals_df is not None and
+            allowed_phase_skip_pairs is not None and not allowed_phase_skip_pairs.empty
+        ):
+            region_phase_skip_rows = prepare_phase_skip_alerts_table(
+                phase_skip_rows,
+                signals_df,
+                region=region,
+                allowed_pairs=allowed_phase_skip_pairs,
+                min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0
+            )
+        else:
+            region_phase_skip_rows = pd.DataFrame()
+
+        if (region_phase_skip_rows is not None and not region_phase_skip_rows.empty) or region_phase_skip_figures:
+            content.append(Paragraph("Phase Skip Alerts", styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+
+            explanation = """Phase Skip alerts highlight phases where wait times exceeded 1.5x the cycle length without an active preempt window.
+            Each table row represents a device/phase/day combination that met these conditions within the last two weeks."""
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+
+            if region_phase_skip_rows is not None and not region_phase_skip_rows.empty:
+                table_content = create_reportlab_table(
+                    region_phase_skip_rows,
+                    "Phase Skip Alerts",
+                    styles,
+                    total_count=len(region_phase_skip_rows),
+                    max_rows=0,
+                    include_trend=False
+                )
+                content.extend(table_content)
+                content.append(Spacer(1, 0.3*inch))
+
+            for fig in region_phase_skip_figures:
                 chart_elements = []
                 chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
                 content.append(KeepTogether(chart_elements))
@@ -617,6 +707,16 @@ def generate_pdf_report(
             region_system_outages = system_outages_df if not system_outages_df.empty else pd.DataFrame()
         else:
             region_system_outages = system_outages_df[system_outages_df['Region'] == region] if not system_outages_df.empty else pd.DataFrame()
+
+        region_has_alerts = any([
+            region_phase_figures,
+            region_detector_figures,
+            region_ped_figures,
+            region_missing_data_figures,
+            region_phase_skip_figures,
+            not region_phase_skip_rows.empty,
+            not region_system_outages.empty
+        ])
         
         if not region_system_outages.empty:
             content.append(Paragraph("System-Wide Outages", styles['SectionHeading']))
@@ -653,10 +753,13 @@ def generate_pdf_report(
         if save_to_disk:
             generated_paths.append(region_path)
             log_message(f"Report for {region} saved to {region_path}", 1, verbosity)
+            if region_has_alerts:
+                region_names.append(region)
         else:
-            buffer_objects.append(buffer)
-            region_names.append(region)
-            log_message(f"Report for {region} generated in memory.", 1, verbosity)
+            if region_has_alerts:
+                buffer_objects.append(buffer)
+                region_names.append(region)
+                log_message(f"Report for {region} generated in memory.", 1, verbosity)
 
     if save_to_disk:
         return generated_paths

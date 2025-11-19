@@ -9,6 +9,7 @@ Generate automated reports to flag traffic signal performance issues using Autom
 ATSPM_Report analyzes aggregated traffic signal data to identify anomalies and generates PDF reports with visualizations of potential issues. It can:
 
 - Detect unusual patterns in signal phase max-outs
+- Flag Phase Skip events where a phase waits more than 1.5× the cycle length outside of preempt windows
 - Identify problematic detector actuations
 - Flag missing data periods
 - Monitor pedestrian phase usage
@@ -32,7 +33,7 @@ The application is configured using a JSON configuration file (default: `config.
   },
   "signals_query": "SELECT DeviceId, Name, Region FROM your_signals_table",
   "num_figures": 3,
-  "email_reports_flag": false,
+  "email_reports": false,
   "verbosity": 1,
   "days_back": 21,
   "alert_flagging_days": 7,
@@ -40,7 +41,11 @@ The application is configured using a JSON configuration file (default: `config.
   "alert_suppression_days": 21,
   "alert_retention_weeks": 104,
   "past_alerts_folder": "Past_Alerts",
-  "use_past_alerts": true
+  "use_past_alerts": true,
+  "phase_skip_alert_rows_folder": "alert_rows",
+  "phase_skip_phase_waits_file": "raw_data/phase_skip_phase_waits.parquet",
+  "phase_skip_retention_days": 14,
+  "phase_skip_alert_threshold": 2
 }
 ```
 
@@ -50,11 +55,12 @@ The application is configured using a JSON configuration file (default: `config.
 - `connection_params`: Database connection parameters (required when `use_parquet` is false)
 - `signals_query`: Custom SQL query to retrieve signal information (required when `use_parquet` is false)
 - `num_figures`: Number of figures to generate per device in the report
-- `email_reports_flag`: If true, email reports instead of saving to disk
+- `email_reports`: If true, email reports instead of saving to disk
 - `days_back`: Number of days of historical data to analyze
 - `alert_flagging_days`: Maximum age (in days) for new alerts to be included in reports
 - `alert_suppression_days`: Number of days to suppress repeated alerts for the same issue
 - `use_past_alerts`: Whether to track and suppress previously reported alerts
+- `phase_skip_*`: Controls where Phase Skip parquet files live, how long to keep history, and how many skips trigger alerts
 
 ### Data Requirements
 
@@ -64,6 +70,16 @@ Performance data must match the structure produced by the Python atspm package, 
 - `Name`: A human-readable name for the signal
 - `Region`: The region/area the signal belongs to (e.g., "Region 1", "Region 2")
 
+### Phase Skip Data
+
+Phase Skip alerts use controller event data from the `DataLoad` database (or an equivalent source). This logic is intentionally kept inside `run_report.py`, which is ODOT-specific and not published when the project is shared. The daily runner must:
+
+1. Query hires-events for the previous day (events 102, 104, 132, and 612–627).
+2. Use the `transform_phase_skip_raw_data` helper (see `phase_skip_processing.py`) to build `phase_waits` and `alert_rows`.
+3. Save the latest `phase_waits` to `raw_data/phase_skip_phase_waits.parquet`.
+4. Save `alert_rows` to `alert_rows/<YYYY-MM-DD>.parquet` and keep only the most recent two weeks of files.
+
+`ATSPMReport.py` simply loads those parquet artifacts, aggregates two weeks of history, suppresses previously reported device/phase pairs, and renders the Phase Skip tables/plots in the PDF.
 
 #### Email Configuration
 
@@ -137,6 +153,7 @@ Each report includes a fun traffic/engineering-related joke. Here's a sample:
 ## Directory Structure
 
 - `raw_data/`: Storage for parquet data files (when using parquet mode)
+- `alert_rows/`: Rolling store of Phase Skip alert parquet files (one per day)
 - `Past_Alerts/`: Tracking of previously reported alerts
 - `images/`: Graphics used in the PDF reports
 

@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
+import matplotlib.dates as mdates
 from typing import List, Optional, Tuple
 import pandas as pd
 
@@ -535,4 +536,136 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
     for fig, region, _ in sorted_figures_with_rank:
         figures.append((fig, region))
     
+    return figures
+
+
+def create_phase_skip_plots(
+    phase_waits_df: 'pd.DataFrame',
+    signals_df: 'pd.DataFrame',
+    device_rankings_df: 'pd.DataFrame',
+    num_figures: int
+) -> List[Tuple['plt.Figure', str]]:
+    """Generate per-device Phase Skip (Phase Wait Time) plots with styling identical to the main device charts."""
+    if (
+        phase_waits_df is None or phase_waits_df.empty or
+        device_rankings_df is None or device_rankings_df.empty or
+        signals_df is None or signals_df.empty
+    ):
+        return []
+
+    # Ensure consistent font settings with the rest of the charts
+    plt.rcParams.update({
+        'font.size': 12,
+        'axes.titlesize': 16,
+        'axes.labelsize': 14,
+        'xtick.labelsize': 12,
+        'ytick.labelsize': 12,
+        'legend.fontsize': 12
+    })
+
+    rankings = device_rankings_df.copy()
+    rankings['DeviceId'] = rankings['DeviceId'].astype(str)
+
+    signals = signals_df[['DeviceId', 'Name', 'Region']].copy()
+    signals['DeviceId'] = signals['DeviceId'].astype(str)
+
+    rankings = rankings.merge(signals, on='DeviceId', how='left')
+    rankings = rankings.dropna(subset=['Region'])
+
+    if rankings.empty:
+        return []
+
+    regions = rankings['Region'].dropna().unique().tolist()
+    if 'All Regions' not in regions:
+        regions.append('All Regions')
+
+    figures: List[Tuple['plt.Figure', str]] = []
+
+    phase_waits_df = phase_waits_df.copy()
+    phase_waits_df['DeviceId'] = phase_waits_df['DeviceId'].astype(str)
+    phase_waits_df['Timestamp'] = pd.to_datetime(phase_waits_df['Timestamp'])
+    phase_waits_df = phase_waits_df.sort_values('Timestamp')
+
+    # Same color palette as the other charts
+    colors = ['#E41A1C', '#377EB8', '#4DAF4A', '#984EA3', '#FF7F00', '#A65628', '#F781BF', '#17BECF']
+
+    for region in regions:
+        if region == 'All Regions':
+            region_rankings = rankings
+        else:
+            region_rankings = rankings[rankings['Region'] == region]
+
+        if region_rankings.empty:
+            continue
+
+        top_devices = (
+            region_rankings
+            .sort_values(by='TotalSkips', ascending=False)
+            .head(num_figures if num_figures is not None else 3)
+        )
+
+        for _, device_row in top_devices.iterrows():
+            device_id = device_row['DeviceId']
+            device_data = phase_waits_df[phase_waits_df['DeviceId'] == device_id]
+
+            if device_data.empty:
+                continue
+
+            # Match figure size with other individual device charts
+            fig, ax = plt.subplots(figsize=(10, 5))
+
+            unique_phases = sorted(device_data['Phase'].astype(int).unique())
+            phase_colors = {phase: colors[i % len(colors)] for i, phase in enumerate(unique_phases)}
+
+            for phase_value in unique_phases:
+                phase_points = device_data[device_data['Phase'] == phase_value]
+                ax.plot(
+                    phase_points['Timestamp'],
+                    phase_points['PhaseWaitTime'],
+                    label=f"Phase {phase_value}",
+                    color=phase_colors[phase_value],
+                    linewidth=2.5,           # thicker lines like other charts
+                    zorder=5
+                )
+
+            signal_label = device_row.get('Name') or device_id
+
+            # Title and labels with bold, same padding and font sizes
+            ax.set_title(
+                f"Phase Wait Time\n{signal_label}",
+                pad=20,
+                fontweight='bold',
+                fontsize=16
+            )
+            ax.set_ylabel("Phase Wait Time (s)", fontweight='bold', fontsize=14)
+
+            # Visual styling identical to the main charts
+            ax.set_facecolor('#f8f8f8')                    # light gray background
+            ax.grid(True, alpha=0.3, linestyle='--')
+            ax.set_axisbelow(True)
+
+            # Nice time formatting on x-axis
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            plt.xticks(rotation=45, ha='right', fontsize=12)
+            ax.tick_params(axis='both', labelsize=12)
+
+            # Legend placed exactly like the other charts
+            ax.legend(
+                frameon=True,
+                fancybox=True,
+                framealpha=0.9,
+                loc='upper left',
+                bbox_to_anchor=(0.01, 1),
+                ncol=2
+            )
+
+            # Thicker spines for consistent look
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.2)
+
+            # Tight layout with extra padding to prevent cutoff (same as others)
+            plt.tight_layout(pad=2.0)
+
+            figures.append((fig, region))
+
     return figures
