@@ -8,6 +8,8 @@ PHASE_SKIP_PHASE_WAITS_COLUMNS = [
 PHASE_SKIP_ALERT_COLUMNS = [
     'DeviceId', 'Phase', 'Date', 'MaxCycleLength', 'MaxWaitTime', 'TotalSkips'
 ]
+CYCLE_LENGTH_MULTIPLIER = 1.5
+FREE_SIGNAL_THRESHOLD = 180
 
 
 def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -29,7 +31,7 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
     con = duckdb.connect(database=':memory:')
     con.register('raw_data', raw_data)
 
-    phase_waits_sql = """
+    phase_waits_sql = f"""
     WITH preempt_pairs AS (
         SELECT
             deviceid,
@@ -60,13 +62,6 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
         FROM raw_data
         WHERE eventid BETWEEN 612 AND 627
     ),
-    preempt_windows AS (
-        SELECT
-            deviceid,
-            start_time AS window_start,
-            end_time + INTERVAL '2 minutes' AS window_end
-        FROM valid_preempt_intervals
-    ),
     max_cycles AS (
         SELECT
             deviceid,
@@ -74,6 +69,23 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
         FROM raw_data
         WHERE eventid = 132
         GROUP BY deviceid
+    ),
+    preempt_windows AS (
+        SELECT
+            v.deviceid,
+            v.start_time AS window_start,
+            v.end_time
+            + (
+                CASE
+                    WHEN mc.max_cycle_length > 0 THEN
+                        INTERVAL '1 second' * (mc.max_cycle_length * {CYCLE_LENGTH_MULTIPLIER})
+                    ELSE
+                        INTERVAL '1 second' * {FREE_SIGNAL_THRESHOLD}
+                END
+            ) AS window_end
+        FROM valid_preempt_intervals v
+        LEFT JOIN max_cycles mc
+          ON v.deviceid = mc.deviceid
     )
     SELECT
         pw.deviceid,
@@ -97,7 +109,7 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
     phase_waits_df = con.sql(phase_waits_sql).df()
     con.register('phase_waits', phase_waits_df)
 
-    alert_sql = """
+    alert_sql = f"""
     SELECT 
         deviceid, 
         phase,
@@ -107,7 +119,14 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
         COUNT(*) AS total_skips
     FROM phase_waits
     WHERE preempt_flag = FALSE 
-      AND phase_wait_time > (COALESCE(NULLIF(max_cycle_length, 0), 140) * 1.5)
+      AND phase_wait_time > (
+          CASE
+              WHEN COALESCE(max_cycle_length, 0) > 0 THEN
+                  max_cycle_length * {CYCLE_LENGTH_MULTIPLIER}
+              ELSE
+                  {FREE_SIGNAL_THRESHOLD}
+          END
+      )
     GROUP BY ALL
     ORDER BY total_skips DESC
     """
