@@ -546,13 +546,20 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     phase_skip_alert_pairs = None
     if not final_phase_skip_alerts.empty:
         phase_skip_alert_pairs = final_phase_skip_alerts[['DeviceId', 'Phase']].drop_duplicates()
+    plot_phase_skip_waits = pd.DataFrame()
     if (
         phase_skip_alert_pairs is not None
+        and not phase_skip_alert_pairs.empty
         and not phase_skip_waits.empty
     ):
-        plot_phase_skip_waits = phase_skip_waits.merge(phase_skip_alert_pairs, on=['DeviceId', 'Phase'], how='inner')
-    else:
-        plot_phase_skip_waits = pd.DataFrame()
+        annotated_phase_waits = phase_skip_waits.merge(
+            phase_skip_alert_pairs.assign(AlertPhase=True),
+            on=['DeviceId', 'Phase'],
+            how='left'
+        )
+        annotated_phase_waits['AlertPhase'] = annotated_phase_waits['AlertPhase'].fillna(False)
+        alert_devices = phase_skip_alert_pairs['DeviceId'].unique()
+        plot_phase_skip_waits = annotated_phase_waits[annotated_phase_waits['DeviceId'].isin(alert_devices)]
     phase_skip_figures = create_phase_skip_plots(plot_phase_skip_waits, signals_df, phase_skip_rankings, num_figures)
     log_message("Plots created successfully", 1, verbosity)
 

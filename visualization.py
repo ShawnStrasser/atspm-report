@@ -585,6 +585,10 @@ def create_phase_skip_plots(
     phase_waits_df['DeviceId'] = phase_waits_df['DeviceId'].astype(str)
     phase_waits_df['Timestamp'] = pd.to_datetime(phase_waits_df['Timestamp'])
     phase_waits_df = phase_waits_df.sort_values('Timestamp')
+    alert_column = 'AlertPhase'
+    if alert_column not in phase_waits_df.columns:
+        phase_waits_df[alert_column] = False
+    phase_waits_df[alert_column] = phase_waits_df[alert_column].fillna(False).astype(bool)
 
     # Same color palette as the other charts
     colors = ['#E41A1C', '#377EB8', '#4DAF4A', '#984EA3', '#FF7F00', '#A65628', '#F781BF', '#17BECF']
@@ -616,16 +620,51 @@ def create_phase_skip_plots(
 
             unique_phases = sorted(device_data['Phase'].astype(int).unique())
             phase_colors = {phase: colors[i % len(colors)] for i, phase in enumerate(unique_phases)}
+            alert_phases = sorted(device_data.loc[device_data[alert_column], 'Phase'].astype(int).unique())
+            if not alert_phases:
+                alert_phases = unique_phases
+            other_phases = sorted(set(unique_phases) - set(alert_phases))
 
-            for phase_value in unique_phases:
-                phase_points = device_data[device_data['Phase'] == phase_value]
+            other_phase_lines = []
+            for phase_value in other_phases:
+                data = device_data[device_data['Phase'] == phase_value]
+                if data.empty:
+                    continue
+                line = ax.plot(
+                    data['Timestamp'],
+                    data['PhaseWaitTime'],
+                    color='#cccccc',
+                    linewidth=1.5,
+                    alpha=0.7,
+                    zorder=1
+                )
+                other_phase_lines.append(line[0])
+            if other_phase_lines:
+                other_phase_lines[0].set_label("Other Phases")
+
+            for phase_value in alert_phases:
+                data = device_data[device_data['Phase'] == phase_value]
+                if data.empty:
+                    continue
                 ax.plot(
-                    phase_points['Timestamp'],
-                    phase_points['PhaseWaitTime'],
+                    data['Timestamp'],
+                    data['PhaseWaitTime'],
                     label=f"Phase {phase_value}",
-                    color=phase_colors[phase_value],
-                    linewidth=2.5,           # thicker lines like other charts
+                    color=phase_colors.get(phase_value, colors[0]),
+                    linewidth=2.5,
                     zorder=5
+                )
+
+            max_cycle_vals = device_data['MaxCycleLength'].dropna()
+            if not max_cycle_vals.empty:
+                max_cycle_length = max_cycle_vals.max()
+                ax.axhline(
+                    y=max_cycle_length,
+                    color='#4d4d4d',
+                    linestyle='--',
+                    linewidth=1.5,
+                    zorder=2,
+                    label='Max Cycle Length'
                 )
 
             signal_label = device_row.get('Name') or device_id
