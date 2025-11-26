@@ -78,7 +78,9 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
             + (
                 CASE
                     WHEN mc.max_cycle_length > 0 THEN
-                        INTERVAL '1 second' * (mc.max_cycle_length * {CYCLE_LENGTH_MULTIPLIER})
+                        INTERVAL '1 second' * CAST(
+                            CEIL(mc.max_cycle_length * {CYCLE_LENGTH_MULTIPLIER}) AS INT
+                        )
                     ELSE
                         INTERVAL '1 second' * {FREE_SIGNAL_THRESHOLD}
                 END
