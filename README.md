@@ -34,6 +34,7 @@ The application is configured using a JSON configuration file (default: `config.
   "signals_query": "SELECT DeviceId, Name, Region FROM your_signals_table",
   "num_figures": 3,
   "email_reports": false,
+  "delete_sent_emails": false,
   "verbosity": 1,
   "days_back": 21,
   "alert_flagging_days": 7,
@@ -56,6 +57,7 @@ The application is configured using a JSON configuration file (default: `config.
 - `signals_query`: Custom SQL query to retrieve signal information (required when `use_parquet` is false)
 - `num_figures`: Number of figures to generate per device in the report
 - `email_reports`: If true, email reports instead of saving to disk
+- `delete_sent_emails`: If true, Outlook deletes the sent report email instead of storing it in Sent Items
 - `days_back`: Number of days of historical data to analyze
 - `alert_flagging_days`: Maximum age (in days) for new alerts to be included in reports
 - `alert_suppression_days`: Number of days to suppress repeated alerts for the same issue
@@ -96,6 +98,8 @@ All Regions,manager@example.com
 - The "Region" column should match the region names from your signals data
 - Use "All Regions" to specify recipients for the consolidated report
 - Multiple email addresses can be specified for each region
+
+Set `delete_sent_emails` to `true` in `config.json` if you want Outlook to delete the automated emails from the Sent Items folder immediately after delivery.
 
 ## Usage
 

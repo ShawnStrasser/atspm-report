@@ -296,6 +296,7 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
     connection_params = connection_params or cfg.get('connection_params')
     num_figures = num_figures if num_figures is not None else cfg.get('num_figures', 1)
     should_email_reports = should_email_reports if should_email_reports is not None else cfg.get('email_reports', False)
+    delete_sent_emails = cfg.get('delete_sent_emails', False)
     signals_query = cfg.get('signals_query')
     verbosity = cfg.get('verbosity', 1) # Get verbosity from config, default to 1
     days_back = cfg.get('days_back', 21) # Get days_back from config, default to 21
@@ -597,7 +598,8 @@ def main(use_parquet=None, connection_params=None, num_figures=None,
             regions=region_names,
             report_in_memory=True,
             verbosity=verbosity, # Pass verbosity
-            regions_with_alerts=regions_with_alerts
+            regions_with_alerts=regions_with_alerts,
+            delete_sent_emails=delete_sent_emails
         )
         
         if success:

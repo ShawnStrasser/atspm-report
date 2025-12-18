@@ -32,7 +32,8 @@ def email_reports(
         report_in_memory: bool = False,
         email_csv: str = "emails.csv",
         verbosity: int = 1,
-        regions_with_alerts: List[str] = None
+        regions_with_alerts: List[str] = None,
+        delete_sent_emails: bool = False
 ) -> bool:
     """
     Email reports to recipients using MS Outlook.
@@ -44,6 +45,7 @@ def email_reports(
         email_csv: Path to CSV file containing email recipients
         verbosity: Verbosity level (0=silent, 1=info, 2=debug)
         regions_with_alerts: List of region names that have alerts (to determine email content)
+        delete_sent_emails: If True, delete the sent message from Outlook's Sent Items folder
         
     Returns:
         Success status
@@ -63,7 +65,10 @@ def email_reports(
     if not recipients:
         log_message("No email recipients found. Check the emails.csv file.", 1, verbosity)
         return False
-      # Get today's date for the email subject
+
+    if delete_sent_emails:
+        log_message("Delete-after-send enabled: sent Outlook messages will be removed from Sent Items.", 2, verbosity)
+    # Get today's date for the email subject
     today = datetime.today().strftime("%B %d, %Y")
     
     try:
@@ -85,6 +90,8 @@ def email_reports(
             
             # Create a new email
             mail = outlook.CreateItem(0)  # 0 corresponds to olMailItem
+            if delete_sent_emails:
+                mail.DeleteAfterSubmit = True
             
             mail.Subject = f"ATSPM Report - {region} - {today}"
             
@@ -172,6 +179,8 @@ def email_reports(
                 continue # disable cause these are probably kinda annoying
                 # Create a new email
                 mail = outlook.CreateItem(0)  # 0 corresponds to olMailItem
+                if delete_sent_emails:
+                    mail.DeleteAfterSubmit = True
                 mail.Subject = f"ATSPM Report - {region} - {today} - No Issues Found"
                 mail.To = ';'.join(recipients[region])
                 
