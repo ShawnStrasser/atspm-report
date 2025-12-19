@@ -4,7 +4,7 @@ import win32com.client
 from typing import List, Optional, Dict, Union
 from io import BytesIO
 from datetime import datetime
-from utils import log_message  # Import the utility function
+from src.atspm_report.utils import log_message  # Import the utility function
 
 def load_email_recipients(csv_path: str) -> Dict[str, str]:
     """

@@ -1,5 +1,5 @@
 import pandas as pd
-import requests
+import importlib.resources
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -9,13 +9,12 @@ from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 from io import BytesIO
 import matplotlib.pyplot as plt
-from datetime import datetime
+from datetime import datetime, date
 import os
 import calendar
-import random
-import PIL.Image
+from pathlib import Path
 from typing import List, Tuple, Union, Dict, Any, Optional
-from table_generation import (
+from .table_generation import (
     prepare_phase_termination_alerts_table,
     prepare_phase_skip_alerts_table,
     prepare_detector_health_alerts_table,
@@ -24,100 +23,80 @@ from table_generation import (
     prepare_system_outages_table,
     create_reportlab_table
 )
-from utils import log_message # Import the utility function
+from .utils import log_message
 
-# Load jokes of the week
-JOKES_CSV_PATH = os.path.join(os.path.dirname(__file__), "jokes.csv")
-try:
-    jokes_df = pd.read_csv(JOKES_CSV_PATH, parse_dates=['Date'])
-    jokes_df.sort_values('Date', inplace=True)
-except Exception as e:
-    print(f"Warning: Could not load jokes.csv: {e}")
-    jokes_df = pd.DataFrame(columns=['Date', 'Joke'])
-
-
-def get_joke_from_api():
-    """Get a joke from the JokeAPI."""
+# Load jokes from package data
+def _load_jokes() -> list[str]:
+    """Load jokes from package data."""
     try:
-        url = 'https://v2.jokeapi.dev/joke/any?&safe-mode'
-        response = requests.get(url, verify=False)
-        if response.ok:
-            joke_data = response.json()
-            if joke_data['type'] == 'single':
-                return {'text': joke_data['joke'], 'source': 'JokeAPI'}
-            else:  # twopart
-                return {'text': f"{joke_data['setup']}\n{joke_data['delivery']}", 'source': 'JokeAPI'}
+        with importlib.resources.files(__package__).joinpath('jokes.csv').open(encoding='utf-8') as f:
+            df = pd.read_csv(f)
+            return df['Joke'].tolist()
     except Exception as e:
-        print(f"Warning: Could not fetch joke from JokeAPI: {e}")
-    return None
+        print(f"Warning: Could not load jokes.csv: {e}")
+        return ["Why did the traffic engineer break up with the signal? The timing was off!"]
 
-def get_dad_joke():
-    """Get a joke from icanhazdadjoke API."""
-    try:
-        headers = {'Accept': 'application/json'}
-        response = requests.get('https://icanhazdadjoke.com/', headers=headers, verify=False)
-        if response.ok:
-            joke_data = response.json()
-            return {'text': joke_data['joke'], 'source': 'icanhazdadjoke'}
-    except Exception as e:
-        print(f"Warning: Could not fetch joke from icanhazdadjoke: {e}")
-    return None
+_JOKES = _load_jokes()
 
-# Curated list of approved XKCD comic numbers
-APPROVED_XKCD_COMICS = [
-    26, 55, 58, 149, 162, 208, 221, 227, 237, 246, 272, 281, 284, 285,
-    302, 303, 325, 327, 386, 390, 421, 435, 451, 470, 483, 552, 557,
-    605, 610, 612, 616, 626, 627, 833, 844, 927, 979, 1162, 1172, 1425,
-    1667, 1741, 1831, 1906, 2054, 2228, 2347, 2610
-]
-
-def get_xkcd_comic():
-    """Get a random XKCD comic from the approved list."""
-    try:
-        # Pick a random comic number from our approved list
-        random_num = random.choice(APPROVED_XKCD_COMICS)
-        
-        # Get the comic
-        response = requests.get(f'https://xkcd.com/{random_num}/info.0.json')
-        if response.ok:
-            comic_data = response.json()
-            
-            # Download the image to check its size
-            img_response = requests.get(comic_data['img'])
-            if img_response.ok:
-                img_data = BytesIO(img_response.content)
-                with PIL.Image.open(img_data) as img:
-                    width, height = img.size
-                    
-                    # If the image is too large (more than 800px in either dimension),
-                    # try again with a different comic
-                    if width > 800 or height > 800:
-                        return get_xkcd_comic()  # Recursive call for a different comic
-                    
-                    return {
-                        'text': comic_data['title'],
-                        'source': 'XKCD',
-                        'image': img_data.getvalue(),
-                        'alt': comic_data['alt'],
-                        'dimensions': (width, height)
-                    }
-    except Exception as e:
-        print(f"Warning: Could not fetch XKCD comic: {e}")
-    return None
-
-def get_random_joke():
-    """Get a random joke from any available source."""
-    joke_sources = [get_joke_from_api, get_dad_joke, get_xkcd_comic]
-    random.shuffle(joke_sources)
+def get_joke(joke_index: int = None) -> str:
+    """
+    Get a joke for the report.
     
-    # Try each source until we get a successful response
-    for source in joke_sources:
-        joke_data = source()
-        if joke_data:
-            return joke_data
-            
-    # If all sources fail, return a fallback message
-    return {'text': "No joke available today.", 'source': None}
+    Args:
+        joke_index: Specific joke index (0-based). If None, auto-cycles based on today's date.
+    
+    Returns:
+        Joke string
+    """
+    if not _JOKES:
+        return "Why did the traffic engineer break up with the signal? The timing was off!"
+    
+    if joke_index is not None:
+        # Use provided index (wrap around if out of range)
+        idx = joke_index % len(_JOKES)
+    else:
+        # Auto-cycle based on today's date
+        days_since_epoch = (date.today() - date(1970, 1, 1)).days
+        idx = days_since_epoch % len(_JOKES)
+    
+    return _JOKES[idx]
+
+def get_logo_path(custom_logo_path: str = None) -> str:
+    """
+    Get the logo path to use in reports.
+    
+    Args:
+        custom_logo_path: User-provided logo file path. If None, uses default ODOT logo.
+    
+    Returns:
+        Path to logo image file, or None if not found
+    """
+    if custom_logo_path:
+        if Path(custom_logo_path).exists():
+            return custom_logo_path
+        else:
+            print(f"Warning: Custom logo not found at {custom_logo_path}, using default")
+    
+    # Use default logo from package
+    try:
+        with importlib.resources.as_file(
+            importlib.resources.files(__package__).joinpath('images/logo.png')
+        ) as path:
+            return str(path)
+    except Exception as e:
+        print(f"Warning: Could not load default logo: {e}")
+        return None
+
+def get_signal_head_path() -> str:
+    """Get the signal head icon path from package data."""
+    try:
+        with importlib.resources.as_file(
+            importlib.resources.files(__package__).joinpath('images/signal_head.png')
+        ) as path:
+            return str(path)
+    except Exception as e:
+        print(f"Warning: Could not load signal head icon: {e}")
+        return None
 
 
 class PageNumCanvas(canvas.Canvas):
@@ -288,15 +267,16 @@ def generate_pdf_report(
         ped_figures: List[tuple[plt.Figure, str]],
         missing_data_figures: List[tuple[plt.Figure, str]],
         signals_df: pd.DataFrame = None,
-        output_path: str = "ATSPM_Report_{region}.pdf",
-        save_to_disk: bool = True,
+        save_to_disk: bool = False,
         max_table_rows: int = 10,
         verbosity: int = 1,
         phase_skip_rows: pd.DataFrame = None,
         phase_skip_figures: List[tuple[plt.Figure, str]] = None,
         phase_skip_alerts_df: Optional[pd.DataFrame] = None,
-        phase_skip_threshold: Optional[float] = None
-) -> Union[List[str], Tuple[List[BytesIO], List[str]]]:
+        phase_skip_threshold: Optional[float] = None,
+        joke_index: int = None,
+        custom_logo_path: str = None
+) -> Dict[str, BytesIO]:
     """Generate PDF reports for each region with the plots.
     
     Args:
@@ -311,18 +291,18 @@ def generate_pdf_report(
         ped_figures: List of (figure, region) tuples for pedestrian alerts
         missing_data_figures: List of (figure, region) tuples for missing data
         signals_df: DataFrame with signal information
-        output_path: Path template for saving reports
-        save_to_disk: If True, save reports to disk, otherwise return BytesIO objects
+        save_to_disk: Must be False (legacy parameter, kept for compatibility)
         max_table_rows: Maximum number of rows to show in each alert table
         verbosity: Verbosity level (0=silent, 1=info, 2=debug)
         phase_skip_rows: DataFrame containing combined Phase Skip alert rows (for tables)
         phase_skip_figures: List of (figure, region) tuples for Phase Skip charts
-        phase_skip_alerts_df: DataFrame with Phase Skip alerts after suppression (DeviceId, Phase, Date)
+        phase_skip_alerts_df: DataFrame with Phase Skip alerts after suppression
         phase_skip_threshold: Minimum per-row skips to display in the Phase Skip table
+        joke_index: Specific joke index to use (0-based), None for date-based cycling
+        custom_logo_path: Path to custom logo file, None for default ODOT logo
         
     Returns:
-        If save_to_disk is True: List of file paths where reports were saved
-        If save_to_disk is False: Tuple of (List of BytesIO objects, List of region names)
+        Dict mapping region name to BytesIO containing PDF bytes
     """
     # Get unique regions from figure collections and Phase Skip tables
     figure_collections = [
@@ -361,30 +341,11 @@ def generate_pdf_report(
     allowed_phase_skip_pairs = None
     if phase_skip_alerts_df is not None and not phase_skip_alerts_df.empty:
         allowed_phase_skip_pairs = phase_skip_alerts_df[['DeviceId', 'Phase']].drop_duplicates()
-    generated_paths = []
     buffer_objects = []
-    region_names = []    # Get the joke once, outside the region loop
-    today_date = datetime.today().date()
-    is_monday = calendar.day_name[today_date.weekday()] == 'Monday'
-    exact_match = jokes_df[jokes_df['Date'].dt.date == today_date]
-    if not exact_match.empty:
-        # Use scheduled joke from CSV
-        joke_data = {'text': exact_match.iloc[0]['Joke'], 'source': None}
-        joke_title = "Joke of the Week"  # Always use this for scheduled jokes
-    else:
-        # If no exact match, get a random joke
-        joke_data = get_random_joke()
-        joke_title = "Joke of the Week" if is_monday else "Daily Dose of Humor"
-    
-    # Set attribution based on source
-    if joke_data['source'] == 'JokeAPI':
-        joke_attribution = "Joke provided by JokeAPI (https://jokeapi.dev)"
-    elif joke_data['source'] == 'icanhazdadjoke':
-        joke_attribution = "Dad joke provided by icanhazdadjoke.com"
-    elif joke_data['source'] == 'XKCD':
-        joke_attribution = f"XKCD Comic: {joke_data['alt']}"
-    else:
-        joke_attribution = None
+
+    # Get joke for this report
+    joke_text = get_joke(joke_index)
+    joke_title = "Joke of the Week"
 
     # Process each individual region first
     for region in regions:
@@ -401,13 +362,12 @@ def generate_pdf_report(
         else:
             region_signals_df = signals_df[signals_df['Region'] == region] if signals_df is not None else None
 
-        # Create the document
-        region_path = output_path.format(region=region.replace(" ", "_"))
-        
         # Create header/footer handler
+        logo_path = get_logo_path(custom_logo_path)
+        signal_head_path = get_signal_head_path()
         header_footer = HeaderFooter(
-            logo_path=os.path.join("images", "logo.jpg"),
-            signal_head_path=os.path.join("images", "signal_head.jpg"),
+            logo_path=logo_path if logo_path else "",
+            signal_head_path=signal_head_path if signal_head_path else "",
             region=region
         )
 
@@ -420,26 +380,16 @@ def generate_pdf_report(
             return canvas
 
         # Determine if we're writing to disk or memory
-        if save_to_disk:
-            doc = SimpleDocTemplate(
-                region_path,
-                pagesize=letter,
-                leftMargin=0.5*inch,
-                rightMargin=0.5*inch,
-                topMargin=1.2*inch,  # Increased top margin to prevent text encroachment
-                bottomMargin=0.5*inch
-            )
-        else:
-            # Create a BytesIO buffer for this report
-            buffer = BytesIO()
-            doc = SimpleDocTemplate(
-                buffer,
-                pagesize=letter,
-                leftMargin=0.5*inch,
-                rightMargin=0.5*inch,
-                topMargin=1.2*inch,  # Increased top margin to prevent text encroachment
-                bottomMargin=0.5*inch
-            )
+        # Create a BytesIO buffer for this report
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            leftMargin=0.5*inch,
+            rightMargin=0.5*inch,
+            topMargin=1.2*inch,
+            bottomMargin=0.5*inch
+        )
 
         # Content building
         content = []
@@ -478,36 +428,11 @@ def generate_pdf_report(
         These are new alerts only, recurring issues are not shown but will be added in a future update.
         """
         content.append(Paragraph(intro_text, styles['Normal']))
-        content.append(Spacer(1, 0.2*inch))        # Joke section
-        content.append(Paragraph(joke_title, styles['SectionHeading']))
+        content.append(Spacer(1, 0.2*inch))
         
-        # Handle different types of jokes
-        if joke_data.get('source') == 'XKCD':
-            # For XKCD comics, add the title and then the image
-            content.append(Paragraph(joke_data['text'], styles['Normal']))
-            content.append(Spacer(1, 0.1*inch))
-            
-            # Create and add the image
-            img_data = BytesIO(joke_data['image'])
-            width, height = joke_data['dimensions']
-            # Scale image to fit page width while maintaining aspect ratio
-            scale_factor = min(6*inch / width, 4*inch / height)
-            img = Image(img_data, width=width*scale_factor, height=height*scale_factor)
-            content.append(img)
-        else:
-            # For text-based jokes
-            content.append(Paragraph(joke_data['text'], styles['Normal']))
-            
-        if joke_attribution:
-            # Add joke attribution in italics and gray
-            content.append(Spacer(1, 0.1*inch))
-            content.append(Paragraph(joke_attribution, ParagraphStyle(
-                'Attribution',
-                parent=styles['Normal'],
-                fontSize=8,
-                textColor=colors.gray,
-                italic=True
-            )))
+        # Joke section
+        content.append(Paragraph(joke_title, styles['SectionHeading']))
+        content.append(Paragraph(joke_text, styles['Normal']))
         content.append(Spacer(1, 0.3*inch))
 
         # Section: Phase Terminations - Changed to a single header
@@ -750,26 +675,9 @@ def generate_pdf_report(
                  onLaterPages=header_footer.laterPages,
                  canvasmaker=make_canvas)
         
-        if save_to_disk:
-            generated_paths.append(region_path)
-            log_message(f"Report for {region} saved to {region_path}", 1, verbosity)
-            if region_has_alerts:
-                region_names.append(region)
-        else:
-            if region_has_alerts:
-                buffer_objects.append(buffer)
-                region_names.append(region)
-                log_message(f"Report for {region} generated in memory.", 1, verbosity)
+        if region_has_alerts:
+            buffer_objects.append((region, buffer))
+            log_message(f"Report for {region} generated in memory.", 1, verbosity)
 
-    if save_to_disk:
-        return generated_paths
-    else:
-        # Ensure we return consistent types even if All Regions report is skipped
-        if not buffer_objects and not region_names: # If no individual reports AND no all regions report
-             return [], []
-        elif not buffer_objects: # If individual reports but no all regions report
-             return [], region_names # Should not happen if individual reports exist, but handle defensively
-        elif not region_names: # If all regions report but no individual reports (should not happen with new logic)
-             return buffer_objects, [] # Should not happen
-        else:
-             return buffer_objects, region_names # Return dict of buffers and region names
+    # Return dict mapping region name to BytesIO
+    return {region: buf for region, buf in buffer_objects}

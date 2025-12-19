@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atspm-report"
+version = "0.0.0"
+authors = [
+  { name="Shawn Strasser", email="shawn.strasser@odot.oregon.gov" },
+]
+description = "Generate ATSPM anomaly detection reports with CUSUM analysis and PDF output."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "pandas>=1.5.0",
+    "duckdb>=1.0.0,<2.0.0",
+    "ibis-framework>=10.0.0,<11.0.0",
+    "reportlab>=4.0.0",
+    "matplotlib>=3.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+atspm_report = ["jokes.csv", "images/*.png"]

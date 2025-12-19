@@ -1,7 +1,7 @@
 import duckdb
 import ibis
 from datetime import date, timedelta
-from statistical_analysis import cusum, alert
+from .statistical_analysis import cusum, alert
 
 def process_maxout_data(df):
     """Process the max out data to calculate daily aggregates"""
