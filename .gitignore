@@ -11,3 +11,6 @@ emails_copy.csv
 .claude/settings.local.json
 alert_rows/
 run_report.py
+dist/
+build/
+*.egg-info/

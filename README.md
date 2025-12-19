@@ -1,8 +1,43 @@
 # ATSPM Report Package
 
+[![PyPI version](https://img.shields.io/pypi/v/atspm-report.svg)](https://pypi.org/project/atspm-report/)
+[![Python versions](https://img.shields.io/pypi/pyversions/atspm-report.svg)](https://pypi.org/project/atspm-report/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Downloads](https://static.pepy.tech/badge/atspm-report)](https://pepy.tech/project/atspm-report)
+
 A Python package for generating Automated Traffic Signal Performance Measures (ATSPM) reports. This package analyzes traffic signal data to identify issues like max-outs, actuation problems, pedestrian service issues, phase skipping, and system outages.
 
 ![Example Report](images/example_report.png)
+
+## Alert Types
+
+The package identifies 6 key types of traffic signal performance issues:
+
+### 1. Max-Out Alerts
+Detects when a phase terminates via max-out (rather than gap-out) too frequently, indicating potential capacity issues.
+
+![Example Max-Out Alert](images/example_phase_termination.png)
+
+### 2. Actuation Alerts
+Identifies detectors with zero or abnormally low actuations, suggesting detector malfunction.
+
+![Example Detector Alert](images/example_detector.png)
+
+### 3. Pedestrian Alerts
+Detects when pedestrian buttons are pressed but no walk signal is provided, indicating service failures.
+
+![Example Pedestrian Alert](images/example_ped.png)
+
+### 4. Missing Data Alerts
+Flags signals that are not reporting data to the system, indicating communication or hardware issues.
+
+### 5. Phase Skip Alerts
+Identifies phases that are being skipped in coordination mode when they shouldn't be, indicating timing issues.
+
+![Example Phase Skip Alert](images/example_phase_skip.png)
+
+### 6. System Outage Alerts
+Detects prolonged periods when signals are completely offline.
 
 ## Features
 
@@ -524,32 +559,6 @@ print(f"\nGenerated {len(result['reports'])} reports")
 | `verbosity` | int | 2 | Output verbosity: 0=silent, 1=errors, 2=info, 3=debug |
 | `suppression_days` | int | 14 | Days to suppress repeat alerts for same signal/issue |
 | `retention_days` | int | 21 | Days to retain past alerts before cleanup |
-
-## Alert Types
-
-### 1. Max-Out Alerts
-Detects when a phase terminates via max-out (rather than gap-out) too frequently, indicating potential capacity issues.
-
-![Example Max-Out Alert](images/example_phase_termination.png)
-
-### 2. Actuation Alerts
-Identifies detectors with zero or abnormally low actuations, suggesting detector malfunction.
-
-![Example Detector Alert](images/example_detector.png)
-
-### 3. Missing Data Alerts
-Flags signals that are not reporting data to the system, indicating communication or hardware issues.
-
-### 4. Pedestrian Alerts
-Detects when pedestrian buttons are pressed but no walk signal is provided, indicating service failures.
-
-![Example Pedestrian Alert](images/example_ped.png)
-
-### 5. Phase Skip Alerts
-Identifies phases that are being skipped in coordination mode when they shouldn't be, indicating timing issues.
-
-### 6. System Outage Alerts
-Detects prolonged periods when signals are completely offline.
 
 ## License
 
