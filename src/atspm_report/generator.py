@@ -3,6 +3,7 @@
 from typing import Optional, Dict
 import pandas as pd
 from io import BytesIO
+
 from datetime import datetime, timedelta
 from pathlib import Path
 import ibis
@@ -321,7 +322,7 @@ class ReportGenerator:
                     on=['DeviceId', 'Phase'],
                     how='left'
                 )
-                annotated_phase_waits['AlertPhase'] = annotated_phase_waits['AlertPhase'].fillna(False)
+                annotated_phase_waits['AlertPhase'] = annotated_phase_waits['AlertPhase'].fillna(False).astype(bool)
                 alert_devices = phase_skip_alert_pairs['DeviceId'].unique()
                 plot_phase_skip_waits = annotated_phase_waits[annotated_phase_waits['DeviceId'].isin(alert_devices)]
                 phase_skip_figures = create_phase_skip_plots(plot_phase_skip_waits, signals, phase_skip_rankings, num_figures)

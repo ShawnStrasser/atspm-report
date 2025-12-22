@@ -32,108 +32,124 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
     con = ibis.duckdb.connect()
     raw_data_tbl = con.create_table('raw_data', raw_data, overwrite=True)
 
-    phase_waits_sql = f"""
-    WITH preempt_pairs AS (
-        SELECT
-            deviceid,
-            parameter AS preempt_number,
-            timestamp AS start_time,
-            LEAD(timestamp) OVER (PARTITION BY deviceid, parameter ORDER BY timestamp, eventid) AS end_time
-        FROM raw_data
-        WHERE eventid IN (102, 104)
-          AND timestamp IS NOT NULL
-    ),
-    valid_preempt_intervals AS (
-        SELECT
-            deviceid,
-            preempt_number,
-            start_time,
-            end_time
-        FROM preempt_pairs
-        WHERE start_time IS NOT NULL
-          AND end_time IS NOT NULL
-          AND end_time > start_time
-    ),
-    phase_waits AS (
-        SELECT
-            deviceid,
-            timestamp,
-            eventid - 611 AS phase,
-            parameter
-        FROM raw_data
-        WHERE eventid BETWEEN 612 AND 627
-    ),
-    max_cycles AS (
-        SELECT
-            deviceid,
-            MAX(parameter) AS max_cycle_length
-        FROM raw_data
-        WHERE eventid = 132
-        GROUP BY deviceid
-    ),
-    preempt_windows AS (
-        SELECT
-            v.deviceid,
-            v.start_time AS window_start,
-            v.end_time
-            + (
-                CASE
-                    WHEN mc.max_cycle_length > 0 THEN
-                        INTERVAL '1 second' * CAST(
-                            CEIL(mc.max_cycle_length * {CYCLE_LENGTH_MULTIPLIER}) AS INT
-                        )
-                    ELSE
-                        INTERVAL '1 second' * {FREE_SIGNAL_THRESHOLD}
-                END
-            ) AS window_end
-        FROM valid_preempt_intervals v
-        LEFT JOIN max_cycles mc
-          ON v.deviceid = mc.deviceid
+    # 1. Preempt Pairs
+    preempt_events = raw_data_tbl.filter(
+        raw_data_tbl.eventid.isin([102, 104]) & raw_data_tbl.timestamp.notnull()
     )
-    SELECT
-        pw.deviceid,
-        pw.timestamp,
-        pw.phase,
-        pw.parameter AS phase_wait_time,
-        COALESCE(bool_or(
-            pw.timestamp >= p.window_start
-            AND pw.timestamp < p.window_end
-        ), FALSE) AS preempt_flag,
-        mc.max_cycle_length
-    FROM phase_waits pw
-    LEFT JOIN preempt_windows p
-      ON pw.deviceid = p.deviceid
-    LEFT JOIN max_cycles mc
-      ON pw.deviceid = mc.deviceid
-    GROUP BY pw.deviceid, pw.timestamp, pw.phase, pw.parameter, mc.max_cycle_length
-    ORDER BY pw.deviceid, pw.timestamp
-    """
 
-    phase_waits_df = con.sql(phase_waits_sql).to_pandas()
+    w = ibis.window(
+        group_by=[preempt_events.deviceid, preempt_events.parameter],
+        order_by=[preempt_events.timestamp, preempt_events.eventid]
+    )
+
+    preempt_pairs = preempt_events.select(
+        deviceid=preempt_events.deviceid,
+        preempt_number=preempt_events.parameter,
+        start_time=preempt_events.timestamp,
+        end_time=preempt_events.timestamp.lead().over(w)
+    )
+
+    # 2. Valid Preempt Intervals
+    valid_preempt_intervals = preempt_pairs.filter(
+        preempt_pairs.start_time.notnull() &
+        preempt_pairs.end_time.notnull() &
+        (preempt_pairs.end_time > preempt_pairs.start_time)
+    )
+
+    # 3. Phase Waits
+    phase_waits = raw_data_tbl.filter(
+        (raw_data_tbl.eventid >= 612) & (raw_data_tbl.eventid <= 627)
+    ).select(
+        deviceid=raw_data_tbl.deviceid,
+        timestamp=raw_data_tbl.timestamp,
+        phase=raw_data_tbl.eventid - 611,
+        parameter=raw_data_tbl.parameter
+    )
+
+    # 4. Max Cycles
+    max_cycles = raw_data_tbl.filter(
+        raw_data_tbl.eventid == 132
+    ).group_by(raw_data_tbl.deviceid).aggregate(
+        max_cycle_length=raw_data_tbl.parameter.max()
+    )
+
+    # 5. Preempt Windows
+    joined_preempt = valid_preempt_intervals.left_join(
+        max_cycles, valid_preempt_intervals.deviceid == max_cycles.deviceid
+    )
+
+    max_cycle_len = joined_preempt.max_cycle_length
+    cycle_seconds = (max_cycle_len * CYCLE_LENGTH_MULTIPLIER).ceil().cast('int')
+
+    added_seconds = ibis.ifelse(
+        max_cycle_len > 0,
+        cycle_seconds,
+        FREE_SIGNAL_THRESHOLD
+    )
+
+    window_end = joined_preempt.end_time + (added_seconds * ibis.interval(seconds=1))
+
+    preempt_windows = joined_preempt.select(
+        deviceid=joined_preempt.deviceid,
+        window_start=joined_preempt.start_time,
+        window_end=window_end
+    )
+
+    # 6. Final Join and Aggregation
+    pw = phase_waits.alias('pw')
+    p = preempt_windows.alias('p')
+    mc = max_cycles.alias('mc')
+
+    joined = pw.left_join(p, pw.deviceid == p.deviceid) \
+               .left_join(mc, pw.deviceid == mc.deviceid) \
+               .select(
+                   deviceid=pw.deviceid,
+                   timestamp=pw.timestamp,
+                   phase=pw.phase,
+                   parameter=pw.parameter,
+                   window_start=p.window_start,
+                   window_end=p.window_end,
+                   max_cycle_length=mc.max_cycle_length
+               )
+
+    is_preempted = (joined.timestamp >= joined.window_start) & (joined.timestamp < joined.window_end)
+
+    result = joined.group_by([
+        joined.deviceid,
+        joined.timestamp,
+        joined.phase,
+        joined.parameter,
+        joined.max_cycle_length
+    ]).aggregate(
+        preempt_flag=ibis.coalesce(is_preempted.any(), False)
+    ).order_by([joined.deviceid, joined.timestamp])
+
+    result = result.mutate(phase_wait_time=result.parameter).drop('parameter')
+
+    phase_waits_df = result.to_pandas()
     phase_waits_tbl = con.create_table('phase_waits', phase_waits_df, overwrite=True)
 
-    alert_sql = f"""
-    SELECT 
-        deviceid, 
-        phase,
-        date_trunc('day', timestamp) AS date,
-        max_cycle_length,
-        max(phase_wait_time) AS max_wait_time,
-        COUNT(*) AS total_skips
-    FROM phase_waits
-    WHERE preempt_flag = FALSE 
-      AND phase_wait_time > (
-          CASE
-              WHEN COALESCE(max_cycle_length, 0) > 0 THEN
-                  max_cycle_length * {CYCLE_LENGTH_MULTIPLIER}
-              ELSE
-                  {FREE_SIGNAL_THRESHOLD}
-          END
-      )
-    GROUP BY ALL
-    ORDER BY total_skips DESC
-    """
-    alert_rows_df = con.sql(alert_sql).to_pandas()
+    # Alert Generation using Ibis
+    threshold = ibis.ifelse(
+        ibis.coalesce(phase_waits_tbl.max_cycle_length, 0) > 0,
+        phase_waits_tbl.max_cycle_length * CYCLE_LENGTH_MULTIPLIER,
+        FREE_SIGNAL_THRESHOLD
+    )
+
+    alerts = phase_waits_tbl.filter(
+        (phase_waits_tbl.preempt_flag == False) &
+        (phase_waits_tbl.phase_wait_time > threshold)
+    )
+
+    alert_rows_df = alerts.group_by([
+        alerts.deviceid,
+        alerts.phase,
+        alerts.timestamp.truncate('D').name('date'),
+        alerts.max_cycle_length
+    ]).aggregate(
+        max_wait_time=alerts.phase_wait_time.max(),
+        total_skips=alerts.count()
+    ).order_by(ibis.desc('total_skips')).to_pandas()
 
     con = None
 
