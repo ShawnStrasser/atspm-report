@@ -63,7 +63,7 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
         deviceid=raw_data_tbl.deviceid,
         timestamp=raw_data_tbl.timestamp,
         phase=raw_data_tbl.eventid - 611,
-        parameter=raw_data_tbl.parameter
+        phase_wait_time=raw_data_tbl.parameter
     )
 
     # 4. Max Cycles
@@ -106,7 +106,7 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
                    deviceid=pw.deviceid,
                    timestamp=pw.timestamp,
                    phase=pw.phase,
-                   parameter=pw.parameter,
+                   phase_wait_time=pw.phase_wait_time,
                    window_start=p.window_start,
                    window_end=p.window_end,
                    max_cycle_length=mc.max_cycle_length
@@ -118,13 +118,11 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
         joined.deviceid,
         joined.timestamp,
         joined.phase,
-        joined.parameter,
+        joined.phase_wait_time,
         joined.max_cycle_length
     ]).aggregate(
         preempt_flag=ibis.coalesce(is_preempted.any(), False)
     ).order_by([joined.deviceid, joined.timestamp])
-
-    result = result.mutate(phase_wait_time=result.parameter).drop('parameter')
 
     phase_waits_df = result.to_pandas()
     phase_waits_tbl = con.create_table('phase_waits', phase_waits_df, overwrite=True)
