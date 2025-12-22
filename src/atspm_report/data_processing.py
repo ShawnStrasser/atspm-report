@@ -1,69 +1,85 @@
-import duckdb
 import ibis
+import pandas as pd
 from datetime import date, timedelta
 from .statistical_analysis import cusum, alert
 
 def process_maxout_data(df):
     """Process the max out data to calculate daily aggregates"""
-
-    sql = """
-    SELECT
-        TimeStamp::date as Date,
-        DeviceId,
-        Phase,
-        SUM(CASE WHEN PerformanceMeasure IN ('MaxOut', 'ForceOff') THEN Total ELSE 0 END) / SUM(Total) as "Percent MaxOut",
-        SUM(Total) as Services
-    FROM df
-    GROUP BY ALL
-    ORDER BY Date, DeviceId, Phase
-    """
-
-    # Get Max Date minus 7 days for filtering hourly data
-    start_date = duckdb.sql("SELECT max(TimeStamp::date) - interval '6 days' as startdate from df").fetchone()[0]
-    sql2 = f"""
-    SELECT
-        time_bucket(interval '60 minutes', TimeStamp) as TimeStamp,
-        DeviceId,
-        Phase,
-        SUM(CASE WHEN PerformanceMeasure IN ('MaxOut', 'ForceOff') THEN Total ELSE 0 END) / SUM(Total) as "Percent MaxOut",
-        SUM(Total) as Services
-    FROM df
-    WHERE TimeStamp >= '{start_date}'
-    GROUP BY ALL
-    ORDER BY TimeStamp, DeviceId, Phase
-    """
-    return duckdb.sql(sql).df(), duckdb.sql(sql2).df()
+    ibis.options.interactive = True
+    
+    # Convert to Ibis table
+    t = ibis.memtable(df)
+    
+    # Daily aggregates
+    t_daily = t.mutate(Date=t['TimeStamp'].cast('date'))
+    t_daily = t_daily.mutate(
+        MaxOutTotal=(
+            t_daily['PerformanceMeasure'].isin(['MaxOut', 'ForceOff'])
+            .ifelse(t_daily['Total'], 0)
+        )
+    )
+    
+    daily_result = t_daily.group_by(['Date', 'DeviceId', 'Phase']).aggregate(
+        **{
+            'Percent MaxOut': t_daily.MaxOutTotal.sum() / t_daily.Total.sum(),
+            'Services': t_daily.Total.sum()
+        }
+    ).order_by(['Date', 'DeviceId', 'Phase'])
+    
+    # Get max date minus 6 days for hourly data
+    max_date = t['TimeStamp'].cast('date').max().execute()
+    start_date = max_date - timedelta(days=6)
+    
+    # Hourly aggregates
+    t_hourly = t.filter(t['TimeStamp'] >= start_date)
+    t_hourly = t_hourly.mutate(
+        TimeStamp=t_hourly['TimeStamp'].truncate('hour')
+    )
+    t_hourly = t_hourly.mutate(
+        MaxOutTotal=(
+            t_hourly['PerformanceMeasure'].isin(['MaxOut', 'ForceOff'])
+            .ifelse(t_hourly['Total'], 0)
+        )
+    )
+    
+    hourly_result = t_hourly.group_by(['TimeStamp', 'DeviceId', 'Phase']).aggregate(
+        **{
+            'Percent MaxOut': t_hourly.MaxOutTotal.sum() / t_hourly.Total.sum(),
+            'Services': t_hourly.Total.sum()
+        }
+    ).order_by(['TimeStamp', 'DeviceId', 'Phase'])
+    
+    return daily_result.execute(), hourly_result.execute()
 
 def process_actuations_data(df):
     """Process the actuations data to calculate daily aggregates"""
-    sql = """
-    SELECT
-        TimeStamp::date as Date,
-        DeviceId,
-        Detector,
-        SUM(Total)::int as Total,
-        SUM(anomaly::float) / COUNT(*) as PercentAnomalous
-    FROM df
-    GROUP BY ALL
-    ORDER BY Date, DeviceId, Detector
-    """
-
-    # Get Max Date minus 7 days for filtering hourly data
-    start_date = duckdb.sql("SELECT max(TimeStamp::date) - interval '6 days' as startdate from df").fetchone()[0]
-    # Filter for hourly data
-    sql2 = f"""
-    SELECT
-        time_bucket(interval '60 minutes', TimeStamp) as TimeStamp,
-        DeviceId,
-        Detector,
-        SUM(Total)::int as Total,
-        SUM(prediction::int) as Forecast
-    FROM df
-    WHERE TimeStamp >= '{start_date}'
-    GROUP BY ALL
-    ORDER BY TimeStamp, DeviceId, Detector
-    """
-    return duckdb.sql(sql).df(), duckdb.sql(sql2).df()
+    ibis.options.interactive = True
+    
+    # Convert to Ibis table
+    t = ibis.memtable(df)
+    
+    # Daily aggregates
+    t_daily = t.mutate(Date=t['TimeStamp'].cast('date'))
+    daily_result = t_daily.group_by(['Date', 'DeviceId', 'Detector']).aggregate(
+        Total=t_daily.Total.sum().cast('int'),
+        PercentAnomalous=t_daily.anomaly.cast('float').sum() / t_daily.count()
+    ).order_by(['Date', 'DeviceId', 'Detector'])
+    
+    # Get max date minus 6 days for hourly data
+    max_date = t['TimeStamp'].cast('date').max().execute()
+    start_date = max_date - timedelta(days=6)
+    
+    # Hourly aggregates
+    t_hourly = t.filter(t['TimeStamp'] >= start_date)
+    t_hourly = t_hourly.mutate(
+        TimeStamp=t_hourly['TimeStamp'].truncate('hour')
+    )
+    hourly_result = t_hourly.group_by(['TimeStamp', 'DeviceId', 'Detector']).aggregate(
+        Total=t_hourly.Total.sum().cast('int'),
+        Forecast=t_hourly.prediction.cast('int').sum()
+    ).order_by(['TimeStamp', 'DeviceId', 'Detector'])
+    
+    return daily_result.execute(), hourly_result.execute()
 
 def process_missing_data(has_data_df):
     """Process the missing data to calculate daily percent missing data"""
@@ -117,154 +133,147 @@ def process_missing_data(has_data_df):
 
 def process_ped(df_ped, df_maxout, df_intersections):
     """Process the max out data to calculate daily aggregates"""
-    sql = """
-    WITH t1 AS (
-    SELECT
-        TimeStamp::date as Date,
-        DeviceId,
-        Phase,
-        SUM(PedServices) as PedServices,
-        SUM(PedActuation) as PedActuation
-    FROM df_ped
-    GROUP BY ALL
-    ),
-    t2 AS (
-    SELECT
-        Date,
-        DeviceId,
-        Phase,
-        Region,
-        PedServices,
-        PedActuation,
-        Services,
-        CASE WHEN PedServices = 0 or (PedServices = 0 and Services = 0) THEN NULL ELSE PedActuation / PedServices END AS Ped_APS,
-        CASE WHEN Services = 0 or (Services = 0 and PedServices = 0) THEN NULL ELSE PedServices / Services END AS Ped_Percent
-    FROM t1
-    NATURAL JOIN df_maxout
-    NATURAL JOIN df_intersections
-    ),
-    _medians AS (
-    SELECT DeviceId, Phase,
-    MEDIAN(Ped_Percent) as _median_percent,
-    MEDIAN(Ped_APS) as _median_aps,
-    MEDIAN(PedActuation) as _median_actuation,
-    from t2
-    GROUP BY ALL
-    ),
-
-    t3 AS (
-    select * EXCLUDE(_median_percent, _median_aps, _median_actuation),
-    CASE WHEN Services < 30 OR Ped_Percent + _median_percent = 0 THEN NULL ELSE ((2 * (Ped_Percent - _median_percent)^2) / (Ped_Percent + _median_percent)) * SIGN(Ped_Percent - _median_percent) END as Ped_Percent_GEH_,
-    CASE WHEN Services < 30 OR Ped_APS + _median_aps = 0 THEN NULL ELSE ((2 * (Ped_APS - _median_aps)^2) / (Ped_APS + _median_aps)) * SIGN(Ped_APS - _median_aps) END as Ped_APS_GEH_,
-    CASE WHEN Services < 30 OR PedActuation + _median_actuation = 0 THEN NULL ELSE ((2 * (PedActuation - _median_actuation)^2) / (PedActuation + _median_actuation)) * SIGN(PedActuation - _median_actuation) END as PedActuation_GEH_,
-    from t2
-    NATURAL JOIN _medians
-    ),
-
-    _group_stats AS (
-    SELECT Date, Region,
-    AVG(Ped_Percent_GEH_) as Ped_Percent_GEH_Avg,
-    STDDEV(Ped_Percent_GEH_) as Ped_Percent_GEH_Std,
-    AVG(Ped_APS_GEH_) as Ped_APS_GEH_Avg,
-    STDDEV(Ped_APS_GEH_) as Ped_APS_GEH_Std,
-    AVG(PedActuation_GEH_) as PedActuation_GEH_Avg,
-    STDDEV(PedActuation_GEH_) as PedActuation_GEH_Std
-    from t3
-    GROUP BY ALL
-    ),
-
-    t4 AS (
-    select * EXCLUDE(Ped_Percent_GEH_Avg, Ped_Percent_GEH_Std, Ped_APS_GEH_Avg, Ped_APS_GEH_Std, PedActuation_GEH_Avg, PedActuation_GEH_Std),
-    CASE WHEN Ped_Percent_GEH_ IS NULL THEN NULL ELSE (Ped_Percent_GEH_ - Ped_Percent_GEH_Avg) / Ped_Percent_GEH_Std END as Ped_Percent_ZScore,
-    CASE WHEN Ped_APS_GEH_ IS NULL THEN NULL ELSE (Ped_APS_GEH_ - Ped_APS_GEH_Avg) / Ped_APS_GEH_Std END as Ped_APS_ZScore,
-    CASE WHEN PedActuation_GEH_ IS NULL THEN NULL ELSE (PedActuation_GEH_ - PedActuation_GEH_Avg) / PedActuation_GEH_Std END as PedActuation_ZScore,
-    from t3
-    NATURAL JOIN _group_stats
-    ),
-
-    t5 AS (
-    select *,
-    CASE WHEN Ped_Percent_ZScore < 0 THEN ABS(Ped_Percent_ZScore * Ped_APS_ZScore) ELSE Ped_percent_ZScore * Ped_APS_ZScore END as Ped_Combined_ZScore
-    from t4
-    ),
-
-    t6 AS (
-    SELECT 
-        *,
-        CASE 
-            WHEN COUNT(*) FILTER (WHERE "PedActuation_ZScore" > 4) 
-                OVER (
-                    PARTITION BY "DeviceId", "Phase" 
-                    ORDER BY "Date" 
-                    RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND CURRENT ROW
-                ) = 2
-            THEN 1
-            ELSE 0
-        END AS Ped_Actuations_Alert
-    FROM t5
-    ORDER BY "DeviceId", "Phase", "Date"
-    )
-
-    select Date, DeviceId, Phase
-    from t6
-    WHERE Ped_Combined_ZScore <=-11-- OR Ped_Actuations_Alert = 1--eratic alerts is broken for now need to fix!
-    ORDER BY ALL
-    """
-
-    start_date = duckdb.sql("SELECT max(TimeStamp::date) - interval '6 days' as startdate from df_ped").fetchone()[0]
-    sql2 = f"""
-    WITH t1 AS (
-        SELECT
-            time_bucket(interval '60 minutes', TimeStamp) as TimeStamp,
-            DeviceId,
-            Phase,
-            SUM(PedServices) as PedServices,
-            SUM(PedActuation) as PedActuation
-        FROM df_ped
-        WHERE TimeStamp >= '{start_date}'
-        GROUP BY ALL
-    ),
-    devices_phases AS (
-        SELECT DISTINCT DeviceId, Phase FROM t1
-    ),
-    time_boundaries AS (
-        SELECT 
-            MIN(TimeStamp) AS min_time,
-            MAX(TimeStamp) AS max_time
-        FROM t1
-    ),
-    time_series AS (
-        SELECT
-            generate_series AS TimeStamp
-        FROM generate_series(
-            (SELECT min_time FROM time_boundaries),
-            (SELECT max_time FROM time_boundaries),
-            INTERVAL '1 HOUR'
-        )
-    ),
-    scaffold AS (
-        SELECT 
-            ts.TimeStamp,
-            dp.DeviceId,
-            dp.Phase
-        FROM time_series ts
-        CROSS JOIN devices_phases dp
-    ),
-    filled_data AS (
-        SELECT
-            s.TimeStamp,
-            s.DeviceId,
-            s.Phase,
-            COALESCE(t1.PedServices, 0) AS PedServices,
-            COALESCE(t1.PedActuation, 0) AS PedActuation
-        FROM scaffold s
-        LEFT JOIN t1 ON 
-            s.TimeStamp = t1.TimeStamp
-            AND s.DeviceId = t1.DeviceId
-            AND s.Phase = t1.Phase
-    )
-    SELECT * FROM filled_data
-    ORDER BY TimeStamp, DeviceId, Phase
-    """
+    ibis.options.interactive = True
     
-    return duckdb.sql(sql).df(), duckdb.sql(sql2).df()
+    # Convert to Ibis tables
+    ped = ibis.memtable(df_ped)
+    maxout = ibis.memtable(df_maxout)
+    intersections = ibis.memtable(df_intersections)
+    
+    # --- Daily Aggregation Logic ---
+    
+    # t1: Aggregate by Date, DeviceId, Phase
+    t1 = ped.mutate(Date=ped['TimeStamp'].cast('date'))
+    t1 = t1.group_by(['Date', 'DeviceId', 'Phase']).aggregate(
+        PedServices=t1.PedServices.sum(),
+        PedActuation=t1.PedActuation.sum()
+    )
+    
+    # t2: Join with maxout and intersections
+    # Assuming maxout has Date, DeviceId, Phase and intersections has DeviceId
+    t2 = t1.join(maxout, ['Date', 'DeviceId', 'Phase'], how='inner')
+    t2 = t2.join(intersections, ['DeviceId'], how='inner')
+    
+    # Calculate Ped_APS and Ped_Percent
+    t2 = t2.mutate(
+        Ped_APS=((t2.PedServices == 0) | ((t2.PedServices == 0) & (t2.Services == 0)))
+            .ifelse(ibis.null(), t2.PedActuation / t2.PedServices),
+        Ped_Percent=((t2.Services == 0) | ((t2.Services == 0) & (t2.PedServices == 0)))
+            .ifelse(ibis.null(), t2.PedServices / t2.Services)
+    )
+    
+    # _medians: Group by DeviceId, Phase
+    medians = t2.group_by(['DeviceId', 'Phase']).aggregate(
+        _median_percent=t2.Ped_Percent.median(),
+        _median_aps=t2.Ped_APS.median(),
+        _median_actuation=t2.PedActuation.median()
+    )
+    
+    # t3: Join t2 and medians
+    t3 = t2.join(medians, ['DeviceId', 'Phase'])
+    
+    # Calculate GEH
+    def geh_calc(val, median, services):
+        return (
+            ((services < 30) | ((val + median) == 0))
+            .ifelse(ibis.null(), ((2 * (val - median).pow(2)) / (val + median)) * (val - median).sign())
+        )
+
+    t3 = t3.mutate(
+        Ped_Percent_GEH_=geh_calc(t3.Ped_Percent, t3._median_percent, t3.Services),
+        Ped_APS_GEH_=geh_calc(t3.Ped_APS, t3._median_aps, t3.Services),
+        PedActuation_GEH_=geh_calc(t3.PedActuation, t3._median_actuation, t3.Services)
+    )
+    
+    # _group_stats: Group by Date, Region
+    group_stats = t3.group_by(['Date', 'Region']).aggregate(
+        Ped_Percent_GEH_Avg=t3.Ped_Percent_GEH_.mean(),
+        Ped_Percent_GEH_Std=t3.Ped_Percent_GEH_.std(),
+        Ped_APS_GEH_Avg=t3.Ped_APS_GEH_.mean(),
+        Ped_APS_GEH_Std=t3.Ped_APS_GEH_.std(),
+        PedActuation_GEH_Avg=t3.PedActuation_GEH_.mean(),
+        PedActuation_GEH_Std=t3.PedActuation_GEH_.std()
+    )
+    
+    # t4: Join t3 and group_stats
+    t4 = t3.join(group_stats, ['Date', 'Region'])
+    
+    # Calculate Z-Scores
+    def zscore_calc(val, avg, std):
+        return (
+            val.isnull()
+            .ifelse(ibis.null(), (val - avg) / std)
+        )
+
+    t4 = t4.mutate(
+        Ped_Percent_ZScore=zscore_calc(t4.Ped_Percent_GEH_, t4.Ped_Percent_GEH_Avg, t4.Ped_Percent_GEH_Std),
+        Ped_APS_ZScore=zscore_calc(t4.Ped_APS_GEH_, t4.Ped_APS_GEH_Avg, t4.Ped_APS_GEH_Std),
+        PedActuation_ZScore=zscore_calc(t4.PedActuation_GEH_, t4.PedActuation_GEH_Avg, t4.PedActuation_GEH_Std)
+    )
+    
+    # t5: Combined Z-Score
+    t5 = t4.mutate(
+        Ped_Combined_ZScore=(t4.Ped_Percent_ZScore < 0)
+            .ifelse((t4.Ped_Percent_ZScore * t4.Ped_APS_ZScore).abs(), t4.Ped_Percent_ZScore * t4.Ped_APS_ZScore)
+    )
+    
+    # t6: Window function for alert
+    w = ibis.window(
+        group_by=['DeviceId', 'Phase'],
+        order_by='Date',
+        preceding=ibis.interval(days=1),
+        following=0
+    )
+    
+    t5 = t5.mutate(
+        High_ZScore=(t5.PedActuation_ZScore > 4).cast('int')
+    )
+    
+    t6 = t5.mutate(
+        Ped_Actuations_Alert=(t5.High_ZScore.sum().over(w) == 2).cast('int')
+    )
+    
+    # Final selection
+    result1 = t6.filter(t6.Ped_Combined_ZScore <= -11).select('Date', 'DeviceId', 'Phase').order_by(['Date', 'DeviceId', 'Phase'])
+    
+    
+    # --- Hourly Aggregation Logic ---
+    
+    # Get max date and start date
+    max_date = ped['TimeStamp'].cast('date').max().execute()
+    start_date = max_date - timedelta(days=6)
+    
+    # t1: Hourly aggregation
+    t1_hourly = ped.filter(ped['TimeStamp'] >= start_date)
+    t1_hourly = t1_hourly.mutate(TimeStamp=t1_hourly['TimeStamp'].truncate('hour'))
+    t1_hourly = t1_hourly.group_by(['TimeStamp', 'DeviceId', 'Phase']).aggregate(
+        PedServices=t1_hourly.PedServices.sum(),
+        PedActuation=t1_hourly.PedActuation.sum()
+    )
+    
+    # Scaffold
+    # Distinct devices/phases
+    devices_phases = t1_hourly.select('DeviceId', 'Phase').distinct()
+    
+    # Time series
+    min_time = t1_hourly['TimeStamp'].min().execute()
+    max_time = t1_hourly['TimeStamp'].max().execute()
+    
+    # Generate hourly timestamps
+    date_range = pd.date_range(start=min_time, end=max_time, freq='h')
+    time_series = ibis.memtable({'TimeStamp': date_range})
+    
+    scaffold = time_series.cross_join(devices_phases)
+    
+    # Join and fillna
+    filled_data = scaffold.left_join(
+        t1_hourly,
+        ['TimeStamp', 'DeviceId', 'Phase']
+    ).mutate(
+        PedServices=ibis.coalesce(t1_hourly.PedServices, 0),
+        PedActuation=ibis.coalesce(t1_hourly.PedActuation, 0)
+    )
+    
+    result2 = filled_data.order_by(['TimeStamp', 'DeviceId', 'Phase'])
+    
+    return result1.execute(), result2.execute()

@@ -46,7 +46,7 @@ class TestReportGenerator(unittest.TestCase):
             "alert_flagging_days": 7,
             "suppress_repeated_alerts": True,
             "alert_suppression_days": 21,
-            "figures_per_device": 0, # Speed up tests
+            "figures_per_device": 1, # Speed up tests
             "verbosity": 1,
         }
         

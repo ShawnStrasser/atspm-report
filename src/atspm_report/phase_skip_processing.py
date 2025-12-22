@@ -1,4 +1,4 @@
-import duckdb
+import ibis
 import pandas as pd
 
 PHASE_SKIP_PHASE_WAITS_COLUMNS = [
@@ -28,8 +28,9 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
             pd.DataFrame(columns=PHASE_SKIP_ALERT_COLUMNS)
         )
 
-    con = duckdb.connect(database=':memory:')
-    con.register('raw_data', raw_data)
+    ibis.options.interactive = True
+    con = ibis.duckdb.connect()
+    raw_data_tbl = con.create_table('raw_data', raw_data, overwrite=True)
 
     phase_waits_sql = f"""
     WITH preempt_pairs AS (
@@ -108,8 +109,8 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
     ORDER BY pw.deviceid, pw.timestamp
     """
 
-    phase_waits_df = con.sql(phase_waits_sql).df()
-    con.register('phase_waits', phase_waits_df)
+    phase_waits_df = con.sql(phase_waits_sql).to_pandas()
+    phase_waits_tbl = con.create_table('phase_waits', phase_waits_df, overwrite=True)
 
     alert_sql = f"""
     SELECT 
@@ -132,11 +133,9 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
     GROUP BY ALL
     ORDER BY total_skips DESC
     """
-    alert_rows_df = con.sql(alert_sql).df()
+    alert_rows_df = con.sql(alert_sql).to_pandas()
 
-    con.unregister('phase_waits')
-    con.unregister('raw_data')
-    con.close()
+    con = None
 
     phase_waits_df = phase_waits_df.rename(columns={
         'deviceid': 'DeviceId',

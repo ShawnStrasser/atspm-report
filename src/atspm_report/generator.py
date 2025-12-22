@@ -5,7 +5,7 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime, timedelta
 from pathlib import Path
-import duckdb
+import ibis
 
 from .data_processing import (
     process_maxout_data,
@@ -166,35 +166,48 @@ class ReportGenerator:
             log_message(f"Processed missing data. Shape: {missing_data.shape}", 1, verbosity)
             
             # Filter out dates with system-wide missing data
+            ibis.options.interactive = True
             signal_count = len(signals) * 0.30
-            missing_data_filtered = duckdb.sql(f"""
-                with a as (
-                select Date, Region
-                from missing_data
-                natural join signals
-                group by all
-                having avg(MissingData) < 0.3
-                ),
-                b as (
-                select a.Date, signals.DeviceId
-                from a
-                natural join signals
-                )
-                select * from missing_data
-                natural join b
-                order by Date, DeviceId                               
-                """
-            ).df()
+            
+            # Convert to ibis tables
+            missing_data_tbl = ibis.memtable(missing_data)
+            signals_tbl = ibis.memtable(signals)
+            
+            # Join and filter
+            md_with_region = missing_data_tbl.join(
+                signals_tbl,
+                missing_data_tbl.DeviceId == signals_tbl.DeviceId
+            )
+            
+            # Find dates/regions where average missing data < 0.3
+            valid_date_regions = md_with_region.group_by(['Date', 'Region']).aggregate(
+                avg_missing=md_with_region.MissingData.mean()
+            ).filter(lambda t: t.avg_missing < 0.3)
+            
+            # Get all devices for those valid date/regions
+            valid_combos = valid_date_regions.join(
+                signals_tbl,
+                valid_date_regions.Region == signals_tbl.Region
+            ).select(
+                Date=valid_date_regions.Date,
+                DeviceId=signals_tbl.DeviceId
+            )
+            
+            # Filter missing_data to keep only valid combinations
+            missing_data_filtered = missing_data_tbl.join(
+                valid_combos,
+                [missing_data_tbl.DeviceId == valid_combos.DeviceId,
+                 missing_data_tbl.Date == valid_combos.Date]
+            ).select(
+                DeviceId=missing_data_tbl.DeviceId,
+                Date=missing_data_tbl.Date,
+                MissingData=missing_data_tbl.MissingData
+            ).order_by(['Date', 'DeviceId']).execute()
 
-            system_outages = duckdb.sql("""
-                select Date, Region, avg(MissingData) as MissingData
-                from missing_data
-                natural join signals
-                group by all
-                having avg(MissingData) >= 0.3
-                order by all
-                """
-            ).df()
+            # Get system outages (dates/regions where avg missing data >= 0.3)
+            system_outages = md_with_region.group_by(['Date', 'Region']).aggregate(
+                MissingData=md_with_region.MissingData.mean()
+            ).filter(lambda t: t.MissingData >= 0.3).order_by(['Date', 'Region']).execute()
             
             log_message("Calculating CUSUM statistics for missing data...", 1, verbosity)
             t_missing_data = cusum(missing_data_filtered, k_value=1)
