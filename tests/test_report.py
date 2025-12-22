@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import sys
 import os
 import re
-import tomllib
+import tomli
 import matplotlib
 matplotlib.use('Agg')
 
@@ -153,7 +153,7 @@ class TestPackageMetadata(unittest.TestCase):
         # Get version from pyproject.toml
         pyproject_path = Path(__file__).parent.parent / 'pyproject.toml'
         with open(pyproject_path, 'rb') as f:
-            pyproject_data = tomllib.load(f)
+            pyproject_data = tomli.load(f)
         toml_version = pyproject_data['project']['version']
         
         self.assertEqual(
