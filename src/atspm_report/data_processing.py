@@ -133,7 +133,7 @@ def process_ped(df_ped, df_maxout, df_intersections):
         Date,
         DeviceId,
         Phase,
-        group_name,
+        Region,
         PedServices,
         PedActuation,
         Services,
@@ -162,7 +162,7 @@ def process_ped(df_ped, df_maxout, df_intersections):
     ),
 
     _group_stats AS (
-    SELECT Date, group_name,
+    SELECT Date, Region,
     AVG(Ped_Percent_GEH_) as Ped_Percent_GEH_Avg,
     STDDEV(Ped_Percent_GEH_) as Ped_Percent_GEH_Std,
     AVG(Ped_APS_GEH_) as Ped_APS_GEH_Avg,
