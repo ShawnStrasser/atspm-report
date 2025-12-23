@@ -1,12 +1,13 @@
 """Main ReportGenerator class for ATSPM anomaly detection."""
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Union
 import pandas as pd
 from io import BytesIO
 
 from datetime import datetime, timedelta
 from pathlib import Path
 import ibis
+import ibis.expr.types as ir
 
 from .data_processing import (
     process_maxout_data,
@@ -19,6 +20,55 @@ from .visualization import create_device_plots, create_phase_skip_plots
 from .report_generation import generate_pdf_report
 from .phase_skip_processing import transform_phase_skip_raw_data
 from .utils import log_message
+
+
+def _is_empty(data: Union[pd.DataFrame, ir.Table, None]) -> bool:
+    """Check if data is None or empty, works for both pandas and Ibis."""
+    if data is None:
+        return True
+    if isinstance(data, pd.DataFrame):
+        return data.empty
+    if isinstance(data, ir.Table):
+        # For Ibis tables, check if there are any rows
+        return data.count().execute() == 0
+    return True
+
+
+def _to_pandas(data: Union[pd.DataFrame, ir.Table]) -> pd.DataFrame:
+    """Convert Ibis table to pandas DataFrame if needed."""
+    if isinstance(data, ir.Table):
+        return data.execute()
+    return data
+
+
+def _get_shape_str(data: Union[pd.DataFrame, ir.Table]) -> str:
+    """Get a shape string for logging, works for both pandas and Ibis."""
+    if isinstance(data, pd.DataFrame):
+        return str(data.shape)
+    if isinstance(data, ir.Table):
+        return f"({data.count().execute()}, {len(data.columns)})"
+    return "unknown"
+
+
+def _normalize_deviceid(data: Union[pd.DataFrame, ir.Table, None]) -> Union[pd.DataFrame, ir.Table, None]:
+    """Convert DeviceId column to string type if present, works for both pandas and Ibis."""
+    if data is None:
+        return None
+    
+    if isinstance(data, pd.DataFrame):
+        if 'DeviceId' in data.columns:
+            data = data.copy()
+            data['DeviceId'] = data['DeviceId'].astype(str)
+        return data
+    
+    if isinstance(data, ir.Table):
+        if 'DeviceId' in data.columns:
+            # For Ibis, cast the DeviceId column to string
+            data = data.mutate(DeviceId=data.DeviceId.cast('string'))
+        return data
+    
+    return data
+
 
 # Alert configuration
 ALERT_CONFIG = {
@@ -77,19 +127,20 @@ class ReportGenerator:
     
     def generate(
         self,
-        signals: pd.DataFrame,  # REQUIRED
-        terminations: Optional[pd.DataFrame] = None,
-        detector_health: Optional[pd.DataFrame] = None,
-        has_data: Optional[pd.DataFrame] = None,
-        pedestrian: Optional[pd.DataFrame] = None,
-        phase_skip_events: Optional[pd.DataFrame] = None,
+        signals: Union[pd.DataFrame, ir.Table],  # REQUIRED
+        terminations: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        detector_health: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        has_data: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        pedestrian: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        phase_skip_events: Optional[Union[pd.DataFrame, ir.Table]] = None,
         past_alerts: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> dict:
         """
-        Generate reports from provided DataFrames.
+        Generate reports from provided DataFrames or Ibis tables.
         
         Args:
-            signals: REQUIRED. Signal metadata with columns: DeviceId, Name, Region
+            signals: REQUIRED. Signal metadata with columns: DeviceId, Name, Region.
+                Can be pandas DataFrame or Ibis table.
             terminations: Phase termination data with columns:
                 TimeStamp, DeviceId, Phase, Total, PerformanceMeasure
             detector_health: Detector actuation data with columns:
@@ -115,8 +166,18 @@ class ReportGenerator:
                     Keys: 'maxout_hourly', 'detector_hourly', 'ped_hourly'
         """
         # Validate required input
-        if signals is None or signals.empty:
-            raise ValueError("'signals' DataFrame is required and cannot be None or empty")
+        if _is_empty(signals):
+            raise ValueError("'signals' is required and cannot be None or empty")
+        
+        # Normalize DeviceId to string in all inputs
+        signals = _normalize_deviceid(signals)
+        terminations = _normalize_deviceid(terminations)
+        detector_health = _normalize_deviceid(detector_health)
+        has_data = _normalize_deviceid(has_data)
+        pedestrian = _normalize_deviceid(pedestrian)
+        
+        # Convert signals to pandas (needed for downstream operations)
+        signals = _to_pandas(signals)
         
         verbosity = self.config['verbosity']
         log_message("Starting signal analysis...", 1, verbosity)
@@ -133,11 +194,11 @@ class ReportGenerator:
         hourly_data = {}
         
         # Process maxout data if provided
-        if terminations is not None and not terminations.empty:
+        if not _is_empty(terminations):
             log_message("Processing max out data...", 1, verbosity)
             maxout_daily, maxout_hourly = process_maxout_data(terminations)
-            hourly_data['maxout_hourly'] = maxout_hourly
-            log_message(f"Processed max out data. Shape: {maxout_daily.shape}", 1, verbosity)
+            hourly_data['maxout_hourly'] = _to_pandas(maxout_hourly)
+            log_message(f"Processed max out data. Shape: {_get_shape_str(maxout_daily)}", 1, verbosity)
             
             log_message("Calculating CUSUM statistics for maxout...", 1, verbosity)
             t = cusum(maxout_daily, k_value=1)
@@ -147,11 +208,11 @@ class ReportGenerator:
             hourly_data['maxout_hourly'] = pd.DataFrame()
         
         # Process actuations data if provided
-        if detector_health is not None and not detector_health.empty:
+        if not _is_empty(detector_health):
             log_message("Processing actuations data...", 1, verbosity)
             detector_daily, detector_hourly = process_actuations_data(detector_health)
-            hourly_data['detector_hourly'] = detector_hourly
-            log_message(f"Processed actuations data. Shape: {detector_daily.shape}", 1, verbosity)
+            hourly_data['detector_hourly'] = _to_pandas(detector_hourly)
+            log_message(f"Processed actuations data. Shape: {_get_shape_str(detector_daily)}", 1, verbosity)
             
             log_message("Calculating CUSUM statistics for actuations...", 1, verbosity)
             t_actuations = cusum(detector_daily, k_value=1)
@@ -161,10 +222,10 @@ class ReportGenerator:
             hourly_data['detector_hourly'] = pd.DataFrame()
         
         # Process missing data if provided
-        if has_data is not None and not has_data.empty:
+        if not _is_empty(has_data):
             log_message("Processing missing data...", 1, verbosity)
             missing_data = process_missing_data(has_data)
-            log_message(f"Processed missing data. Shape: {missing_data.shape}", 1, verbosity)
+            log_message(f"Processed missing data. Shape: {_get_shape_str(missing_data)}", 1, verbosity)
             
             # Filter out dates with system-wide missing data
             ibis.options.interactive = True
@@ -219,18 +280,18 @@ class ReportGenerator:
             new_alerts['system_outages'] = pd.DataFrame()
         
         # Process pedestrian data if provided
-        if pedestrian is not None and not pedestrian.empty and terminations is not None:
+        if not _is_empty(pedestrian) and not _is_empty(terminations):
             log_message("Processing pedestrian data...", 1, verbosity)
             ped_alerts, ped_hourly = process_ped(df_ped=pedestrian, df_maxout=maxout_daily, df_intersections=signals)
-            new_alerts['pedestrian'] = ped_alerts
-            hourly_data['ped_hourly'] = ped_hourly
-            log_message(f"Processed pedestrian data. Shape: {ped_alerts.shape}", 1, verbosity)
+            new_alerts['pedestrian'] = _to_pandas(ped_alerts)
+            hourly_data['ped_hourly'] = _to_pandas(ped_hourly)
+            log_message(f"Processed pedestrian data. Shape: {_get_shape_str(ped_alerts)}", 1, verbosity)
         else:
             new_alerts['pedestrian'] = pd.DataFrame()
             hourly_data['ped_hourly'] = pd.DataFrame()
         
         # Process phase skip data if provided
-        if phase_skip_events is not None and not phase_skip_events.empty:
+        if not _is_empty(phase_skip_events):
             log_message("Processing phase skip data...", 1, verbosity)
             phase_skip_waits, phase_skip_alert_rows = transform_phase_skip_raw_data(phase_skip_events)
             

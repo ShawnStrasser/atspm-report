@@ -93,19 +93,40 @@ class TestReportGenerator(unittest.TestCase):
                 
                 if not actual.empty:
                     # Check that key columns match
-                    # We can't compare exact values due to timestamps, but we can compare structure
                     self.assertEqual(
                         set(actual.columns), 
                         set(expected.columns),
                         f"{alert_type}: Column mismatch"
                     )
                     
-                    # Check DeviceId matches for non-system_outages
+                    # Check DeviceId values match for non-system_outages
                     if alert_type != 'system_outages' and 'DeviceId' in actual.columns:
+                        actual_device_ids = set(actual['DeviceId'].values)
+                        expected_device_ids = set(expected['DeviceId'].values)
                         self.assertEqual(
-                            set(actual['DeviceId'].values),
-                            set(expected['DeviceId'].values),
-                            f"{alert_type}: DeviceId mismatch"
+                            actual_device_ids,
+                            expected_device_ids,
+                            f"{alert_type}: DeviceId mismatch.\nActual: {actual_device_ids}\nExpected: {expected_device_ids}"
+                        )
+                    
+                    # Check Phase values match if present
+                    if 'Phase' in actual.columns:
+                        actual_phases = set(actual['Phase'].values)
+                        expected_phases = set(expected['Phase'].values)
+                        self.assertEqual(
+                            actual_phases,
+                            expected_phases,
+                            f"{alert_type}: Phase mismatch.\nActual: {actual_phases}\nExpected: {expected_phases}"
+                        )
+                    
+                    # Check Detector values match if present
+                    if 'Detector' in actual.columns:
+                        actual_detectors = set(actual['Detector'].values)
+                        expected_detectors = set(expected['Detector'].values)
+                        self.assertEqual(
+                            actual_detectors,
+                            expected_detectors,
+                            f"{alert_type}: Detector mismatch.\nActual: {actual_detectors}\nExpected: {expected_detectors}"
                         )
             else:
                 # If no expected alerts exist, verify actual is empty
@@ -140,6 +161,45 @@ class TestReportGenerator(unittest.TestCase):
             self.assertTrue(df.empty, f"Alert type {alert_type} was not suppressed: {df}")
             
         self.assertEqual(len(result['reports']), 0, "Reports were generated even though all alerts should be suppressed")
+
+    def test_3_deviceid_as_int(self):
+        """Test that DeviceId can be provided as int and gets converted to string."""
+        # Create a copy of signals with DeviceId as int
+        signals_with_int_deviceid = self.subset_signals.copy()
+        signals_with_int_deviceid['DeviceId'] = range(len(signals_with_int_deviceid))
+        
+        # Create matching test data with int DeviceIds
+        test_terminations = self.terminations.copy()
+        test_terminations['DeviceId'] = 0
+        
+        test_detector_health = self.detector_health.copy()
+        test_detector_health['DeviceId'] = 0
+        
+        test_has_data = self.has_data.copy()
+        test_has_data['DeviceId'] = 0
+        
+        test_pedestrian = self.pedestrian.copy()
+        test_pedestrian['DeviceId'] = 0
+        
+        generator = ReportGenerator(self.config)
+        
+        # Should not raise an error
+        result = generator.generate(
+            signals=signals_with_int_deviceid,
+            terminations=test_terminations,
+            detector_health=test_detector_health,
+            has_data=test_has_data,
+            pedestrian=test_pedestrian
+        )
+        
+        # Verify DeviceIds are strings in the output
+        for alert_type, alerts_df in result['alerts'].items():
+            if not alerts_df.empty and 'DeviceId' in alerts_df.columns:
+                self.assertEqual(
+                    alerts_df['DeviceId'].dtype,
+                    'object',
+                    f"{alert_type}: DeviceId should be string type"
+                )
 
 
 class TestPackageMetadata(unittest.TestCase):

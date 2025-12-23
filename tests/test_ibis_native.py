@@ -5,6 +5,8 @@ import ibis.expr.types as ir
 from datetime import datetime, timedelta
 import sys
 import os
+import matplotlib
+matplotlib.use('Agg')
 
 # Add the src directory to the path to import the package directly
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -107,6 +109,107 @@ class TestIbisNative(unittest.TestCase):
         # Check columns match expected schema (renaming happened correctly)
         self.assertIn('PhaseWaitTime', pw_df.columns)
         self.assertIn('TotalSkips', alerts_df.columns)
+
+
+class TestIbisEndToEnd(unittest.TestCase):
+    """Test end-to-end ReportGenerator with Ibis tables."""
+    
+    @classmethod
+    def setUpClass(cls):
+        from pathlib import Path
+        from atspm_report import ReportGenerator
+        
+        cls.test_data_dir = Path(__file__).parent / 'data'
+        cls.con = ibis.duckdb.connect()
+        
+        # Load data as Ibis tables
+        cls.signals_ibis = cls.con.read_parquet(str(cls.test_data_dir / 'signals.parquet'))
+        cls.terminations_ibis = cls.con.read_parquet(str(cls.test_data_dir / 'terminations.parquet'))
+        cls.detector_health_ibis = cls.con.read_parquet(str(cls.test_data_dir / 'detector_health.parquet'))
+        cls.has_data_ibis = cls.con.read_parquet(str(cls.test_data_dir / 'has_data.parquet'))
+        cls.pedestrian_ibis = cls.con.read_parquet(str(cls.test_data_dir / 'full_ped.parquet'))
+        
+        # Load pandas versions for comparison
+        cls.signals_pd = pd.read_parquet(cls.test_data_dir / 'signals.parquet')
+        cls.terminations_pd = pd.read_parquet(cls.test_data_dir / 'terminations.parquet')
+        cls.detector_health_pd = pd.read_parquet(cls.test_data_dir / 'detector_health.parquet')
+        cls.has_data_pd = pd.read_parquet(cls.test_data_dir / 'has_data.parquet')
+        cls.pedestrian_pd = pd.read_parquet(cls.test_data_dir / 'full_ped.parquet')
+        
+        cls.config = {
+            "suppress_repeated_alerts": True,
+            "alert_suppression_days": 21,
+            "figures_per_device": 1,
+            "verbosity": 0,  # Silent for faster tests
+        }
+    
+    def test_ibis_generates_same_alerts_as_pandas(self):
+        """Test that Ibis tables produce the same alerts as pandas DataFrames."""
+        from atspm_report import ReportGenerator
+        
+        generator = ReportGenerator(self.config)
+        
+        # Generate with Ibis
+        result_ibis = generator.generate(
+            signals=self.signals_ibis,
+            terminations=self.terminations_ibis,
+            detector_health=self.detector_health_ibis,
+            has_data=self.has_data_ibis,
+            pedestrian=self.pedestrian_ibis
+        )
+        
+        # Generate with pandas
+        result_pandas = generator.generate(
+            signals=self.signals_pd,
+            terminations=self.terminations_pd,
+            detector_health=self.detector_health_pd,
+            has_data=self.has_data_pd,
+            pedestrian=self.pedestrian_pd
+        )
+        
+        # Compare alert counts
+        for alert_type in ['maxout', 'actuations', 'missing_data', 'pedestrian', 'system_outages']:
+            ibis_alerts = result_ibis['alerts'][alert_type]
+            pandas_alerts = result_pandas['alerts'][alert_type]
+            
+            self.assertEqual(
+                len(ibis_alerts),
+                len(pandas_alerts),
+                f"{alert_type}: Ibis produced {len(ibis_alerts)} alerts but pandas produced {len(pandas_alerts)}"
+            )
+            
+            # Compare DeviceIds if not empty
+            if not ibis_alerts.empty and 'DeviceId' in ibis_alerts.columns:
+                self.assertEqual(
+                    set(ibis_alerts['DeviceId'].values),
+                    set(pandas_alerts['DeviceId'].values),
+                    f"{alert_type}: DeviceId mismatch between Ibis and pandas"
+                )
+    
+    def test_ibis_generates_pdf_reports(self):
+        """Test that Ibis input generates PDF reports."""
+        from atspm_report import ReportGenerator
+        
+        generator = ReportGenerator(self.config)
+        
+        result = generator.generate(
+            signals=self.signals_ibis,
+            terminations=self.terminations_ibis,
+            detector_health=self.detector_health_ibis,
+            has_data=self.has_data_ibis,
+            pedestrian=self.pedestrian_ibis
+        )
+        
+        # Verify PDF reports were generated
+        self.assertIn('reports', result)
+        self.assertTrue(len(result['reports']) > 0, "No PDF reports were generated with Ibis input")
+        
+        # Verify each report is a valid BytesIO with PDF content
+        for region, pdf_bytes in result['reports'].items():
+            pdf_bytes.seek(0)
+            header = pdf_bytes.read(4)
+            self.assertEqual(header, b'%PDF', f"Report for {region} is not a valid PDF")
+
 
 if __name__ == '__main__':
     unittest.main()
