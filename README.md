@@ -43,7 +43,8 @@ Detects system-wide outage or data loss.
 
 ## Features
 
-- **DataFrame-based API**: All inputs and outputs use pandas DataFrames for maximum flexibility
+- **Flexible API**: Accepts both pandas DataFrames and Ibis expressions for maximum flexibility
+- **Ibis Integration**: Native support for lazy evaluation using any SQL backend, for cloud computing support
 - **Multi-region reporting**: Automatically generates separate PDF reports for each region
 - **Alert suppression**: Configurable alert retention to prevent duplicate alerts
 - **Custom branding**: Support for custom logos in generated PDFs
@@ -104,6 +105,40 @@ for region, pdf_bytes in result['reports'].items():
 for alert_type, alerts_df in result['alerts'].items():
     if not alerts_df.empty:
         print(f"{alert_type}: {len(alerts_df)} alerts")
+```
+
+### Using Ibis for High-Performance Analytics
+
+For large datasets or distributed processing, you can pass Ibis expressions directly to the data processing functions. This enables lazy evaluation and backend-optimized query execution:
+
+```python
+import ibis
+from atspm_report.data_processing import process_maxout_data, process_actuations_data
+
+# Connect to your backend (DuckDB, Polars, etc.)
+con = ibis.duckdb.connect()
+
+# Load data as Ibis table (lazy - not executed yet)
+terminations = con.read_parquet('terminations.parquet')
+detector_health = con.read_parquet('detector_health.parquet')
+
+# Process using Ibis - returns lazy expressions
+daily_maxout, hourly_maxout = process_maxout_data(terminations)
+daily_detectors, hourly_detectors = process_actuations_data(detector_health)
+
+# Execute only when needed (e.g., for visualization or final report)
+daily_maxout_df = daily_maxout.execute()
+
+# Or continue building your query chain
+filtered = daily_maxout.filter(daily_maxout['Percent MaxOut'] > 0.5)
+result = filtered.execute()
+```
+
+**Key Benefits of Ibis Integration:**
+- **Lazy Evaluation**: Queries are optimized and only executed when needed
+- **Backend Flexibility**: Works with DuckDB, Polars, Apache Spark, and more
+- **Memory Efficiency**: Process datasets larger than RAM
+- **Backward Compatible**: Pandas DataFrames still work as before
 ``````
 
 ## Workflow

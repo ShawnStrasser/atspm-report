@@ -1,5 +1,7 @@
 import ibis
 import pandas as pd
+import ibis.expr.types as ir
+from typing import Union, Any, Tuple
 
 PHASE_SKIP_PHASE_WAITS_COLUMNS = [
     'DeviceId', 'Timestamp', 'Phase', 'PhaseWaitTime', 'PreemptFlag', 'MaxCycleLength'
@@ -11,26 +13,35 @@ PHASE_SKIP_ALERT_COLUMNS = [
 CYCLE_LENGTH_MULTIPLIER = 1.5
 FREE_SIGNAL_THRESHOLD = 180
 
+def _to_ibis(data: Union[pd.DataFrame, ir.Table]) -> Tuple[ir.Table, bool]:
+    if isinstance(data, pd.DataFrame):
+        return ibis.memtable(data), True
+    if data is None or (hasattr(data, 'empty') and data.empty):
+        # Handle empty input case - return empty memtable with schema if possible, 
+        # but for now let's just return None and handle it
+        return None, True
+    return data, False
 
-def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def transform_phase_skip_raw_data(raw_data: Union[ibis.Expr, Any]) -> tuple:
     """
     Transform staged device events into phase wait and phase skip alert tables.
 
     Args:
-        raw_data: DataFrame containing columns deviceid, timestamp, eventid, parameter.
+        raw_data: Ibis table or DataFrame containing columns deviceid, timestamp, eventid, parameter.
 
     Returns:
-        Tuple of (phase_waits_df, alert_rows_df) with normalized column names.
+        Tuple of (phase_waits, alert_rows). 
+        If input is DataFrame, returns DataFrames.
+        If input is Ibis expression, returns Ibis expressions.
     """
-    if raw_data is None or raw_data.empty:
+    raw_data_tbl, is_pandas = _to_ibis(raw_data)
+    
+    if raw_data_tbl is None:
+        # Return empty DataFrames
         return (
             pd.DataFrame(columns=PHASE_SKIP_PHASE_WAITS_COLUMNS),
             pd.DataFrame(columns=PHASE_SKIP_ALERT_COLUMNS)
         )
-
-    ibis.options.interactive = True
-    con = ibis.duckdb.connect()
-    raw_data_tbl = con.create_table('raw_data', raw_data, overwrite=True)
 
     # 1. Preempt Pairs
     preempt_events = raw_data_tbl.filter(
@@ -124,22 +135,19 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
         preempt_flag=ibis.coalesce(is_preempted.any(), False)
     ).order_by([joined.deviceid, joined.timestamp])
 
-    phase_waits_df = result.to_pandas()
-    phase_waits_tbl = con.create_table('phase_waits', phase_waits_df, overwrite=True)
-
-    # Alert Generation using Ibis
+    # Alert Generation using Ibis (chained from result)
     threshold = ibis.ifelse(
-        ibis.coalesce(phase_waits_tbl.max_cycle_length, 0) > 0,
-        phase_waits_tbl.max_cycle_length * CYCLE_LENGTH_MULTIPLIER,
+        ibis.coalesce(result.max_cycle_length, 0) > 0,
+        result.max_cycle_length * CYCLE_LENGTH_MULTIPLIER,
         FREE_SIGNAL_THRESHOLD
     )
 
-    alerts = phase_waits_tbl.filter(
-        (phase_waits_tbl.preempt_flag == False) &
-        (phase_waits_tbl.phase_wait_time > threshold)
+    alerts = result.filter(
+        (result.preempt_flag == False) &
+        (result.phase_wait_time > threshold)
     )
 
-    alert_rows_df = alerts.group_by([
+    alerts_agg = alerts.group_by([
         alerts.deviceid,
         alerts.phase,
         alerts.timestamp.truncate('D').name('date'),
@@ -147,37 +155,43 @@ def transform_phase_skip_raw_data(raw_data: pd.DataFrame) -> tuple[pd.DataFrame,
     ]).aggregate(
         max_wait_time=alerts.phase_wait_time.max(),
         total_skips=alerts.count()
-    ).order_by(ibis.desc('total_skips')).to_pandas()
+    ).order_by(ibis.desc('total_skips'))
 
-    con = None
-
-    phase_waits_df = phase_waits_df.rename(columns={
-        'deviceid': 'DeviceId',
-        'timestamp': 'Timestamp',
-        'phase': 'Phase',
-        'phase_wait_time': 'PhaseWaitTime',
-        'preempt_flag': 'PreemptFlag',
-        'max_cycle_length': 'MaxCycleLength'
+    # Rename columns to match expected output
+    phase_waits_final = result.rename({
+        'DeviceId': 'deviceid',
+        'Timestamp': 'timestamp',
+        'Phase': 'phase',
+        'PhaseWaitTime': 'phase_wait_time',
+        'PreemptFlag': 'preempt_flag',
+        'MaxCycleLength': 'max_cycle_length'
     })
-    if not phase_waits_df.empty:
-        phase_waits_df['Timestamp'] = pd.to_datetime(phase_waits_df['Timestamp'])
-        phase_waits_df['DeviceId'] = phase_waits_df['DeviceId'].astype(str)
-        phase_waits_df['Phase'] = phase_waits_df['Phase'].astype(int)
-
-    alert_rows_df = alert_rows_df.rename(columns={
-        'deviceid': 'DeviceId',
-        'phase': 'Phase',
-        'date': 'Date',
-        'max_cycle_length': 'MaxCycleLength',
-        'max_wait_time': 'MaxWaitTime',
-        'total_skips': 'TotalSkips'
+    
+    alert_rows_final = alerts_agg.rename({
+        'DeviceId': 'deviceid',
+        'Phase': 'phase',
+        'Date': 'date',
+        'MaxCycleLength': 'max_cycle_length',
+        'MaxWaitTime': 'max_wait_time',
+        'TotalSkips': 'total_skips'
     })
-    if not alert_rows_df.empty:
-        alert_rows_df['DeviceId'] = alert_rows_df['DeviceId'].astype(str)
-        alert_rows_df['Phase'] = alert_rows_df['Phase'].astype(int)
-        alert_rows_df['Date'] = pd.to_datetime(alert_rows_df['Date']).dt.normalize()
 
-    return (
-        phase_waits_df.reindex(columns=PHASE_SKIP_PHASE_WAITS_COLUMNS),
-        alert_rows_df.reindex(columns=PHASE_SKIP_ALERT_COLUMNS)
-    )
+    if is_pandas:
+        # Execute to get pandas DataFrame
+        phase_waits_df = phase_waits_final.execute()
+        alert_rows_df = alert_rows_final.execute()
+        
+        # Type casting for consistency
+        if not phase_waits_df.empty:
+            phase_waits_df['DeviceId'] = phase_waits_df['DeviceId'].astype(str)
+            phase_waits_df['Phase'] = phase_waits_df['Phase'].astype(int)
+            phase_waits_df = phase_waits_df[PHASE_SKIP_PHASE_WAITS_COLUMNS]
+            
+        if not alert_rows_df.empty:
+            alert_rows_df['DeviceId'] = alert_rows_df['DeviceId'].astype(str)
+            alert_rows_df['Phase'] = alert_rows_df['Phase'].astype(int)
+            alert_rows_df = alert_rows_df[PHASE_SKIP_ALERT_COLUMNS]
+            
+        return phase_waits_df, alert_rows_df
+
+    return phase_waits_final, alert_rows_final

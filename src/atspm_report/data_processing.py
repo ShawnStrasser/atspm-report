@@ -1,14 +1,21 @@
 import ibis
 import pandas as pd
+import ibis.expr.types as ir
+from typing import Union, Tuple
 from datetime import date, timedelta
 from .statistical_analysis import cusum, alert
 
-def process_maxout_data(df):
+def _to_ibis(data: Union[pd.DataFrame, ir.Table]) -> Tuple[ir.Table, bool]:
+    if isinstance(data, pd.DataFrame):
+        return ibis.memtable(data), True
+    return data, False
+
+def process_maxout_data(df: Union[pd.DataFrame, ir.Table]):
     """Process the max out data to calculate daily aggregates"""
     ibis.options.interactive = True
     
     # Convert to Ibis table
-    t = ibis.memtable(df)
+    t, is_pandas = _to_ibis(df)
     
     # Daily aggregates
     t_daily = t.mutate(Date=t['TimeStamp'].cast('date'))
@@ -27,8 +34,8 @@ def process_maxout_data(df):
     ).order_by(['Date', 'DeviceId', 'Phase'])
     
     # Get max date minus 6 days for hourly data
-    max_date = t['TimeStamp'].cast('date').max().execute()
-    start_date = max_date - timedelta(days=6)
+    max_date = t['TimeStamp'].cast('date').max()
+    start_date = max_date - ibis.interval(days=6)
     
     # Hourly aggregates
     t_hourly = t.filter(t['TimeStamp'] >= start_date)
@@ -49,14 +56,16 @@ def process_maxout_data(df):
         }
     ).order_by(['TimeStamp', 'DeviceId', 'Phase'])
     
-    return daily_result.execute(), hourly_result.execute()
+    if is_pandas:
+        return daily_result.execute(), hourly_result.execute()
+    return daily_result, hourly_result
 
-def process_actuations_data(df):
+def process_actuations_data(df: Union[pd.DataFrame, ir.Table]):
     """Process the actuations data to calculate daily aggregates"""
     ibis.options.interactive = True
     
     # Convert to Ibis table
-    t = ibis.memtable(df)
+    t, is_pandas = _to_ibis(df)
     
     # Daily aggregates
     t_daily = t.mutate(Date=t['TimeStamp'].cast('date'))
@@ -66,8 +75,8 @@ def process_actuations_data(df):
     ).order_by(['Date', 'DeviceId', 'Detector'])
     
     # Get max date minus 6 days for hourly data
-    max_date = t['TimeStamp'].cast('date').max().execute()
-    start_date = max_date - timedelta(days=6)
+    max_date = t['TimeStamp'].cast('date').max()
+    start_date = max_date - ibis.interval(days=6)
     
     # Hourly aggregates
     t_hourly = t.filter(t['TimeStamp'] >= start_date)
@@ -79,25 +88,28 @@ def process_actuations_data(df):
         Forecast=t_hourly.prediction.cast('int').sum()
     ).order_by(['TimeStamp', 'DeviceId', 'Detector'])
     
-    return daily_result.execute(), hourly_result.execute()
+    if is_pandas:
+        return daily_result.execute(), hourly_result.execute()
+    return daily_result, hourly_result
 
-def process_missing_data(has_data_df):
+def process_missing_data(has_data_df: Union[pd.DataFrame, ir.Table]):
     """Process the missing data to calculate daily percent missing data"""
     # Convert to Ibis table
     ibis.options.interactive = True
-    has_data_table = ibis.memtable(has_data_df)
+    has_data_table, is_pandas = _to_ibis(has_data_df)
     
     # Extract the date from the TimeStamp
     has_data_table = has_data_table.mutate(Date=has_data_table['TimeStamp'].date())
     
     # Get min/max dates
+    # We execute here to get python values for the loop below
     min_max_dates = has_data_table.aggregate(
         MinDate=has_data_table.Date.min(),
         MaxDate=has_data_table.Date.max()
     ).execute()
     
-    min_date_val = min_max_dates['MinDate'].iloc[0]
-    max_date_val = min_max_dates['MaxDate'].iloc[0]
+    min_date_val = min_max_dates['MinDate'][0]
+    max_date_val = min_max_dates['MaxDate'][0]
     
     # Generate complete date range
     date_list = [min_date_val + timedelta(days=i) for i in range((max_date_val - min_date_val).days + 1)]
@@ -129,16 +141,22 @@ def process_missing_data(has_data_df):
     # Select final columns
     result = data_availability.select('DeviceId', 'Date', 'MissingData')
     
-    return result.execute()
+    if is_pandas:
+        return result.execute()
+    return result
 
-def process_ped(df_ped, df_maxout, df_intersections):
+def process_ped(df_ped: Union[pd.DataFrame, ir.Table], 
+                df_maxout: Union[pd.DataFrame, ir.Table], 
+                df_intersections: Union[pd.DataFrame, ir.Table]):
     """Process the max out data to calculate daily aggregates"""
     ibis.options.interactive = True
     
     # Convert to Ibis tables
-    ped = ibis.memtable(df_ped)
-    maxout = ibis.memtable(df_maxout)
-    intersections = ibis.memtable(df_intersections)
+    ped, is_ped_pd = _to_ibis(df_ped)
+    maxout, is_maxout_pd = _to_ibis(df_maxout)
+    intersections, is_int_pd = _to_ibis(df_intersections)
+    
+    is_pandas = is_ped_pd or is_maxout_pd or is_int_pd
     
     # --- Daily Aggregation Logic ---
     
@@ -240,8 +258,8 @@ def process_ped(df_ped, df_maxout, df_intersections):
     # --- Hourly Aggregation Logic ---
     
     # Get max date and start date
-    max_date = ped['TimeStamp'].cast('date').max().execute()
-    start_date = max_date - timedelta(days=6)
+    max_date = ped['TimeStamp'].cast('date').max()
+    start_date = max_date - ibis.interval(days=6)
     
     # t1: Hourly aggregation
     t1_hourly = ped.filter(ped['TimeStamp'] >= start_date)
@@ -276,4 +294,6 @@ def process_ped(df_ped, df_maxout, df_intersections):
     
     result2 = filled_data.order_by(['TimeStamp', 'DeviceId', 'Phase'])
     
-    return result1.execute(), result2.execute()
+    if is_pandas:
+        return result1.execute(), result2.execute()
+    return result1, result2

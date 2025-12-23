@@ -237,8 +237,9 @@ class ReportGenerator:
             # Apply retention to phase skip alert rows
             if self.config['phase_skip_retention_days'] > 0:
                 cutoff_date = datetime.now().date() - timedelta(days=self.config['phase_skip_retention_days'])
+                # Filter using native datetime comparison (Date column should already be datetime)
                 phase_skip_alert_rows = phase_skip_alert_rows[
-                    pd.to_datetime(phase_skip_alert_rows['Date']).dt.date >= cutoff_date
+                    phase_skip_alert_rows['Date'].apply(lambda x: x.date() if hasattr(x, 'date') else x) >= cutoff_date
                 ]
             
             # Summarize and generate alerts
@@ -261,7 +262,8 @@ class ReportGenerator:
         # Filter new alerts to only recent ones (alert_flagging_days)
         log_message(f"Filtering newly generated alerts to the last {self.config['alert_flagging_days']} days...", 1, verbosity)
         flagging_cutoff_date = datetime.now() - timedelta(days=self.config['alert_flagging_days'])
-        flagging_cutoff_date_naive = flagging_cutoff_date.replace(tzinfo=None)
+        # Normalize to beginning of day for proper comparison with date-only columns
+        flagging_cutoff_date_naive = flagging_cutoff_date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
         
         recent_new_alerts = {}
         for alert_type, df in new_alerts.items():
