@@ -91,39 +91,41 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10)
     
     return result, total_alerts_count
 
-def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, allowed_pairs=None, min_total_skips=0):
+def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, allowed_pairs=None, min_total_skips=0, max_rows=10):
     """
-    Prepare the Phase Skip table showing all rows ordered by Signal then Phase.
+    Prepare the Phase Skip table showing one row per signal per date with aggregated phases.
 
     Args:
-        phase_skip_rows: DataFrame with DeviceId, Phase, Date, MaxCycleLength, MaxWaitTime, TotalSkips
+        phase_skip_rows: DataFrame with DeviceId, Phase, Date, TotalSkips
         signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
         region: Optional region filter. When provided (and not "All Regions") the table is limited to that region.
+        allowed_pairs: Optional DataFrame with DeviceId and Phase pairs to filter
+        min_total_skips: Minimum total skips threshold (applied after aggregation)
+        max_rows: Maximum number of rows to include in the table
 
     Returns:
-        DataFrame ready for rendering in the report (no row limit applied)
+        Tuple of (Sorted DataFrame with Signal, Date, Phases, Total Skips columns, total_alerts_count)
     """
     if phase_skip_rows is None or phase_skip_rows.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
 
     df = phase_skip_rows.copy()
     df['DeviceId'] = df['DeviceId'].astype(str)
 
+    # Filter by allowed pairs if provided
     if allowed_pairs is not None and not allowed_pairs.empty:
         allowed = allowed_pairs[['DeviceId', 'Phase']].drop_duplicates().copy()
         allowed['DeviceId'] = allowed['DeviceId'].astype(str)
         allowed['Phase'] = allowed['Phase'].astype(int)
         df = df.merge(allowed, on=['DeviceId', 'Phase'], how='inner')
 
-    if min_total_skips and min_total_skips > 0:
-        df = df[df['TotalSkips'] >= min_total_skips]
-
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
 
     signals_df = signals_df.copy()
     signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
 
+    # Merge with signals to get names and regions
     result = df.merge(
         signals_df[['DeviceId', 'Name', 'Region']],
         on='DeviceId',
@@ -132,25 +134,47 @@ def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, al
 
     result = result.dropna(subset=['Name'])
     if result.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
 
-    result['Date'] = pd.to_datetime(result['Date']).dt.date
-    result = result.rename(columns={
-        'Name': 'Signal',
-        'TotalSkips': 'Total Skips',
-        'MaxWaitTime': 'Max Wait (s)',
-        'MaxCycleLength': 'Max Cycle Length'
-    })
-
+    # Filter by region if specified
     if region and region != "All Regions":
         result = result[result['Region'] == region]
         if result.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(), 0
 
-    result = result[['Signal', 'Phase', 'Date', 'Total Skips', 'Max Wait (s)', 'Max Cycle Length']]
-    result = result.sort_values(by=['Signal', 'Phase', 'Date'])
+    # Aggregate by Signal and Date to combine phases
+    result['Date'] = pd.to_datetime(result['Date']).dt.date
+    result = result.rename(columns={'Name': 'Signal'})
+    
+    # Group by Signal and Date, aggregating phases and summing skips
+    aggregated = (
+        result.groupby(['Signal', 'Date'], as_index=False)
+        .agg(
+            Phases=('Phase', lambda x: ', '.join(sorted(set(str(p) for p in x)))),
+            TotalSkips=('TotalSkips', 'sum')
+        )
+    )
+    
+    # Apply min_total_skips filter after aggregation
+    if min_total_skips and min_total_skips > 0:
+        aggregated = aggregated[aggregated['TotalSkips'] >= min_total_skips]
+    
+    if aggregated.empty:
+        return pd.DataFrame(), 0
+    
+    # Get the total count before limiting rows
+    total_alerts_count = len(aggregated)
+    
+    # Rename and select final columns
+    aggregated = aggregated.rename(columns={'TotalSkips': 'Total Skips'})
+    aggregated = aggregated[['Signal', 'Date', 'Phases', 'Total Skips']]
+    aggregated = aggregated.sort_values(by=['Total Skips', 'Signal', 'Date'], ascending=[False, True, True])
+    
+    # Limit the number of rows
+    if max_rows > 0 and len(aggregated) > max_rows:
+        aggregated = aggregated.head(max_rows)
 
-    return result
+    return aggregated, total_alerts_count
 
 
 def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max_rows=10):
@@ -294,8 +318,12 @@ def create_sparkline(data, width=1.0, height=0.25, color='#1f77b4'):
     
     return Image(buf, width=width*inch, height=height*inch)
 
-def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, include_trend=True):
-    """Create a ReportLab table from a pandas DataFrame"""
+def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, include_trend=True, trend_header='Trend'):
+    """Create a ReportLab table from a pandas DataFrame
+    
+    Args:
+        trend_header: Custom header name for the trend column (default: 'Trend')
+    """
     if df.empty:
         return [Paragraph("No alerts found", styles['Normal'])]
     
@@ -310,12 +338,12 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
     
     # Get sparkline data and remove it from display DataFrame
     sparkline_data = None
-    if 'Sparkline_Data' in df_display.columns:
-        sparkline_data = df_display['Sparkline_Data'].tolist()
-        df_display = df_display.drop(columns=['Sparkline_Data'])
-    elif 'Hourly Services Trend' in df_display.columns:
-        sparkline_data = df_display['Hourly Services Trend'].tolist()
-        df_display = df_display.drop(columns=['Hourly Services Trend'])
+    sparkline_columns = ['Sparkline_Data', 'Hourly Services Trend', 'Services (7d)']
+    for col in sparkline_columns:
+        if col in df_display.columns:
+            sparkline_data = df_display[col].tolist()
+            df_display = df_display.drop(columns=[col])
+            break
     
     # Format percentage columns if they exist
     if 'MaxOut %' in df_display.columns:
@@ -330,7 +358,7 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
     
     # Add Trend column header only if requested
     if include_trend:
-        df_display['Trend'] = ""
+        df_display[trend_header] = ""
     
     # Create header and data for the table
     header = df_display.columns.tolist()
@@ -553,13 +581,13 @@ def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_row
             sparkline_data[(device_id, phase)] = hourly_data['PedServices'].tolist()
     
     # Add the sparkline data to the result dataframe
-    result['Hourly Services Trend'] = result.apply(
+    result['Services (7d)'] = result.apply(
         lambda row: sparkline_data.get((row['DeviceId'], row['Phase']), []), 
         axis=1
     )
     
     # Select and order columns
-    result = result[['Signal', 'Phase', 'Alert Dates', 'Hourly Services Trend']]
+    result = result[['Signal', 'Phase', 'Alert Dates', 'Services (7d)']]
     
     # Sort by Signal and Phase
     result = result.sort_values(by=['Signal', 'Phase'])

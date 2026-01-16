@@ -458,7 +458,8 @@ def generate_pdf_report(
                     "Phase Termination Alerts", 
                     styles,
                     total_count=total_phase_alerts,
-                    max_rows=max_table_rows
+                    max_rows=max_table_rows,
+                    trend_header='MaxOut (21d)'
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
@@ -478,15 +479,17 @@ def generate_pdf_report(
             signals_df is not None and
             allowed_phase_skip_pairs is not None and not allowed_phase_skip_pairs.empty
         ):
-            region_phase_skip_rows = prepare_phase_skip_alerts_table(
+            region_phase_skip_rows, total_phase_skip_alerts = prepare_phase_skip_alerts_table(
                 phase_skip_rows,
                 signals_df,
                 region=region,
                 allowed_pairs=allowed_phase_skip_pairs,
-                min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0
+                min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0,
+                max_rows=max_table_rows
             )
         else:
             region_phase_skip_rows = pd.DataFrame()
+            total_phase_skip_alerts = 0
 
         if (region_phase_skip_rows is not None and not region_phase_skip_rows.empty) or region_phase_skip_figures:
             content.append(Paragraph("Phase Skip Alerts", styles['SectionHeading']))
@@ -502,8 +505,8 @@ def generate_pdf_report(
                     region_phase_skip_rows,
                     "Phase Skip Alerts",
                     styles,
-                    total_count=len(region_phase_skip_rows),
-                    max_rows=0,
+                    total_count=total_phase_skip_alerts,
+                    max_rows=max_table_rows,
                     include_trend=False
                 )
                 content.extend(table_content)
@@ -539,7 +542,8 @@ def generate_pdf_report(
                     "Detector Health Alerts", 
                     styles,
                     total_count=total_detector_alerts,
-                    max_rows=max_table_rows
+                    max_rows=max_table_rows,
+                    trend_header='Count (21d)'
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
@@ -577,7 +581,8 @@ def generate_pdf_report(
                     "Ped Detector Alerts", 
                     styles,
                     total_count=total_detector_alerts,
-                    max_rows=max_table_rows
+                    max_rows=max_table_rows,
+                    trend_header='Svc (7d)'
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
@@ -615,7 +620,8 @@ def generate_pdf_report(
                     "Missing Data Alerts", 
                     styles,
                     total_count=total_missing_data_alerts,
-                    max_rows=max_table_rows
+                    max_rows=max_table_rows,
+                    trend_header='Missing (21d)'
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))

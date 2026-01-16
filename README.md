@@ -77,6 +77,11 @@ detector_health = pd.read_parquet(test_data_dir / 'detector_health.parquet')
 has_data = pd.read_parquet(test_data_dir / 'has_data.parquet')
 pedestrian = pd.read_parquet(test_data_dir / 'full_ped.parquet')
 
+# 2b. Load phase wait and coordination data (for phase skip detection)
+# These come from the atspm package's phase_wait and coordination aggregations
+phase_wait = pd.read_parquet(test_data_dir / 'phase_wait.parquet')  # Optional
+coordination = pd.read_parquet(test_data_dir / 'coordination.parquet')  # Optional
+
 # 3. Load past alerts for suppression (optional but recommended)
 past_alerts = {}
 for alert_type in ['maxout', 'actuations', 'missing_data', 'pedestrian', 'phase_skips', 'system_outages']:
@@ -91,6 +96,8 @@ result = generator.generate(
     detector_health=detector_health,
     has_data=has_data,
     pedestrian=pedestrian,
+    phase_wait=phase_wait,  # For phase skip detection
+    coordination=coordination,  # For cycle length visualization
     past_alerts=past_alerts
 )
 
@@ -271,24 +278,51 @@ pedestrian = pd.DataFrame({
 </details>
 
 <details>
-<summary><strong>phase_skip_events</strong> (Optional)</summary>
+<summary><strong>phase_wait</strong> (Optional)</summary>
 
-Raw controller events for phase skip analysis.
+Pre-aggregated phase wait data from the atspm package for phase skip detection.
 
 | Column | Type | Description | Example |
 |--------|------|-------------|---------|
-| deviceid | str | Signal identifier (UUID) | signal_1 |
-| timestamp | datetime | Event timestamp | 2024-01-15 14:22:30 |
-| eventid | int | NEMA event code | 104 |
-| parameter | int | Event parameter (phase # or wait time) | 200 |
+| TimeStamp | datetime | Bin start time | 2024-01-15 14:00:00 |
+| DeviceId | str | Signal identifier (UUID) | signal_1 |
+| Phase | int | Phase number (1-16) | 1 |
+| AvgPhaseWait | float | Average wait time in seconds | 150.0 |
+| TotalSkips | int | Count of skipped phases in this bin | 2 |
 
 **Sample:**
 ```python
-phase_skip_events = pd.DataFrame({
-    'deviceid': ['signal_1'] * 3,
-    'timestamp': pd.to_datetime(['2024-01-15 14:22:30', '2024-01-15 14:22:31', '2024-01-15 14:22:35']),
-    'eventid': [612, 612, 132],  # 612=phase wait, 132=max cycle
-    'parameter': [200, 200, 120]  # wait times or cycle length
+phase_wait = pd.DataFrame({
+    'TimeStamp': pd.to_datetime(['2024-01-15 14:00:00', '2024-01-15 14:15:00', '2024-01-15 14:30:00']),
+    'DeviceId': ['signal_1'] * 3,
+    'Phase': [1, 1, 2],
+    'AvgPhaseWait': [150.0, 160.0, 50.0],
+    'TotalSkips': [2, 3, 0]
+})
+```
+</details>
+
+<details>
+<summary><strong>coordination</strong> (Optional)</summary>
+
+Coordination data for cycle length visualization. EventId 132 contains cycle length changes.
+
+| Column | Type | Description | Example |
+|--------|------|-------------|---------|
+| TimeStamp | datetime | Bin start time | 2024-01-15 14:00:00 |
+| Raw_TimeStamp | datetime | Exact timestamp of the event | 2024-01-15 14:00:05 |
+| DeviceId | str | Signal identifier (UUID) | signal_1 |
+| EventId | int | Event ID (132 = Cycle Length Change) | 132 |
+| Parameter | int | Value (Cycle Length in seconds for EventId 132) | 120 |
+
+**Sample:**
+```python
+coordination = pd.DataFrame({
+    'TimeStamp': pd.to_datetime(['2024-01-15 14:00:00', '2024-01-15 14:30:00']),
+    'Raw_TimeStamp': pd.to_datetime(['2024-01-15 14:00:05', '2024-01-15 14:30:10']),
+    'DeviceId': ['signal_1', 'signal_1'],
+    'EventId': [132, 132],  # 132 = Cycle Length Change
+    'Parameter': [100, 120]  # Cycle lengths in seconds
 })
 ```
 </details>

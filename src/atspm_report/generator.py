@@ -18,7 +18,7 @@ from .data_processing import (
 from .statistical_analysis import cusum, alert
 from .visualization import create_device_plots, create_phase_skip_plots
 from .report_generation import generate_pdf_report
-from .phase_skip_processing import transform_phase_skip_raw_data
+from .phase_skip_processing import process_phase_wait_data
 from .utils import log_message
 
 
@@ -132,7 +132,8 @@ class ReportGenerator:
         detector_health: Optional[Union[pd.DataFrame, ir.Table]] = None,
         has_data: Optional[Union[pd.DataFrame, ir.Table]] = None,
         pedestrian: Optional[Union[pd.DataFrame, ir.Table]] = None,
-        phase_skip_events: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        phase_wait: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        coordination_agg: Optional[Union[pd.DataFrame, ir.Table]] = None,
         past_alerts: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> dict:
         """
@@ -149,8 +150,11 @@ class ReportGenerator:
                 TimeStamp, DeviceId
             pedestrian: Pedestrian phase data with columns:
                 TimeStamp, DeviceId, Phase, PedServices, PedActuation
-            phase_skip_events: Raw controller events with columns:
-                deviceid, timestamp, eventid, parameter
+            phase_wait: Phase wait data with columns:
+                TimeStamp, DeviceId, Phase, AvgPhaseWait, MaxPhaseWait, TotalSkips
+            coordination_agg: Coordination aggregation data with columns:
+                TimeStamp, DeviceId, ActualCycleLength
+                (15-minute bin aggregated data for cycle length plotting)
             past_alerts: Dict of alert_type -> DataFrame for suppression.
                 Keys: 'maxout', 'actuations', 'missing_data', 'pedestrian', 
                       'phase_skips', 'system_outages'
@@ -175,6 +179,8 @@ class ReportGenerator:
         detector_health = _normalize_deviceid(detector_health)
         has_data = _normalize_deviceid(has_data)
         pedestrian = _normalize_deviceid(pedestrian)
+        phase_wait = _normalize_deviceid(phase_wait)
+        coordination_agg = _normalize_deviceid(coordination_agg)
         
         # Convert signals to pandas (needed for downstream operations)
         signals = _to_pandas(signals)
@@ -290,10 +296,17 @@ class ReportGenerator:
             new_alerts['pedestrian'] = pd.DataFrame()
             hourly_data['ped_hourly'] = pd.DataFrame()
         
-        # Process phase skip data if provided
-        if not _is_empty(phase_skip_events):
-            log_message("Processing phase skip data...", 1, verbosity)
-            phase_skip_waits, phase_skip_alert_rows = transform_phase_skip_raw_data(phase_skip_events)
+        # Process phase wait data if provided
+        if not _is_empty(phase_wait):
+            log_message("Processing phase wait data...", 1, verbosity)
+            # Convert to pandas for processing
+            phase_wait_pd = _to_pandas(phase_wait)
+            coordination_agg_pd = _to_pandas(coordination_agg) if not _is_empty(coordination_agg) else None
+            
+            phase_skip_waits, phase_skip_alert_rows, cycle_length_data = process_phase_wait_data(
+                phase_wait_pd,
+                coordination_agg_pd
+            )
             
             # Apply retention to phase skip alert rows
             if self.config['phase_skip_retention_days'] > 0:
@@ -314,11 +327,13 @@ class ReportGenerator:
             self.phase_skip_waits = phase_skip_waits
             self.phase_skip_all_rows = phase_skip_alert_rows
             self.phase_skip_summary = phase_skip_summary
+            self.cycle_length_data = cycle_length_data
         else:
             new_alerts['phase_skips'] = pd.DataFrame()
             self.phase_skip_waits = pd.DataFrame()
             self.phase_skip_all_rows = pd.DataFrame()
             self.phase_skip_summary = pd.DataFrame()
+            self.cycle_length_data = pd.DataFrame()
         
         # Filter new alerts to only recent ones (alert_flagging_days)
         log_message(f"Filtering newly generated alerts to the last {self.config['alert_flagging_days']} days...", 1, verbosity)
@@ -388,7 +403,13 @@ class ReportGenerator:
                 annotated_phase_waits['AlertPhase'] = annotated_phase_waits['AlertPhase'].fillna(False).astype(bool)
                 alert_devices = phase_skip_alert_pairs['DeviceId'].unique()
                 plot_phase_skip_waits = annotated_phase_waits[annotated_phase_waits['DeviceId'].isin(alert_devices)]
-                phase_skip_figures = create_phase_skip_plots(plot_phase_skip_waits, signals, phase_skip_rankings, num_figures)
+                phase_skip_figures = create_phase_skip_plots(
+                    plot_phase_skip_waits, 
+                    signals, 
+                    phase_skip_rankings, 
+                    num_figures,
+                    self.cycle_length_data
+                )
         
         log_message("Plots created successfully", 1, verbosity)
         

@@ -3,6 +3,8 @@ import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
 from typing import List, Optional, Tuple
 import pandas as pd
+import warnings
+warnings.filterwarnings('ignore', message='More than.*figures have been opened') # default is 20 and thats too low
 
 def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', num_figures: int, 
                         df_hourly: Optional['pd.DataFrame'] = None) -> List[Tuple['plt.Figure', str]]:
@@ -34,9 +36,9 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
         group_column = 'Phase'
         left_value_column = 'PedServices'
         right_value_column = 'PedActuation'
-        plot_title = 'Pedestrian Services and Actuations'
+        plot_title = 'Pedestrian Services and Actuations per Service'
         y_label_left = 'Ped Services'
-        y_label_right = 'Ped Actuations'
+        y_label_right = 'Act/Service'
         use_percent_format = False
         fixed_y_limits = None
         is_ped_data = True
@@ -173,6 +175,10 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 if use_percent_format:
                     ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
                 
+                # Standardize x-axis date formatting for multi-day charts
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+                ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+                
                 # Rotate x-axis labels for better readability and add padding
                 plt.xticks(rotation=45, ha='right')
                 
@@ -206,27 +212,56 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 name = device_info['Name']
                 
                 # Filter hourly data for this device
-                plot_data = df_hourly[df_hourly['DeviceId'] == device]
+                plot_data = df_hourly[df_hourly['DeviceId'] == device].copy()
                 time_column = 'TimeStamp'
                 
                 # Skip if no data
                 if plot_data.empty:
                     continue
                 
+                # Calculate Actuations per Service (avoid division by zero)
+                plot_data['ActPerService'] = plot_data.apply(
+                    lambda row: row[right_value_column] / row[left_value_column] 
+                    if row[left_value_column] > 0 else 0, axis=1
+                )
+                
+                # Identify phases with alerts from daily data
+                device_daily = region_data[region_data['DeviceId'] == device]
+                alert_phases = set(device_daily['Phase'].unique())  # All phases in alerts df have alerts
+                
                 # Create the plot with a bigger figure size for better readability
+                # Single y-axis now since both metrics are on same axis
                 fig, ax1 = plt.subplots(figsize=(10, 5))
-                ax2 = ax1.twinx()  # Create a second y-axis
+                ax2 = ax1.twinx()  # Second axis for Actuations per Service
                 
                 # Get the min and max dates for the device data to set x-axis limits
                 min_date = plot_data[time_column].min()
                 max_date = plot_data[time_column].max()
                 
                 # Get all phases for this device
-                phases = sorted(plot_data[group_column].unique())
+                all_phases = sorted(plot_data[group_column].unique())
+                other_phases = sorted(set(all_phases) - alert_phases)
                 
-                # Plot each phase with both services and actuations
-                for i, phase in enumerate(phases):
-                    # Filter data for this phase
+                # First plot "other" phases (non-alert) in grey with lower zorder
+                from matplotlib.lines import Line2D
+                other_phase_lines = []
+                for phase in other_phases:
+                    phase_data = plot_data[plot_data[group_column] == phase]
+                    # Plot PedServices in grey
+                    line = ax1.plot(phase_data[time_column], phase_data[left_value_column], 
+                             color='#cccccc', linewidth=1.5, alpha=0.7,
+                             linestyle='-', zorder=1)
+                    other_phase_lines.append(line[0])
+                    # Plot Actuations per Service in grey dashed
+                    ax2.plot(phase_data[time_column], phase_data['ActPerService'], 
+                             color='#cccccc', linewidth=1.0, alpha=0.7,
+                             linestyle='--', dashes=(4, 2), zorder=1)
+                if other_phase_lines:
+                    other_phase_lines[0].set_label("Other Phases")
+                
+                # Then plot alert phases with colors and higher zorder
+                legend_elements = []
+                for phase in sorted(alert_phases):
                     phase_data = plot_data[plot_data[group_column] == phase]
                     color = phase_color_map[phase]
                     
@@ -234,14 +269,21 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                     ax1.plot(phase_data[time_column], phase_data[left_value_column], 
                              color=color, linewidth=2.5, 
                              label=f'Phase {phase} - Services',
-                             linestyle='-')
+                             linestyle='-', zorder=5)
                     
-                    # Plot PedActuation on right y-axis with dashed line
-                    ax2.plot(phase_data[time_column], phase_data[right_value_column], 
+                    # Plot Actuations per Service on right y-axis with dashed line
+                    ax2.plot(phase_data[time_column], phase_data['ActPerService'], 
                              color=color, linewidth=2.0, 
-                             label=f'Phase {phase} - Actuations',
+                             label=f'Phase {phase} - Act/Svc',
                              linestyle='--', 
-                             dashes=(4, 2))  # Custom dash pattern for better visibility
+                             dashes=(4, 2), zorder=5)
+                    
+                    # Add to legend
+                    legend_elements.append(Line2D([0], [0], color=color, linewidth=2.5,
+                                                  label=f'Phase {phase} - Services'))
+                    legend_elements.append(Line2D([0], [0], color=color, linewidth=2.0,
+                                                  linestyle='--', dashes=(4, 2),
+                                                  label=f'Phase {phase} - Act/Svc'))
                 
                 # Set axes labels
                 ax1.set_ylabel(y_label_left, fontweight='bold', color='black')
@@ -255,23 +297,6 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                               pad=20, fontweight='bold')
                 
                 ax1.grid(True, alpha=0.3, linestyle='--')
-                
-                # Combine legends from both axes
-                lines1, labels1 = ax1.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                
-                # Create custom legend entries to show solid/dashed line styles for services/actuations
-                from matplotlib.lines import Line2D
-                legend_elements = []
-                for i, phase in enumerate(phases):
-                    color = phase_color_map[phase]
-                    # Add services line (solid)
-                    legend_elements.append(Line2D([0], [0], color=color, linewidth=2.5,
-                                                  label=f'Phase {phase} - Services'))
-                    # Add actuations line (dashed)
-                    legend_elements.append(Line2D([0], [0], color=color, linewidth=2.0,
-                                                  linestyle='--', dashes=(4, 2),
-                                                  label=f'Phase {phase} - Actuations'))
                 
                 # Add the combined legend
                 ax1.legend(handles=legend_elements, frameon=True, fancybox=True, framealpha=0.9,
@@ -290,6 +315,10 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 # Format ticks on both y-axes to show integers
                 ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
                 ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                
+                # Standardize x-axis date formatting for multi-day charts
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+                ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
                 
                 # Adjust layout to prevent label cutoff with more padding
                 plt.tight_layout(pad=2.0)
@@ -511,6 +540,10 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
             if use_percent_format:
                 ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
             
+            # Standardize x-axis date formatting for multi-day charts
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            
             # Rotate x-axis labels for better readability and add padding
             plt.xticks(rotation=45, ha='right')
             
@@ -543,9 +576,22 @@ def create_phase_skip_plots(
     phase_waits_df: 'pd.DataFrame',
     signals_df: 'pd.DataFrame',
     device_rankings_df: 'pd.DataFrame',
-    num_figures: int
+    num_figures: int,
+    cycle_length_df: Optional['pd.DataFrame'] = None
 ) -> List[Tuple['plt.Figure', str]]:
-    """Generate per-device Phase Skip (Phase Wait Time) plots with styling identical to the main device charts."""
+    """Generate per-device Phase Skip (Phase Wait Time) plots with styling identical to the main device charts.
+    
+    Args:
+        phase_waits_df: DataFrame with columns DeviceId, TimeStamp, Phase, AvgPhaseWait, MaxPhaseWait, TotalSkips
+        signals_df: DataFrame with columns DeviceId, Name, Region
+        device_rankings_df: DataFrame with columns DeviceId, TotalSkips for ranking
+        num_figures: Number of figures to generate per region
+        cycle_length_df: Optional DataFrame with columns DeviceId, TimeStamp, CycleLength
+                        for plotting cycle length as a step function (from coordination_agg)
+    
+    Returns:
+        List of tuples containing (matplotlib figure, region)
+    """
     if (
         phase_waits_df is None or phase_waits_df.empty or
         device_rankings_df is None or device_rankings_df.empty or
@@ -583,8 +629,8 @@ def create_phase_skip_plots(
 
     phase_waits_df = phase_waits_df.copy()
     phase_waits_df['DeviceId'] = phase_waits_df['DeviceId'].astype(str)
-    phase_waits_df['Timestamp'] = pd.to_datetime(phase_waits_df['Timestamp'])
-    phase_waits_df = phase_waits_df.sort_values('Timestamp')
+    phase_waits_df['TimeStamp'] = pd.to_datetime(phase_waits_df['TimeStamp'])
+    phase_waits_df = phase_waits_df.sort_values('TimeStamp')
     alert_column = 'AlertPhase'
     if alert_column not in phase_waits_df.columns:
         phase_waits_df[alert_column] = False
@@ -631,8 +677,8 @@ def create_phase_skip_plots(
                 if data.empty:
                     continue
                 line = ax.plot(
-                    data['Timestamp'],
-                    data['PhaseWaitTime'],
+                    data['TimeStamp'],
+                    data['MaxPhaseWait'],
                     color='#cccccc',
                     linewidth=1.5,
                     alpha=0.7,
@@ -647,36 +693,45 @@ def create_phase_skip_plots(
                 if data.empty:
                     continue
                 ax.plot(
-                    data['Timestamp'],
-                    data['PhaseWaitTime'],
+                    data['TimeStamp'],
+                    data['MaxPhaseWait'],
                     label=f"Phase {phase_value}",
                     color=phase_colors.get(phase_value, colors[0]),
                     linewidth=2.5,
                     zorder=5
                 )
 
-            max_cycle_vals = device_data['MaxCycleLength'].dropna()
-            if not max_cycle_vals.empty:
-                max_cycle_length = max_cycle_vals.max()
-                ax.axhline(
-                    y=max_cycle_length,
-                    color='#4d4d4d',
-                    linestyle='--',
-                    linewidth=1.5,
-                    zorder=2,
-                    label='Max Cycle Length'
-                )
+            # Plot cycle length as a step function if data is available
+            if cycle_length_df is not None and not cycle_length_df.empty:
+                device_cycle_data = cycle_length_df[cycle_length_df['DeviceId'] == device_id].copy()
+                if not device_cycle_data.empty:
+                    device_cycle_data = device_cycle_data.sort_values('TimeStamp')
+                    # Use step function with 'post' to step up/down at the exact time of change
+                    ax.step(
+                        device_cycle_data['TimeStamp'],
+                        device_cycle_data['CycleLength'],
+                        where='post',
+                        color='#4d4d4d',
+                        linestyle='--',
+                        linewidth=1.5,
+                        zorder=2,
+                        label='Cycle Length'
+                    )
 
             signal_label = device_row.get('Name') or device_id
+            
+            # Get the date for the chart title
+            chart_date = device_data['TimeStamp'].dt.date.iloc[0]
+            date_str = chart_date.strftime('%Y-%m-%d')
 
             # Title and labels with bold, same padding and font sizes
             ax.set_title(
-                f"Phase Wait Time\n{signal_label}",
+                f"Max Phase Wait Time (15-minute bins)\n{signal_label} - {date_str}",
                 pad=20,
                 fontweight='bold',
                 fontsize=16
             )
-            ax.set_ylabel("Phase Wait Time (s)", fontweight='bold', fontsize=14)
+            ax.set_ylabel("Max Phase Wait Time (s)", fontweight='bold', fontsize=14)
 
             # Visual styling identical to the main charts
             ax.set_facecolor('#f8f8f8')                    # light gray background

@@ -12,7 +12,7 @@ matplotlib.use('Agg')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from atspm_report.data_processing import process_maxout_data, process_actuations_data, process_missing_data
-from atspm_report.phase_skip_processing import transform_phase_skip_raw_data
+from atspm_report.phase_skip_processing import process_phase_wait_data
 
 class TestIbisNative(unittest.TestCase):
     def setUp(self):
@@ -94,10 +94,10 @@ class TestIbisNative(unittest.TestCase):
         self.assertIn('MissingData', result_df.columns)
 
     def test_phase_skip_ibis_input(self):
-        """Test that transform_phase_skip_raw_data accepts Ibis table and returns Ibis expressions"""
+        """Test that process_phase_wait_data accepts Ibis table and returns Ibis expressions"""
         t = ibis.memtable(self.phase_skip_df)
         
-        phase_waits, alerts = transform_phase_skip_raw_data(t)
+        phase_waits, alerts, cycle_length = process_phase_wait_data(t)
         
         self.assertIsInstance(phase_waits, ir.Table)
         self.assertIsInstance(alerts, ir.Table)
