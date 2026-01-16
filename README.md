@@ -31,7 +31,7 @@ Detects worsening detector performance compared to historical baseline.
 ![Example Detector Alert](images/example_detector.png)
 
 ### 3. Pedestrian Alerts
-Detects increased ped services or changes in actuations per service ratio compared to historical baseline.
+Detects significant decreases in pedestrian services or anomalous actuations per service ratio compared to historical baseline.
 
 ![Example Pedestrian Alert](images/example_ped.png)
 
@@ -78,9 +78,9 @@ has_data = pd.read_parquet(test_data_dir / 'has_data.parquet')
 pedestrian = pd.read_parquet(test_data_dir / 'full_ped.parquet')
 
 # 2b. Load phase wait and coordination data (for phase skip detection)
-# These come from the atspm package's phase_wait and coordination aggregations
+# These come from the atspm package's phase_wait and coordination_agg aggregations
 phase_wait = pd.read_parquet(test_data_dir / 'phase_wait.parquet')  # Optional
-coordination = pd.read_parquet(test_data_dir / 'coordination.parquet')  # Optional
+coordination_agg = pd.read_parquet(test_data_dir / 'coordination_agg.parquet')  # Optional
 
 # 3. Load past alerts for suppression (optional but recommended)
 past_alerts = {}
@@ -97,7 +97,7 @@ result = generator.generate(
     has_data=has_data,
     pedestrian=pedestrian,
     phase_wait=phase_wait,  # For phase skip detection
-    coordination=coordination,  # For cycle length visualization
+    coordination_agg=coordination_agg,  # For cycle length visualization
     past_alerts=past_alerts
 )
 
@@ -167,7 +167,7 @@ Signal metadata including location and regional assignment.
 
 | Column | Type | Description | Example |
 |--------|------|-------------|---------|
-| DeviceId | str | Unique signal identifier (UUID) | signal_1 |
+| DeviceId | str or int | Unique signal identifier (converted to string internally) | signal_1 or 12345 |
 | Name | str | Signal location name | 04100-Pacific at Hill |
 | Region | str | Geographic region assignment | Region 2 |
 
@@ -189,7 +189,7 @@ Phase termination data for detecting max-out conditions.
 | Column | Type | Description | Example |
 |--------|------|-------------|---------|
 | TimeStamp | datetime | Event timestamp | 2024-01-15 08:30:00 |
-| DeviceId | str | Signal identifier (UUID) | signal_1 |
+| DeviceId | str or int | Signal identifier (converted to string internally) | signal_1 or 12345 |
 | Phase | int | Phase number (1-8) | 2 |
 | PerformanceMeasure | str | Termination type | MaxOut, ForceOff, GapOut |
 | Total | int | Number of occurrences | 45 |
@@ -214,7 +214,7 @@ Detector actuation counts for health monitoring.
 | Column | Type | Description | Example |
 |--------|------|-------------|---------|  
 | TimeStamp | datetime | Event timestamp | 2024-01-15 00:00:00 |
-| DeviceId | str | Signal identifier (UUID) | signal_1 |
+| DeviceId | str or int | Signal identifier (converted to string internally) | signal_1 or 12345 |
 | Detector | int | Detector number | 1 |
 | Total | int | Actuation count | 150 |
 | prediction | float | Predicted actuation count | 145.0 |
@@ -241,7 +241,7 @@ Records of data availability (presence of any record indicates data exists for t
 | Column | Type | Description | Example |
 |--------|------|-------------|---------|  
 | TimeStamp | datetime | Event timestamp | 2024-01-15 00:00:00 |
-| DeviceId | str | Signal identifier (UUID) | signal_1 |
+| DeviceId | str or int | Signal identifier (converted to string internally) | signal_1 or 12345 |
 
 **Sample:**
 ```python
@@ -260,7 +260,7 @@ Pedestrian button press and service data.
 | Column | Type | Description | Example |
 |--------|------|-------------|---------|
 | TimeStamp | datetime | Event timestamp | 2024-01-15 12:30:00 |
-| DeviceId | str | Signal identifier (UUID) | signal_1 |
+| DeviceId | str or int | Signal identifier (converted to string internally) | signal_1 or 12345 |
 | Phase | int | Pedestrian phase number | 2 |
 | PedActuation | int | Button press count | 5 |
 | PedServices | int | Service events (walk signal) | 1 |
@@ -285,9 +285,10 @@ Pre-aggregated phase wait data from the atspm package for phase skip detection.
 | Column | Type | Description | Example |
 |--------|------|-------------|---------|
 | TimeStamp | datetime | Bin start time | 2024-01-15 14:00:00 |
-| DeviceId | str | Signal identifier (UUID) | signal_1 |
+| DeviceId | str or int | Signal identifier (converted to string internally) | signal_1 or 12345 |
 | Phase | int | Phase number (1-16) | 1 |
 | AvgPhaseWait | float | Average wait time in seconds | 150.0 |
+| MaxPhaseWait | float | Maximum wait time in seconds | 200.0 |
 | TotalSkips | int | Count of skipped phases in this bin | 2 |
 
 **Sample:**
@@ -297,32 +298,29 @@ phase_wait = pd.DataFrame({
     'DeviceId': ['signal_1'] * 3,
     'Phase': [1, 1, 2],
     'AvgPhaseWait': [150.0, 160.0, 50.0],
+    'MaxPhaseWait': [200.0, 210.0, 70.0],
     'TotalSkips': [2, 3, 0]
 })
 ```
 </details>
 
 <details>
-<summary><strong>coordination</strong> (Optional)</summary>
+<summary><strong>coordination_agg</strong> (Optional)</summary>
 
-Coordination data for cycle length visualization. EventId 132 contains cycle length changes.
+Pre-aggregated coordination data for cycle length visualization (15-minute bins).
 
 | Column | Type | Description | Example |
 |--------|------|-------------|---------|
-| TimeStamp | datetime | Bin start time | 2024-01-15 14:00:00 |
-| Raw_TimeStamp | datetime | Exact timestamp of the event | 2024-01-15 14:00:05 |
-| DeviceId | str | Signal identifier (UUID) | signal_1 |
-| EventId | int | Event ID (132 = Cycle Length Change) | 132 |
-| Parameter | int | Value (Cycle Length in seconds for EventId 132) | 120 |
+| TimeStamp | datetime | Bin start time (15-minute intervals) | 2024-01-15 14:00:00 |
+| DeviceId | str or int | Signal identifier (converted to string internally) | signal_1 or 12345 |
+| ActualCycleLength | float | Actual cycle length in seconds | 120.0 |
 
 **Sample:**
 ```python
-coordination = pd.DataFrame({
-    'TimeStamp': pd.to_datetime(['2024-01-15 14:00:00', '2024-01-15 14:30:00']),
-    'Raw_TimeStamp': pd.to_datetime(['2024-01-15 14:00:05', '2024-01-15 14:30:10']),
-    'DeviceId': ['signal_1', 'signal_1'],
-    'EventId': [132, 132],  # 132 = Cycle Length Change
-    'Parameter': [100, 120]  # Cycle lengths in seconds
+coordination_agg = pd.DataFrame({
+    'TimeStamp': pd.to_datetime(['2024-01-15 14:00:00', '2024-01-15 14:15:00', '2024-01-15 14:30:00']),
+    'DeviceId': ['signal_1', 'signal_1', 'signal_1'],
+    'ActualCycleLength': [100.0, 120.0, 120.0]
 })
 ```
 </details>
@@ -360,23 +358,71 @@ past_alerts = {
 
 ## Statistical Analysis
 
-The package uses **CUSUM (Cumulative Sum)** with **z-score thresholds** to detect anomalies.
+The package uses **CUSUM (Cumulative Sum)** with **z-score thresholds** to detect anomalies for max-out, actuations, and missing data alerts. Pedestrian and phase skip alerts use different methodologies.
 
-### Detection Method
+### CUSUM Detection Method (Max-Out, Actuations, Missing Data)
 
-1. **Baseline**: Calculate historical mean ($\bar{x}$) and standard deviation ($\sigma$) per signal component
-2. **CUSUM**: Accumulate weighted deviations over a 7-day rolling window, with recent days weighted more heavily
-3. **Alert**: Trigger when CUSUM, z-score, and minimum value thresholds are all exceeded
+The CUSUM algorithm detects sustained deviations from historical baselines:
+
+1. **Baseline Calculation**: For each signal component (DeviceId + Phase/Detector), calculate:
+   - Historical mean ($\bar{x}$) over all available data
+   - Historical standard deviation ($\sigma$) over all available data
+
+2. **Time-Weighted CUSUM**: Over a 7-day rolling window, accumulate deviations with a "forgetfulness" weighting that emphasizes recent days:
+   - **Date Weight**: $(days\_since\_start + 1)^{forgetfulness}$ where $forgetfulness = 2$
+   - **Daily Deviation**: $\max(0, value - \bar{x} - k \cdot \sigma)$ where $k = 1$ (allowance factor)
+   - **CUSUM Score**: $\frac{\sum(DailyDeviation \times DateWeight)}{\sum(DateWeight)} \times 7$
+
+3. **Z-Score**: Standard z-score calculated as $(value - \bar{x}) / \sigma$
+
+4. **Alert Trigger**: An alert fires when **all** of the following conditions are met simultaneously:
+   - CUSUM exceeds threshold
+   - Z-score exceeds threshold  
+   - Current value exceeds minimum threshold
+   - (For max-out only) Services count exceeds minimum
 
 ### Alert Thresholds
 
-| Alert Type | CUSUM | Z-Score | Min Value | Extra |
-|------------|-------|---------|-----------|-------|
+| Alert Type | CUSUM Threshold | Z-Score Threshold | Min Value Threshold | Extra Condition |
+|------------|-----------------|-------------------|---------------------|-----------------|
 | Max-Out | > 0.25 | > 4 | > 20% | Services > 30 |
 | Actuations | > 0.20 | > 3.5 | > 10% | — |
 | Missing Data | > 0.10 | > 3 | > 5% | — |
-| Pedestrian | Combined GEH z-score < -11 | — | — | — |
-| Phase Skip | Wait time > 1.5× cycle length (excluding preemption) | — | — | — |
+
+### Pedestrian Alert Detection
+
+Pedestrian alerts use a **modified GEH statistic** combined with regional z-score normalization:
+
+1. **Calculate Metrics**: For each DeviceId/Phase/Date:
+   - **Ped_Percent**: Pedestrian services / Total phase services
+   - **Ped_APS**: Pedestrian actuations / Pedestrian services (actuations per service)
+
+2. **Signed GEH Calculation**: Modified GEH that preserves direction of change:
+   $$GEH_{signed} = \frac{2(V - M)^2}{V + M} \times sign(V - M)$$
+   where $V$ = observed value, $M$ = historical median for the device/phase
+
+3. **Regional Z-Score Normalization**: GEH values are normalized within each region/date to produce z-scores
+
+4. **Combined Z-Score**: Combines percent and APS z-scores:
+   - If Ped_Percent_ZScore < 0: $|Ped\_Percent\_ZScore \times Ped\_APS\_ZScore|$
+   - Otherwise: $Ped\_Percent\_ZScore \times Ped\_APS\_ZScore$
+
+5. **Alert Trigger**: Combined z-score ≤ -11 (indicates significant decrease in pedestrian activity relative to historical patterns)
+
+### Phase Skip Alert Detection
+
+Phase skip detection is based on pre-aggregated data from the atspm package:
+
+1. **Data Source**: Uses the `TotalSkips` column from `phase_wait` data, which counts phases where wait time exceeded expected cycle time (excluding preemption events)
+
+2. **Aggregation**: Daily totals of skips are summed by DeviceId/Phase
+
+3. **Alert Trigger**: Total aggregated skips exceed `phase_skip_alert_threshold` (default: 1)
+
+### System Outage Detection
+
+1. **Missing Data Threshold**: When average missing data across a region exceeds 30% for a given date
+2. **Output**: Alerts grouped by Date and Region
 
 ## License
 

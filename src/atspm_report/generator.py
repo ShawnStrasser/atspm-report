@@ -299,35 +299,37 @@ class ReportGenerator:
         # Process phase wait data if provided
         if not _is_empty(phase_wait):
             log_message("Processing phase wait data...", 1, verbosity)
-            # Convert to pandas for processing
-            phase_wait_pd = _to_pandas(phase_wait)
-            coordination_agg_pd = _to_pandas(coordination_agg) if not _is_empty(coordination_agg) else None
             
             phase_skip_waits, phase_skip_alert_rows, cycle_length_data = process_phase_wait_data(
-                phase_wait_pd,
-                coordination_agg_pd
+                phase_wait,
+                coordination_agg
             )
+            
+            # Convert to pandas for downstream processing
+            phase_skip_waits_pd = _to_pandas(phase_skip_waits)
+            phase_skip_alert_rows_pd = _to_pandas(phase_skip_alert_rows)
+            cycle_length_data_pd = _to_pandas(cycle_length_data)
             
             # Apply retention to phase skip alert rows
             if self.config['phase_skip_retention_days'] > 0:
                 cutoff_date = datetime.now().date() - timedelta(days=self.config['phase_skip_retention_days'])
                 # Filter using native datetime comparison (Date column should already be datetime)
-                phase_skip_alert_rows = phase_skip_alert_rows[
-                    phase_skip_alert_rows['Date'].apply(lambda x: x.date() if hasattr(x, 'date') else x) >= cutoff_date
+                phase_skip_alert_rows_pd = phase_skip_alert_rows_pd[
+                    phase_skip_alert_rows_pd['Date'].apply(lambda x: x.date() if hasattr(x, 'date') else x) >= cutoff_date
                 ]
             
             # Summarize and generate alerts
             phase_skip_summary, phase_skip_alert_candidates = self._summarize_phase_skip_alerts(
-                phase_skip_alert_rows,
+                phase_skip_alert_rows_pd,
                 self.config['phase_skip_alert_threshold']
             )
             new_alerts['phase_skips'] = phase_skip_alert_candidates
             
             # Store for report generation
-            self.phase_skip_waits = phase_skip_waits
-            self.phase_skip_all_rows = phase_skip_alert_rows
+            self.phase_skip_waits = phase_skip_waits_pd
+            self.phase_skip_all_rows = phase_skip_alert_rows_pd
             self.phase_skip_summary = phase_skip_summary
-            self.cycle_length_data = cycle_length_data
+            self.cycle_length_data = cycle_length_data_pd
         else:
             new_alerts['phase_skips'] = pd.DataFrame()
             self.phase_skip_waits = pd.DataFrame()

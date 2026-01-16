@@ -40,16 +40,15 @@ class TestReportGenerator(unittest.TestCase):
             'DeviceId': [test_device_id] * 6,
             'Phase': [1, 1, 1, 2, 2, 2],
             'AvgPhaseWait': [150.0, 160.0, 170.0, 50.0, 55.0, 60.0],
+            'MaxPhaseWait': [180.0, 190.0, 200.0, 70.0, 75.0, 80.0],
             'TotalSkips': [2, 3, 2, 0, 0, 0]  # Phase 1 has skips, Phase 2 doesn't
         })
         
-        # Create dummy coordination data with cycle length changes (EventId=132)
-        cls.coordination = pd.DataFrame({
+        # Create dummy coordination_agg data with cycle length (15-minute bin aggregated)
+        cls.coordination_agg = pd.DataFrame({
             'TimeStamp': [now - timedelta(hours=5), now - timedelta(hours=3), now - timedelta(hours=1)],
-            'Raw_TimeStamp': [now - timedelta(hours=5), now - timedelta(hours=3), now - timedelta(hours=1)],
             'DeviceId': [test_device_id] * 3,
-            'EventId': [132, 132, 132],  # 132 = Cycle Length Change
-            'Parameter': [100, 120, 100]  # Cycle length changes
+            'ActualCycleLength': [100.0, 120.0, 100.0]  # Cycle lengths
         })
 
         cls.config = {
@@ -79,7 +78,7 @@ class TestReportGenerator(unittest.TestCase):
             'has_data': self.has_data,
             'pedestrian': self.pedestrian,
             'phase_wait': self.phase_wait,
-            'coordination': self.coordination
+            'coordination_agg': self.coordination_agg
         }
         
         result = generator.generate(**data)
@@ -140,7 +139,7 @@ class TestReportGenerator(unittest.TestCase):
             'has_data': self.has_data,
             'pedestrian': self.pedestrian,
             'phase_wait': self.phase_wait,
-            'coordination': self.coordination,
+            'coordination_agg': self.coordination_agg,
             'past_alerts': self.past_alerts
         }
         

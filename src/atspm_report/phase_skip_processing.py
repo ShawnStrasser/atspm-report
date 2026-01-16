@@ -17,6 +17,8 @@ Expected Input Schema (coordination_agg table - for cycle length):
 """
 
 import pandas as pd
+import ibis
+import ibis.expr.types as ir
 from typing import Union, Tuple, Optional
 
 # Output column definitions
@@ -33,118 +35,123 @@ COORDINATION_COLUMNS = [
 ]
 
 
+def _to_ibis(data: Union[pd.DataFrame, ir.Table, None]) -> Optional[ir.Table]:
+    """Convert pandas DataFrame to Ibis table if needed."""
+    if data is None:
+        return None
+    if isinstance(data, ir.Table):
+        return data
+    if isinstance(data, pd.DataFrame):
+        if data.empty:
+            return None
+        return ibis.memtable(data)
+    return None
+
+
+def _is_empty(data: Union[pd.DataFrame, ir.Table, None]) -> bool:
+    """Check if data is None or empty, works for both pandas and Ibis."""
+    if data is None:
+        return True
+    if isinstance(data, pd.DataFrame):
+        return data.empty
+    if isinstance(data, ir.Table):
+        return data.count().execute() == 0
+    return True
+
+
 def process_phase_wait_data(
-    phase_wait: Union[pd.DataFrame, None],
-    coordination_agg: Optional[pd.DataFrame] = None
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    phase_wait: Union[pd.DataFrame, ir.Table, None],
+    coordination_agg: Optional[Union[pd.DataFrame, ir.Table]] = None
+) -> Tuple[ir.Table, ir.Table, ir.Table]:
     """
     Process phase_wait data to generate phase skip alerts.
+    
+    All processing is done using Ibis. Pandas inputs are converted to Ibis tables.
 
     Args:
-        phase_wait: DataFrame with columns TimeStamp, DeviceId, Phase, AvgPhaseWait, MaxPhaseWait, TotalSkips
-        coordination_agg: Optional DataFrame with columns TimeStamp, DeviceId, ActualCycleLength
+        phase_wait: DataFrame or Ibis table with columns TimeStamp, DeviceId, Phase, AvgPhaseWait, MaxPhaseWait, TotalSkips
+        coordination_agg: Optional DataFrame or Ibis table with columns TimeStamp, DeviceId, ActualCycleLength
                          Used to plot cycle length as a step function (15-minute bins)
 
     Returns:
-        Tuple of (phase_waits_df, alert_rows_df, cycle_length_df):
-            - phase_waits_df: Processed phase wait data for plotting
-            - alert_rows_df: Alert candidates with DeviceId, Phase, Date, TotalSkips
-            - cycle_length_df: Cycle length data for plotting (DeviceId, TimeStamp, CycleLength)
+        Tuple of (phase_waits, alert_rows, cycle_length) as Ibis tables:
+            - phase_waits: Processed phase wait data for plotting
+            - alert_rows: Alert candidates with DeviceId, Phase, Date, TotalSkips
+            - cycle_length: Cycle length data for plotting
     """
+    # Convert to Ibis if pandas
+    phase_wait_tbl = _to_ibis(phase_wait)
+    
     # Handle empty/None input
-    if phase_wait is None or phase_wait.empty:
-        return (
-            pd.DataFrame(columns=PHASE_WAIT_COLUMNS),
-            pd.DataFrame(columns=PHASE_SKIP_ALERT_COLUMNS),
-            pd.DataFrame(columns=COORDINATION_COLUMNS)
-        )
+    if phase_wait_tbl is None:
+        empty_phase_waits = ibis.memtable(pd.DataFrame(columns=PHASE_WAIT_COLUMNS))
+        empty_alerts = ibis.memtable(pd.DataFrame(columns=PHASE_SKIP_ALERT_COLUMNS))
+        empty_cycle = ibis.memtable(pd.DataFrame(columns=COORDINATION_COLUMNS))
+        return (empty_phase_waits, empty_alerts, empty_cycle)
     
-    # Make a copy to avoid modifying original
-    phase_waits_df = phase_wait.copy()
-    
-    # Normalize column names (handle case variations)
-    phase_waits_df.columns = [col.strip() for col in phase_waits_df.columns]
-    
-    # Ensure required columns exist
+    # Verify required columns exist
     required_cols = ['TimeStamp', 'DeviceId', 'Phase', 'AvgPhaseWait', 'MaxPhaseWait', 'TotalSkips']
     for col in required_cols:
-        if col not in phase_waits_df.columns:
+        if col not in phase_wait_tbl.columns:
             raise ValueError(f"Missing required column: {col}")
     
-    # Type conversions
-    phase_waits_df['DeviceId'] = phase_waits_df['DeviceId'].astype(str)
-    phase_waits_df['Phase'] = phase_waits_df['Phase'].astype(int)
-    phase_waits_df['TimeStamp'] = pd.to_datetime(phase_waits_df['TimeStamp'])
-    phase_waits_df['AvgPhaseWait'] = phase_waits_df['AvgPhaseWait'].astype(float)
-    phase_waits_df['MaxPhaseWait'] = phase_waits_df['MaxPhaseWait'].astype(float)
-    phase_waits_df['TotalSkips'] = phase_waits_df['TotalSkips'].astype(int)
-    
-    # Create Date column from TimeStamp
-    phase_waits_df['Date'] = phase_waits_df['TimeStamp'].dt.normalize()
-    
-    # Generate alert rows by aggregating by DeviceId, Phase, Date
-    alert_rows_df = (
-        phase_waits_df[phase_waits_df['TotalSkips'] > 0]
-        .groupby(['DeviceId', 'Phase', 'Date'], as_index=False)
-        .agg(TotalSkips=('TotalSkips', 'sum'))
+    # Cast columns to correct types and add Date column
+    phase_waits = phase_wait_tbl.mutate(
+        DeviceId=phase_wait_tbl.DeviceId.cast('string'),
+        Phase=phase_wait_tbl.Phase.cast('int32'),
+        AvgPhaseWait=phase_wait_tbl.AvgPhaseWait.cast('float64'),
+        MaxPhaseWait=phase_wait_tbl.MaxPhaseWait.cast('float64'),
+        TotalSkips=phase_wait_tbl.TotalSkips.cast('int64'),
+        Date=phase_wait_tbl.TimeStamp.truncate('D')
     )
     
-    # Ensure alert columns are in correct order
-    if not alert_rows_df.empty:
-        alert_rows_df = alert_rows_df[PHASE_SKIP_ALERT_COLUMNS]
-    else:
-        alert_rows_df = pd.DataFrame(columns=PHASE_SKIP_ALERT_COLUMNS)
+    # Select output columns for phase_waits
+    phase_waits_out = phase_waits.select(PHASE_WAIT_COLUMNS)
+    
+    # Generate alert rows by filtering and aggregating
+    alert_rows = (
+        phase_waits
+        .filter(phase_waits.TotalSkips > 0)
+        .group_by(['DeviceId', 'Phase', 'Date'])
+        .aggregate(TotalSkips=phase_waits.TotalSkips.sum())
+        .select(PHASE_SKIP_ALERT_COLUMNS)
+    )
     
     # Process coordination_agg data for cycle length
-    cycle_length_df = _extract_cycle_length(coordination_agg)
+    cycle_length = _extract_cycle_length(coordination_agg)
     
-    # Return data in expected format
-    return (
-        phase_waits_df[PHASE_WAIT_COLUMNS],
-        alert_rows_df,
-        cycle_length_df
-    )
+    return (phase_waits_out, alert_rows, cycle_length)
 
 
-def _extract_cycle_length(coordination_agg: Optional[pd.DataFrame]) -> pd.DataFrame:
+def _extract_cycle_length(coordination_agg: Optional[Union[pd.DataFrame, ir.Table]]) -> ir.Table:
     """
-    Extract cycle length data from coordination_agg table.
+    Extract cycle length data from coordination_agg table using Ibis.
     
     Args:
-        coordination_agg: DataFrame with TimeStamp, DeviceId, ActualCycleLength columns
-                         (15-minute bin aggregated data)
+        coordination_agg: DataFrame or Ibis table with TimeStamp, DeviceId, ActualCycleLength columns
     
     Returns:
-        DataFrame with DeviceId, TimeStamp, CycleLength columns
+        Ibis table with DeviceId, TimeStamp, CycleLength columns
     """
-    if coordination_agg is None or coordination_agg.empty:
-        return pd.DataFrame(columns=COORDINATION_COLUMNS)
+    coord_tbl = _to_ibis(coordination_agg)
     
-    # Make a copy
-    coord_df = coordination_agg.copy()
+    if coord_tbl is None:
+        return ibis.memtable(pd.DataFrame(columns=COORDINATION_COLUMNS))
     
     # Check if ActualCycleLength column exists
-    if 'ActualCycleLength' not in coord_df.columns:
-        return pd.DataFrame(columns=COORDINATION_COLUMNS)
+    if 'ActualCycleLength' not in coord_tbl.columns:
+        return ibis.memtable(pd.DataFrame(columns=COORDINATION_COLUMNS))
     
-    # Filter out rows where ActualCycleLength is 0 or null (no coordination)
-    coord_df = coord_df[coord_df['ActualCycleLength'] > 0].copy()
+    # Filter, cast, rename columns
+    cycle_length = (
+        coord_tbl
+        .filter(coord_tbl.ActualCycleLength > 0)
+        .mutate(
+            DeviceId=coord_tbl.DeviceId.cast('string'),
+            CycleLength=coord_tbl.ActualCycleLength.cast('float64')
+        )
+        .select(['DeviceId', 'TimeStamp', 'CycleLength'])
+        .order_by(['DeviceId', 'TimeStamp'])
+    )
     
-    if coord_df.empty:
-        return pd.DataFrame(columns=COORDINATION_COLUMNS)
-    
-    # Ensure TimeStamp is datetime
-    coord_df['TimeStamp'] = pd.to_datetime(coord_df['TimeStamp'])
-    
-    # Extract and rename columns
-    cycle_length_df = coord_df[['DeviceId', 'TimeStamp', 'ActualCycleLength']].copy()
-    cycle_length_df.columns = ['DeviceId', 'TimeStamp', 'CycleLength']
-    
-    # Type conversions
-    cycle_length_df['DeviceId'] = cycle_length_df['DeviceId'].astype(str)
-    cycle_length_df['CycleLength'] = cycle_length_df['CycleLength'].astype(float)
-    
-    # Sort by device and timestamp
-    cycle_length_df = cycle_length_df.sort_values(['DeviceId', 'TimeStamp']).reset_index(drop=True)
-    
-    return cycle_length_df
+    return cycle_length
