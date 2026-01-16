@@ -305,6 +305,8 @@ class ReportGenerator:
                 coordination_agg
             )
             
+            log_message(f"Processed phase wait data. Shape: {_get_shape_str(phase_skip_waits)}", 1, verbosity)
+
             # Convert to pandas for downstream processing
             phase_skip_waits_pd = _to_pandas(phase_skip_waits)
             phase_skip_alert_rows_pd = _to_pandas(phase_skip_alert_rows)
@@ -319,6 +321,7 @@ class ReportGenerator:
                 ]
             
             # Summarize and generate alerts
+            log_message("Summarizing phase skip alerts...", 1, verbosity)
             phase_skip_summary, phase_skip_alert_candidates = self._summarize_phase_skip_alerts(
                 phase_skip_alert_rows_pd,
                 self.config['phase_skip_alert_threshold']
