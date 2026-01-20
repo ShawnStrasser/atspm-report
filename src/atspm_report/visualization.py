@@ -230,9 +230,8 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 alert_phases = set(device_daily['Phase'].unique())  # All phases in alerts df have alerts
                 
                 # Create the plot with a bigger figure size for better readability
-                # Single y-axis now since both metrics are on same axis
+                # Single y-axis for both metrics
                 fig, ax1 = plt.subplots(figsize=(10, 5))
-                ax2 = ax1.twinx()  # Second axis for Actuations per Service
                 
                 # Get the min and max dates for the device data to set x-axis limits
                 min_date = plot_data[time_column].min()
@@ -253,7 +252,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                              linestyle='-', zorder=1)
                     other_phase_lines.append(line[0])
                     # Plot Actuations per Service in grey dashed
-                    ax2.plot(phase_data[time_column], phase_data['ActPerService'], 
+                    ax1.plot(phase_data[time_column], phase_data['ActPerService'], 
                              color='#cccccc', linewidth=1.0, alpha=0.7,
                              linestyle='--', dashes=(4, 2), zorder=1)
                 if other_phase_lines:
@@ -271,8 +270,8 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                              label=f'Phase {phase} - Services',
                              linestyle='-', zorder=5)
                     
-                    # Plot Actuations per Service on right y-axis with dashed line
-                    ax2.plot(phase_data[time_column], phase_data['ActPerService'], 
+                    # Plot Actuations per Service on same y-axis with dashed line
+                    ax1.plot(phase_data[time_column], phase_data['ActPerService'], 
                              color=color, linewidth=2.0, 
                              label=f'Phase {phase} - Act/Svc',
                              linestyle='--', 
@@ -285,9 +284,8 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                                                   linestyle='--', dashes=(4, 2),
                                                   label=f'Phase {phase} - Act/Svc'))
                 
-                # Set axes labels
-                ax1.set_ylabel(y_label_left, fontweight='bold', color='black')
-                ax2.set_ylabel(y_label_right, fontweight='bold', color='black')
+                # Set axis label
+                ax1.set_ylabel(f"{y_label_left} / {y_label_right}", fontweight='bold', color='black')
                 
                 # Set the x-axis limits to match the data range exactly
                 ax1.set_xlim(min_date, max_date)
@@ -312,9 +310,8 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 for spine in ax1.spines.values():
                     spine.set_linewidth(1.2)
                 
-                # Format ticks on both y-axes to show integers
+                # Format ticks on y-axis to show integers
                 ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
-                ax2.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
                 
                 # Standardize x-axis date formatting for multi-day charts
                 ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
