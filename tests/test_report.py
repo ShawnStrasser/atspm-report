@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime, timedelta
+from unittest.mock import patch
 import sys
 import os
 import re
@@ -214,11 +215,14 @@ class TestReportGenerator(unittest.TestCase):
         }
         generator = ReportGenerator(config)
         
-        result = generator.generate(
-            signals=signals,
-            phase_wait=phase_wait,
-            past_alerts={},
-        )
+        with patch("atspm_report.generator.create_device_plots", return_value=[]), \
+             patch("atspm_report.generator.create_phase_skip_plots", return_value=[]), \
+             patch("atspm_report.generator.generate_pdf_report", return_value={}):
+            result = generator.generate(
+                signals=signals,
+                phase_wait=phase_wait,
+                past_alerts={},
+            )
         
         self.assertTrue(
             result['alerts']['phase_skips'].empty,
