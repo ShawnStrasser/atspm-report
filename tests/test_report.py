@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime, timedelta
+from unittest.mock import patch
 import sys
 import os
 import re
@@ -189,6 +190,49 @@ class TestReportGenerator(unittest.TestCase):
                     'object',
                     f"{alert_type}: DeviceId should be string type"
                 )
+    
+    def test_4_phase_skip_retention_handles_empty_alert_rows(self):
+        """Regression: phase skip retention should handle zero-skip input without type errors."""
+        signals = pd.DataFrame([
+            {"DeviceId": "1", "Name": "Test Signal", "Region": "R1"}
+        ])
+        phase_wait = pd.DataFrame([
+            {
+                "TimeStamp": pd.Timestamp("2026-01-26 00:00:00"),
+                "DeviceId": "1",
+                "Phase": 2,
+                "AvgPhaseWait": 10.0,
+                "MaxPhaseWait": 12.0,
+                "TotalSkips": 0,
+            }
+        ])
+        
+        config = {
+            **self.config,
+            "verbosity": 0,
+            "suppress_repeated_alerts": False,
+            "phase_skip_retention_days": 14,
+        }
+        generator = ReportGenerator(config)
+        
+        with patch("atspm_report.generator.create_device_plots", return_value=[]), \
+             patch("atspm_report.generator.create_phase_skip_plots", return_value=[]), \
+             patch("atspm_report.generator.generate_pdf_report", return_value={}):
+            result = generator.generate(
+                signals=signals,
+                phase_wait=phase_wait,
+                past_alerts={},
+            )
+        
+        self.assertTrue(
+            result['alerts']['phase_skips'].empty,
+            "Expected no phase skip alerts when TotalSkips is zero"
+        )
+        self.assertEqual(
+            len(result['reports']),
+            0,
+            "Expected no PDF reports when no alerts are generated"
+        )
 
 
 class TestPackageMetadata(unittest.TestCase):

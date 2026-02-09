@@ -311,12 +311,13 @@ class ReportGenerator:
             cycle_length_data_pd = _to_pandas(cycle_length_data)
             
             # Apply retention to phase skip alert rows
-            if self.config['phase_skip_retention_days'] > 0:
-                cutoff_date = datetime.now().date() - timedelta(days=self.config['phase_skip_retention_days'])
-                # Filter using native datetime comparison (Date column should already be datetime)
-                phase_skip_alert_rows_pd = phase_skip_alert_rows_pd[
-                    phase_skip_alert_rows_pd['Date'].apply(lambda x: x.date() if hasattr(x, 'date') else x) >= cutoff_date
-                ]
+            if self.config['phase_skip_retention_days'] > 0 and 'Date' in phase_skip_alert_rows_pd.columns:
+                cutoff_datetime = (
+                    datetime.now() - timedelta(days=self.config['phase_skip_retention_days'])
+                ).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+                # Coerce to pandas datetime for robust comparisons, including empty frames.
+                phase_skip_dates = pd.to_datetime(phase_skip_alert_rows_pd['Date'], errors='coerce').dt.tz_localize(None)
+                phase_skip_alert_rows_pd = phase_skip_alert_rows_pd[phase_skip_dates >= cutoff_datetime]
             
             # Summarize and generate alerts
             phase_skip_summary, phase_skip_alert_candidates = self._summarize_phase_skip_alerts(
