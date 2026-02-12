@@ -20,6 +20,10 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
     Returns:
         List of tuples containing (matplotlib figure, region)
     """
+    # No daily alert rows means there is nothing to visualize for this alert type.
+    if df_daily is None or df_daily.empty:
+        return []
+
     # Set larger font sizes for better readability
     plt.rcParams.update({
         'font.size': 12,
