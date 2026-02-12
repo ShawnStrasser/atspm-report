@@ -234,6 +234,29 @@ class TestReportGenerator(unittest.TestCase):
             "Expected no PDF reports when no alerts are generated"
         )
 
+    def test_5_empty_terminations_do_not_crash_report_generation(self):
+        """Regression: empty terminations input should not crash visualization."""
+        generator = ReportGenerator({
+            **self.config,
+            "verbosity": 0,
+            "suppress_repeated_alerts": False,
+        })
+
+        empty_terminations = self.terminations.iloc[0:0].copy()
+
+        result = generator.generate(
+            signals=self.subset_signals,
+            terminations=empty_terminations,
+            detector_health=self.detector_health,
+            has_data=self.has_data,
+        )
+
+        self.assertTrue(
+            result['alerts']['maxout'].empty,
+            "Expected maxout alerts to be empty when terminations has no rows"
+        )
+        self.assertIn('reports', result)
+
 
 class TestPackageMetadata(unittest.TestCase):
     """Test package metadata and configuration."""
