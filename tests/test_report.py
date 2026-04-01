@@ -11,12 +11,14 @@ import re
 import tomli
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.dates as mdates
 
 # Add the src directory to the path to import the package directly
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from atspm_report import ReportGenerator
 import atspm_report
+from atspm_report.visualization import create_phase_skip_plots
 
 class TestReportGenerator(unittest.TestCase):
     @classmethod
@@ -254,6 +256,70 @@ class TestPackageMetadata(unittest.TestCase):
             toml_version,
             f"Version mismatch: __init__.py has '{init_version}' but pyproject.toml has '{toml_version}'"
         )
+
+
+class TestPhaseSkipVisualization(unittest.TestCase):
+    def setUp(self):
+        self.signals = pd.DataFrame([
+            {"DeviceId": "1", "Name": "Signal 1", "Region": "R1"}
+        ])
+        self.rankings = pd.DataFrame([
+            {"DeviceId": "1", "TotalSkips": 5}
+        ])
+
+    def tearDown(self):
+        matplotlib.pyplot.close('all')
+
+    def test_phase_skip_single_day_uses_time_axis_labels(self):
+        timestamps = pd.date_range("2026-02-01 00:00:00", periods=8, freq="3h")
+        phase_waits = pd.DataFrame({
+            "TimeStamp": timestamps,
+            "DeviceId": ["1"] * len(timestamps),
+            "Phase": [1] * len(timestamps),
+            "AvgPhaseWait": [10.0] * len(timestamps),
+            "MaxPhaseWait": [15.0] * len(timestamps),
+            "TotalSkips": [1] * len(timestamps),
+            "AlertPhase": [True] * len(timestamps),
+        })
+
+        figures = create_phase_skip_plots(phase_waits, self.signals, self.rankings, num_figures=1)
+
+        self.assertEqual(len(figures), 2)
+        formatter = figures[0][0].axes[0].xaxis.get_major_formatter()
+        formatted_tick = formatter.format_data_short(mdates.date2num(pd.Timestamp("2026-02-01 06:00:00")))
+
+        self.assertRegex(formatted_tick, r"\d{2}:\d{2}")
+        self.assertNotIn("Feb", formatted_tick)
+
+    def test_phase_skip_multi_day_uses_date_axis_labels(self):
+        timestamps = pd.to_datetime([
+            "2026-02-01 00:00:00",
+            "2026-02-01 12:00:00",
+            "2026-02-02 00:00:00",
+            "2026-02-02 12:00:00",
+            "2026-02-03 00:00:00",
+        ])
+        phase_waits = pd.DataFrame({
+            "TimeStamp": timestamps,
+            "DeviceId": ["1"] * len(timestamps),
+            "Phase": [1] * len(timestamps),
+            "AvgPhaseWait": [10.0] * len(timestamps),
+            "MaxPhaseWait": [15.0] * len(timestamps),
+            "TotalSkips": [1] * len(timestamps),
+            "AlertPhase": [True] * len(timestamps),
+        })
+
+        figures = create_phase_skip_plots(phase_waits, self.signals, self.rankings, num_figures=1)
+
+        self.assertEqual(len(figures), 2)
+        axis = figures[0][0].axes[0]
+        formatter = axis.xaxis.get_major_formatter()
+        formatted_tick = formatter.format_data_short(mdates.date2num(pd.Timestamp("2026-02-02 00:00:00")))
+
+        self.assertRegex(formatted_tick, r"[A-Za-z]{3}-\d{2}")
+        self.assertNotIn("00:00", formatted_tick)
+        self.assertIn("2026-02-01 to 2026-02-03", axis.get_title())
+        self.assertEqual(axis.title.get_fontsize(), 14)
 
 
 class TestDataSchemas(unittest.TestCase):

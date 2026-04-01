@@ -6,6 +6,21 @@ import pandas as pd
 import warnings
 warnings.filterwarnings('ignore', message='More than.*figures have been opened') # default is 20 and thats too low
 
+
+def _format_phase_skip_time_axis(ax: 'plt.Axes', timestamps: 'pd.Series') -> None:
+    """Use time labels for single-day charts and date labels for multi-day charts."""
+    valid_timestamps = pd.to_datetime(timestamps, errors='coerce').dropna()
+    if valid_timestamps.empty:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        return
+
+    if valid_timestamps.dt.normalize().nunique() > 1:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+    else:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+
 def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', num_figures: int, 
                         df_hourly: Optional['pd.DataFrame'] = None) -> List[Tuple['plt.Figure', str]]:
     """Generate plots for each device's data
@@ -717,16 +732,26 @@ def create_phase_skip_plots(
 
             signal_label = device_row.get('Name') or device_id
             
-            # Get the date for the chart title
-            chart_date = device_data['TimeStamp'].dt.date.iloc[0]
-            date_str = chart_date.strftime('%Y-%m-%d')
+            title_timestamps = device_data['TimeStamp'].dropna().sort_values()
+            start_timestamp = title_timestamps.iloc[0]
+            end_timestamp = title_timestamps.iloc[-1]
+            is_multi_day = start_timestamp.normalize() != end_timestamp.normalize()
+            if is_multi_day:
+                date_str = (
+                    f"{start_timestamp.strftime('%Y-%m-%d')} to "
+                    f"{end_timestamp.strftime('%Y-%m-%d')}"
+                )
+                title_fontsize = 14
+            else:
+                date_str = start_timestamp.strftime('%Y-%m-%d')
+                title_fontsize = 16
 
             # Title and labels with bold, same padding and font sizes
             ax.set_title(
                 f"Max Phase Wait Time (15-minute bins)\n{signal_label} - {date_str}",
                 pad=20,
                 fontweight='bold',
-                fontsize=16
+                fontsize=title_fontsize
             )
             ax.set_ylabel("Max Phase Wait Time (s)", fontweight='bold', fontsize=14)
 
@@ -735,8 +760,8 @@ def create_phase_skip_plots(
             ax.grid(True, alpha=0.3, linestyle='--')
             ax.set_axisbelow(True)
 
-            # Nice time formatting on x-axis
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            # Keep intraday charts readable, but show dates when the plot spans multiple days.
+            _format_phase_skip_time_axis(ax, device_data['TimeStamp'])
             plt.xticks(rotation=45, ha='right', fontsize=12)
             ax.tick_params(axis='both', labelsize=12)
 
