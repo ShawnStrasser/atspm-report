@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from atspm_report import ReportGenerator
 import atspm_report
-from atspm_report.visualization import create_phase_skip_plots
+from atspm_report.visualization import create_phase_skip_plots, _format_time_axis
 
 class TestReportGenerator(unittest.TestCase):
     @classmethod
@@ -340,9 +340,21 @@ class TestPhaseSkipVisualization(unittest.TestCase):
         formatted_tick = formatter.format_data_short(mdates.date2num(pd.Timestamp("2026-02-02 00:00:00")))
 
         self.assertRegex(formatted_tick, r"[A-Za-z]{3}-\d{2}")
-        self.assertNotIn("00:00", formatted_tick)
+        self.assertIn("00:00", formatted_tick)
         self.assertIn("2026-02-01 to 2026-02-03", axis.get_title())
         self.assertEqual(axis.title.get_fontsize(), 14)
+
+    def test_time_axis_uses_date_only_for_daily_multi_day_data(self):
+        fig, ax = matplotlib.pyplot.subplots()
+        timestamps = pd.date_range("2026-02-01", periods=3, freq="D")
+
+        _format_time_axis(ax, timestamps)
+
+        formatter = ax.xaxis.get_major_formatter()
+        formatted_tick = formatter.format_data_short(mdates.date2num(pd.Timestamp("2026-02-02")))
+
+        self.assertRegex(formatted_tick, r"[A-Za-z]{3}-\d{2}")
+        self.assertNotIn("00:00", formatted_tick)
 
 
 class TestDataSchemas(unittest.TestCase):

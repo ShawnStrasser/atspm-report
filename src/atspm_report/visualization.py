@@ -7,19 +7,30 @@ import warnings
 warnings.filterwarnings('ignore', message='More than.*figures have been opened') # default is 20 and thats too low
 
 
-def _format_phase_skip_time_axis(ax: 'plt.Axes', timestamps: 'pd.Series') -> None:
-    """Use time labels for single-day charts and date labels for multi-day charts."""
-    valid_timestamps = pd.to_datetime(timestamps, errors='coerce').dropna()
+def _format_time_axis(ax: 'plt.Axes', timestamps: 'pd.Series') -> None:
+    """Format time axes consistently across daily, intraday, and multi-day charts."""
+    valid_timestamps = pd.Series(pd.to_datetime(timestamps, errors='coerce')).dropna()
     if valid_timestamps.empty:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator())
         return
 
-    if valid_timestamps.dt.normalize().nunique() > 1:
+    normalized_timestamps = valid_timestamps.dt.normalize()
+    spans_multiple_days = normalized_timestamps.nunique() > 1
+    date_only_values = (valid_timestamps == normalized_timestamps).all()
+
+    if spans_multiple_days and date_only_values:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
+    elif spans_multiple_days:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d\n%H:%M'))
     else:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+
+
+def _format_phase_skip_time_axis(ax: 'plt.Axes', timestamps: 'pd.Series') -> None:
+    """Backward-compatible wrapper for phase skip chart axis formatting."""
+    _format_time_axis(ax, timestamps)
 
 def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', num_figures: int, 
                         df_hourly: Optional['pd.DataFrame'] = None) -> List[Tuple['plt.Figure', str]]:
@@ -194,9 +205,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 if use_percent_format:
                     ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
                 
-                # Standardize x-axis date formatting for multi-day charts
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
-                ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+                _format_time_axis(ax, plot_data[time_column])
                 
                 # Rotate x-axis labels for better readability and add padding
                 plt.xticks(rotation=45, ha='right')
@@ -332,9 +341,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 # Format ticks on y-axis to show integers
                 ax1.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
                 
-                # Standardize x-axis date formatting for multi-day charts
-                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
-                ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+                _format_time_axis(ax1, plot_data[time_column])
                 
                 # Adjust layout to prevent label cutoff with more padding
                 plt.tight_layout(pad=2.0)
@@ -556,9 +563,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
             if use_percent_format:
                 ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
             
-            # Standardize x-axis date formatting for multi-day charts
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
-            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            _format_time_axis(ax, plot_data[time_column])
             
             # Rotate x-axis labels for better readability and add padding
             plt.xticks(rotation=45, ha='right')
@@ -764,8 +769,7 @@ def create_phase_skip_plots(
             ax.grid(True, alpha=0.3, linestyle='--')
             ax.set_axisbelow(True)
 
-            # Keep intraday charts readable, but show dates when the plot spans multiple days.
-            _format_phase_skip_time_axis(ax, device_data['TimeStamp'])
+            _format_time_axis(ax, device_data['TimeStamp'])
             plt.xticks(rotation=45, ha='right', fontsize=12)
             ax.tick_params(axis='both', labelsize=12)
 
