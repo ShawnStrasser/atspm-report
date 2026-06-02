@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
 from typing import List, Optional, Tuple
 import pandas as pd
 import warnings
@@ -22,7 +23,13 @@ def _format_time_axis(ax: 'plt.Axes', timestamps: 'pd.Series') -> None:
     if spans_multiple_days and date_only_values:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d'))
     elif spans_multiple_days:
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%d\n%H:%M'))
+        def format_tick(value, position):
+            tick_datetime = mdates.num2date(value)
+            if tick_datetime.hour == 0 and tick_datetime.minute == 0 and tick_datetime.second == 0:
+                return tick_datetime.strftime('%b-%d')
+            return tick_datetime.strftime('%b-%d\n%H:%M')
+
+        ax.xaxis.set_major_formatter(FuncFormatter(format_tick))
     else:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator())

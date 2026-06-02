@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from atspm_report import ReportGenerator
 import atspm_report
 from atspm_report.visualization import create_phase_skip_plots, _format_time_axis
+from atspm_report.clearance_processing import process_clearance_intervals
+from atspm_report.table_generation import prepare_clearance_interval_alerts_table
 
 class TestReportGenerator(unittest.TestCase):
     @classmethod
@@ -92,7 +94,7 @@ class TestReportGenerator(unittest.TestCase):
         alerts = result['alerts']
         
         # Check that all alert types are present
-        for alert_type in ['maxout', 'actuations', 'missing_data', 'pedestrian', 'phase_skips', 'system_outages']:
+        for alert_type in ['maxout', 'actuations', 'missing_data', 'pedestrian', 'phase_skips', 'clearance_intervals', 'system_outages']:
             self.assertIn(alert_type, alerts, f"Missing alert type: {alert_type}")
             actual = alerts[alert_type]
             
@@ -108,6 +110,8 @@ class TestReportGenerator(unittest.TestCase):
                     required_cols = ['DeviceId', 'Phase', 'Date']
                 elif alert_type == 'phase_skips':
                     required_cols = ['DeviceId', 'Phase', 'Date']
+                elif alert_type == 'clearance_intervals':
+                    required_cols = ['DeviceId', 'EventClass', 'EventValue', 'Date']
                 elif alert_type == 'system_outages':
                     required_cols = ['Date', 'Region']
                 else:
@@ -259,6 +263,51 @@ class TestReportGenerator(unittest.TestCase):
         )
         self.assertIn('reports', result)
 
+    def test_6_clearance_intervals_flow_through_generator_history(self):
+        """Clearance interval alerts should be exposed and saved by movement identity."""
+        signal_id = "clearance-signal"
+        signals = pd.DataFrame([
+            {"DeviceId": signal_id, "Name": "Clearance Signal", "Region": "R1"}
+        ])
+        now = datetime.now().replace(microsecond=200000)
+        timeline = pd.DataFrame({
+            "DeviceId": [signal_id] * 4,
+            "StartTime": [now - timedelta(minutes=i) for i in range(4)],
+            "EndTime": [now - timedelta(minutes=i) + timedelta(seconds=3) for i in range(4)],
+            "Duration": [3.5, 3.5, 3.5, 3.3],
+            "IsValid": [True] * 4,
+            "EventClass": ["Yellow"] * 4,
+            "EventValue": [2] * 4,
+        })
+        generator = ReportGenerator({
+            **self.config,
+            "verbosity": 0,
+            "suppress_repeated_alerts": False,
+        })
+
+        with patch("atspm_report.generator.create_device_plots", return_value=[]), \
+             patch("atspm_report.generator.create_phase_skip_plots", return_value=[]), \
+             patch("atspm_report.generator.generate_pdf_report", return_value={}) as pdf_mock:
+            result = generator.generate(
+                signals=signals,
+                timeline=timeline,
+                past_alerts={},
+            )
+
+        clearance_alerts = result['alerts']['clearance_intervals']
+        self.assertEqual(len(clearance_alerts), 1)
+        self.assertEqual(clearance_alerts.iloc[0]['DeviceId'], signal_id)
+        self.assertEqual(clearance_alerts.iloc[0]['EventClass'], "Yellow")
+        self.assertEqual(clearance_alerts.iloc[0]['EventValue'], 2)
+
+        clearance_history = result['updated_past_alerts']['clearance_intervals']
+        self.assertEqual(
+            clearance_history.columns.tolist(),
+            ['DeviceId', 'EventClass', 'EventValue', 'Date']
+        )
+        self.assertEqual(len(clearance_history), 1)
+        self.assertIn('clearance_alerts_df', pdf_mock.call_args.kwargs)
+
 
 class TestPackageMetadata(unittest.TestCase):
     """Test package metadata and configuration."""
@@ -279,6 +328,212 @@ class TestPackageMetadata(unittest.TestCase):
             toml_version,
             f"Version mismatch: __init__.py has '{init_version}' but pyproject.toml has '{toml_version}'"
         )
+
+
+class TestClearanceIntervals(unittest.TestCase):
+    def _timeline(self, durations, event_class="Yellow", event_value=2, device_id="1", valid=None, start=None):
+        start = start or pd.Timestamp("2026-05-26 14:00:00")
+        valid = valid if valid is not None else [True] * len(durations)
+        starts = [start + pd.Timedelta(minutes=i) for i in range(len(durations))]
+        return pd.DataFrame({
+            "DeviceId": [device_id] * len(durations),
+            "StartTime": starts,
+            "EndTime": [ts + pd.Timedelta(seconds=float(duration)) for ts, duration in zip(starts, durations)],
+            "Duration": durations,
+            "IsValid": valid,
+            "EventClass": [event_class] * len(durations),
+            "EventValue": [event_value] * len(durations),
+        })
+
+    def test_hard_minimum_uses_point_one_second_tolerance(self):
+        allowed = self._timeline([3.5, 3.5, 3.5, 3.4])
+        self.assertTrue(process_clearance_intervals(allowed).empty)
+
+        flagged = self._timeline([3.5, 3.5, 3.5, 3.3])
+        alerts = process_clearance_intervals(flagged)
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['ShortCount'], 1)
+        self.assertAlmostEqual(alerts.iloc[0]['RepresentativeShortDuration'], 3.3)
+
+    def test_median_irregularity_flags_more_than_point_one_second_only(self):
+        allowed = self._timeline([4.0, 4.0, 4.0, 4.1])
+        self.assertTrue(process_clearance_intervals(allowed).empty)
+
+        flagged = self._timeline([4.0, 4.0, 4.0, 4.2])
+        alerts = process_clearance_intervals(flagged)
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['IrregularCount'], 1)
+
+    def test_invalid_timeline_rows_are_excluded(self):
+        timeline = self._timeline([3.5, 3.5, 3.0], valid=[True, True, False])
+        self.assertTrue(process_clearance_intervals(timeline).empty)
+
+    def test_clearance_rows_longer_than_25_seconds_are_excluded(self):
+        timeline = self._timeline([3.5, 3.5, 3.5, 30.0])
+        self.assertTrue(process_clearance_intervals(timeline).empty)
+
+    def test_short_clearance_rows_near_invalid_events_are_not_excluded_by_device(self):
+        timeline = self._timeline([3.5, 3.5, 3.5, 3.3])
+        invalid_event = pd.DataFrame([{
+            "DeviceId": "1",
+            "StartTime": pd.Timestamp("2026-05-26 14:03:20"),
+            "EndTime": pd.Timestamp("2026-05-26 14:03:21"),
+            "Duration": 1.0,
+            "IsValid": False,
+            "EventClass": "Green",
+            "EventValue": 2,
+        }])
+
+        alerts = process_clearance_intervals(pd.concat([timeline, invalid_event], ignore_index=True))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['ShortCount'], 1)
+
+        other_device_invalid = invalid_event.copy()
+        other_device_invalid["DeviceId"] = "2"
+        alerts = process_clearance_intervals(pd.concat([timeline, other_device_invalid], ignore_index=True))
+
+        self.assertEqual(len(alerts), 1)
+
+    def test_invalid_event_cushion_seconds_is_configurable(self):
+        timeline = self._timeline([3.5, 3.5, 3.5, 7.0])
+        invalid_event = pd.DataFrame([{
+            "DeviceId": "1",
+            "StartTime": pd.Timestamp("2026-05-26 14:03:45"),
+            "EndTime": pd.Timestamp("2026-05-26 14:03:46"),
+            "Duration": 1.0,
+            "IsValid": False,
+            "EventClass": "Green",
+            "EventValue": 2,
+        }])
+        combined = pd.concat([timeline, invalid_event], ignore_index=True)
+
+        self.assertEqual(len(process_clearance_intervals(combined)), 1)
+        self.assertTrue(
+            process_clearance_intervals(
+                combined,
+                {"clearance_invalid_event_cushion_seconds": 60}
+            ).empty
+        )
+
+    def test_unsorted_overlap_row_at_same_time_as_invalid_phase_rows_is_excluded(self):
+        device_id = "03082"
+        bad_time = pd.Timestamp("2026-05-25 02:53:06.600")
+        rows = [
+            {
+                "DeviceId": device_id,
+                "StartTime": bad_time,
+                "EndTime": bad_time + pd.Timedelta(seconds=24.4),
+                "Duration": 24.4,
+                "IsValid": True,
+                "EventClass": "Overlap Yellow",
+                "EventValue": 8,
+            }
+        ]
+        for minute_offset in range(20):
+            start_time = pd.Timestamp("2026-05-25 02:00:00") + pd.Timedelta(minutes=minute_offset)
+            rows.append({
+                "DeviceId": device_id,
+                "StartTime": start_time,
+                "EndTime": start_time + pd.Timedelta(seconds=3.5),
+                "Duration": 3.5,
+                "IsValid": True,
+                "EventClass": "Overlap Yellow",
+                "EventValue": 8,
+            })
+
+        rows.extend([
+            {
+                "DeviceId": device_id,
+                "StartTime": bad_time,
+                "EndTime": bad_time + pd.Timedelta(seconds=3.5),
+                "Duration": 3.5,
+                "IsValid": False,
+                "EventClass": "Yellow",
+                "EventValue": 4,
+            },
+            {
+                "DeviceId": device_id,
+                "StartTime": bad_time,
+                "EndTime": bad_time + pd.Timedelta(seconds=3.5),
+                "Duration": 3.5,
+                "IsValid": False,
+                "EventClass": "Yellow",
+                "EventValue": 8,
+            },
+        ])
+        timeline = pd.DataFrame(rows)
+
+        self.assertTrue(process_clearance_intervals(timeline).empty)
+
+    def test_overlap_rows_must_behave_like_fixed_clearance(self):
+        fixed = self._timeline([4.0, 4.0, 4.0, 4.3], event_class="Overlap Yellow", event_value=5)
+        variable = self._timeline([4.0] * 9 + [7.0], event_class="Overlap Yellow", event_value=6)
+        alerts = process_clearance_intervals(pd.concat([fixed, variable], ignore_index=True))
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['EventClass'], "Overlap Yellow")
+        self.assertEqual(alerts.iloc[0]['EventValue'], 5)
+
+    def test_representative_irregular_sample_is_farthest_from_median(self):
+        timeline = self._timeline([1.0, 1.0, 1.0, 0.8, 1.4], event_class="Red")
+        alerts = process_clearance_intervals(timeline)
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['IrregularCount'], 2)
+        self.assertAlmostEqual(alerts.iloc[0]['RepresentativeIrregularDuration'], 1.4)
+
+    def test_clearance_table_prioritizes_phases_then_sorts_for_display(self):
+        timestamp = pd.Timestamp("2026-05-26 14:54:33.200")
+        signals = pd.DataFrame([
+            {"DeviceId": "1", "Name": "Signal A", "Region": "R1"},
+            {"DeviceId": "2", "Name": "Signal B", "Region": "R1"},
+            {"DeviceId": "3", "Name": "Signal C", "Region": "R1"},
+        ])
+        alerts = pd.DataFrame([
+            {
+                "DeviceId": "1", "EventClass": "Overlap Red", "EventValue": 5,
+                "Date": timestamp.normalize(), "MedianDuration": 1.0, "SampleCount": 8,
+                "MaxAbsDelta": 3.0, "ShortCount": 0, "IrregularCount": 1, "LongCount": 1,
+                "AvgSignedDeviation": 0.1, "RepresentativeShortDuration": pd.NA,
+                "RepresentativeShortTime": pd.NaT, "RepresentativeIrregularDuration": 4.0,
+                "RepresentativeIrregularTime": timestamp, "RepresentativeLongDuration": 4.0,
+                "RepresentativeLongTime": timestamp,
+            },
+            {
+                "DeviceId": "1", "EventClass": "Yellow", "EventValue": 2,
+                "Date": timestamp.normalize(), "MedianDuration": 3.5, "SampleCount": 18,
+                "MaxAbsDelta": 2.0, "ShortCount": 3, "IrregularCount": 5, "LongCount": 2,
+                "AvgSignedDeviation": -0.2, "RepresentativeShortDuration": 3.1,
+                "RepresentativeShortTime": timestamp, "RepresentativeIrregularDuration": 5.1,
+                "RepresentativeIrregularTime": pd.Timestamp("2026-05-26 14:34:33.200"),
+                "RepresentativeLongDuration": 5.1,
+                "RepresentativeLongTime": pd.Timestamp("2026-05-26 14:34:33.200"),
+            },
+            {
+                "DeviceId": "3", "EventClass": "Yellow", "EventValue": 4,
+                "Date": timestamp.normalize(), "MedianDuration": 3.5, "SampleCount": 12,
+                "MaxAbsDelta": 1.0, "ShortCount": 1, "IrregularCount": 1, "LongCount": 0,
+                "AvgSignedDeviation": 0.0, "RepresentativeShortDuration": 3.2,
+                "RepresentativeShortTime": timestamp, "RepresentativeIrregularDuration": 4.5,
+                "RepresentativeIrregularTime": timestamp, "RepresentativeLongDuration": pd.NA,
+                "RepresentativeLongTime": pd.NaT,
+            },
+        ])
+
+        table, total = prepare_clearance_interval_alerts_table(alerts, signals, region="R1", max_rows=2)
+
+        self.assertEqual(total, 3)
+        self.assertEqual(len(table), 2)
+        self.assertEqual(table.columns.tolist(), ["Signal", "Movement", "Median", "Details"])
+        self.assertEqual(table['Movement'].tolist(), ["Ph 2 Yellow", "Ph 4 Yellow"])
+        self.assertNotIn("Latest", table.columns)
+        self.assertEqual(table.iloc[0]['Median'], "3.5s")
+        self.assertIn("Of 18 samples, 3 were short (3.1s at 5/26/26 2:54:33.2 PM)", table.iloc[0]['Details'])
+        self.assertIn("2 were long (5.1s at 5/26/26 2:34:33.2 PM)", table.iloc[0]['Details'])
+        self.assertNotIn("irregular", table.iloc[0]['Details'])
+        self.assertNotIn("Ovlp 5 Red", table['Movement'].tolist())
 
 
 class TestPhaseSkipVisualization(unittest.TestCase):
@@ -337,10 +592,13 @@ class TestPhaseSkipVisualization(unittest.TestCase):
         self.assertEqual(len(figures), 2)
         axis = figures[0][0].axes[0]
         formatter = axis.xaxis.get_major_formatter()
-        formatted_tick = formatter.format_data_short(mdates.date2num(pd.Timestamp("2026-02-02 00:00:00")))
+        midnight_tick = formatter(mdates.date2num(pd.Timestamp("2026-02-02 00:00:00")), None)
+        noon_tick = formatter(mdates.date2num(pd.Timestamp("2026-02-02 12:00:00")), None)
 
-        self.assertRegex(formatted_tick, r"[A-Za-z]{3}-\d{2}")
-        self.assertIn("00:00", formatted_tick)
+        self.assertRegex(midnight_tick, r"[A-Za-z]{3}-\d{2}")
+        self.assertNotIn("00:00", midnight_tick)
+        self.assertRegex(noon_tick, r"[A-Za-z]{3}-\d{2}")
+        self.assertIn("12:00", noon_tick)
         self.assertIn("2026-02-01 to 2026-02-03", axis.get_title())
         self.assertEqual(axis.title.get_fontsize(), 14)
 

@@ -19,6 +19,7 @@ from .statistical_analysis import cusum, alert
 from .visualization import create_device_plots, create_phase_skip_plots
 from .report_generation import generate_pdf_report
 from .phase_skip_processing import process_phase_wait_data
+from .clearance_processing import process_clearance_intervals
 from .utils import log_message
 
 
@@ -77,6 +78,7 @@ ALERT_CONFIG = {
     'missing_data': {'id_cols': ['DeviceId'], 'file_suffix': 'missing_data_alerts'},
     'pedestrian': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'pedestrian_alerts'},
     'phase_skips': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'phase_skips_alerts'},
+    'clearance_intervals': {'id_cols': ['DeviceId', 'EventClass', 'EventValue'], 'file_suffix': 'clearance_interval_alerts'},
     'system_outages': {'id_cols': ['Region'], 'file_suffix': 'system_outages_alerts'}
 }
 
@@ -103,6 +105,11 @@ class ReportGenerator:
             - verbosity (int): 0=silent, 1=info, 2=debug. Default: 1
             - phase_skip_alert_threshold (int): Min skips to trigger alert. Default: 1
             - phase_skip_retention_days (int): Days to retain phase skip data. Default: 14
+            - max_table_rows (int): Maximum rows to show in each report table. Default: 10
+            - clearance_yellow_min_seconds (float): Minimum yellow clearance time. Default: 3.5
+            - clearance_red_min_seconds (float): Minimum red clearance time. Default: 0.5
+            - clearance_tolerance_seconds (float): Clearance timing tolerance. Default: 0.1
+            - clearance_invalid_event_cushion_seconds (float): Seconds around invalid timeline events to exclude. Default: 30
             - joke_index (int): Specific joke index. Default: None (auto-cycle by date)
             - custom_logo_path (str): Path to custom logo. Default: None (use ODOT logo)
         """
@@ -120,6 +127,14 @@ class ReportGenerator:
             'verbosity': 1,
             'phase_skip_alert_threshold': 1,
             'phase_skip_retention_days': 14,
+            'max_table_rows': 10,
+            'clearance_yellow_min_seconds': 3.5,
+            'clearance_red_min_seconds': 0.5,
+            'clearance_tolerance_seconds': 0.1,
+            'clearance_invalid_event_cushion_seconds': 30,
+            'overlap_fixed_median_max_seconds': 6.0,
+            'overlap_fixed_within_seconds': 2.0,
+            'overlap_fixed_within_ratio': 0.95,
             'joke_index': None,
             'custom_logo_path': None,
         }
@@ -134,6 +149,7 @@ class ReportGenerator:
         pedestrian: Optional[Union[pd.DataFrame, ir.Table]] = None,
         phase_wait: Optional[Union[pd.DataFrame, ir.Table]] = None,
         coordination_agg: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        timeline: Optional[Union[pd.DataFrame, ir.Table]] = None,
         past_alerts: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> dict:
         """
@@ -155,16 +171,18 @@ class ReportGenerator:
             coordination_agg: Coordination aggregation data with columns:
                 TimeStamp, DeviceId, ActualCycleLength
                 (15-minute bin aggregated data for cycle length plotting)
+            timeline: ATSPM timeline data with columns:
+                DeviceId, StartTime, EndTime, Duration, IsValid, EventClass, EventValue
             past_alerts: Dict of alert_type -> DataFrame for suppression.
                 Keys: 'maxout', 'actuations', 'missing_data', 'pedestrian', 
-                      'phase_skips', 'system_outages'
+                      'phase_skips', 'clearance_intervals', 'system_outages'
         
         Returns:
             dict with keys:
                 - 'reports': Dict[str, BytesIO] - region name -> PDF bytes (empty if no alerts)
                 - 'alerts': Dict[str, pd.DataFrame] - alert type -> alert DataFrame
                     Keys: 'maxout', 'actuations', 'missing_data', 'pedestrian',
-                          'phase_skips', 'system_outages'
+                          'phase_skips', 'clearance_intervals', 'system_outages'
                 - 'updated_past_alerts': Dict[str, pd.DataFrame] - for next run's suppression
                 - 'hourly_data': Dict[str, pd.DataFrame] - intermediate hourly aggregates
                     Keys: 'maxout_hourly', 'detector_hourly', 'ped_hourly'
@@ -181,6 +199,7 @@ class ReportGenerator:
         pedestrian = _normalize_deviceid(pedestrian)
         phase_wait = _normalize_deviceid(phase_wait)
         coordination_agg = _normalize_deviceid(coordination_agg)
+        timeline = _normalize_deviceid(timeline)
         
         # Convert signals to pandas (needed for downstream operations)
         signals = _to_pandas(signals)
@@ -337,6 +356,15 @@ class ReportGenerator:
             self.phase_skip_all_rows = pd.DataFrame()
             self.phase_skip_summary = pd.DataFrame()
             self.cycle_length_data = pd.DataFrame()
+
+        # Process clearance interval data if provided
+        if not _is_empty(timeline):
+            log_message("Processing clearance interval data...", 1, verbosity)
+            clearance_alerts = process_clearance_intervals(timeline, self.config)
+            new_alerts['clearance_intervals'] = clearance_alerts
+            log_message(f"Processed clearance interval data. Shape: {clearance_alerts.shape}", 1, verbosity)
+        else:
+            new_alerts['clearance_intervals'] = pd.DataFrame()
         
         # Filter new alerts to only recent ones (alert_flagging_days)
         log_message(f"Filtering newly generated alerts to the last {self.config['alert_flagging_days']} days...", 1, verbosity)
@@ -435,6 +463,10 @@ class ReportGenerator:
             phase_skip_figures=phase_skip_figures,
             phase_skip_alerts_df=final_alerts['phase_skips'],
             phase_skip_threshold=self.config['phase_skip_alert_threshold'],
+            clearance_alerts_df=final_alerts['clearance_intervals'],
+            clearance_yellow_min_seconds=self.config['clearance_yellow_min_seconds'],
+            clearance_red_min_seconds=self.config['clearance_red_min_seconds'],
+            max_table_rows=self.config['max_table_rows'],
             joke_index=self.config['joke_index'],
             custom_logo_path=self.config['custom_logo_path']
         )

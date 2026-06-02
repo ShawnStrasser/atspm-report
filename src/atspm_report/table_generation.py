@@ -366,7 +366,11 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
     
     # Add rows
     for _, row in df_display.iterrows():
-        data.append(row.tolist())
+        values = row.tolist()
+        if 'Details' in header:
+            details_index = header.index('Details')
+            values[details_index] = Paragraph(str(values[details_index]), styles['Normal'])
+        data.append(values)
       # Create the table
     if include_trend:
         colWidths = [None] * (len(header) - 1) + [1.2*inch]  # Make the Trend column wider
@@ -630,3 +634,121 @@ def prepare_system_outages_table(system_outages_df, max_rows=10):
         result = result.head(max_rows)
     
     return result, total_outages_count
+
+
+def prepare_clearance_interval_alerts_table(clearance_alerts_df, signals_df, region=None, max_rows=10):
+    """
+    Prepare clearance interval alerts with compact details text.
+
+    Rows are filtered to the top N largest max deltas, then displayed by signal and
+    movement order so the table is stable and easy to scan.
+    """
+    if clearance_alerts_df is None or clearance_alerts_df.empty:
+        return pd.DataFrame(), 0
+
+    df = clearance_alerts_df.copy()
+    df['DeviceId'] = df['DeviceId'].astype(str)
+
+    signals_df = signals_df.copy()
+    signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
+
+    result = df.merge(
+        signals_df[['DeviceId', 'Name', 'Region']],
+        on='DeviceId',
+        how='left'
+    )
+    result = result.dropna(subset=['Name'])
+    if result.empty:
+        return pd.DataFrame(), 0
+
+    if region and region != "All Regions":
+        result = result[result['Region'] == region]
+        if result.empty:
+            return pd.DataFrame(), 0
+
+    total_alerts_count = len(result)
+
+    result['Signal'] = result['Name']
+    result['Movement'] = result.apply(_format_clearance_movement, axis=1)
+    result['Median'] = result['MedianDuration'].apply(lambda value: f"{float(value):.1f}s")
+    result['Details'] = result.apply(_format_clearance_details, axis=1)
+    result['MovementTypeSort'] = result['EventClass'].apply(lambda value: 1 if str(value).startswith('Overlap') else 0)
+    result['MovementNumberSort'] = pd.to_numeric(result['EventValue'], errors='coerce').fillna(0).astype(int)
+    result['MovementStateSort'] = result['EventClass'].apply(lambda value: 0 if 'Yellow' in str(value) else 1)
+    result['MaxAbsDelta'] = pd.to_numeric(result['MaxAbsDelta'], errors='coerce').fillna(0)
+
+    if max_rows > 0 and len(result) > max_rows:
+        phase_rows = result[result['MovementTypeSort'] == 0].sort_values('MaxAbsDelta', ascending=False)
+        overlap_rows = result[result['MovementTypeSort'] == 1].sort_values('MaxAbsDelta', ascending=False)
+
+        selected_parts = []
+        if not phase_rows.empty:
+            selected_parts.append(phase_rows.head(max_rows))
+        selected_count = sum(len(part) for part in selected_parts)
+        remaining_rows = max_rows - selected_count
+        if remaining_rows > 0 and not overlap_rows.empty:
+            selected_parts.append(overlap_rows.head(remaining_rows))
+
+        result = pd.concat(selected_parts, ignore_index=True) if selected_parts else result.head(0)
+
+    result = result.sort_values(
+        by=['Signal', 'MovementTypeSort', 'MovementNumberSort', 'MovementStateSort'],
+        ascending=[True, True, True, True]
+    )
+
+    return result[['Signal', 'Movement', 'Median', 'Details']], total_alerts_count
+
+
+def _format_clearance_movement(row):
+    event_class = str(row['EventClass'])
+    prefix = 'Ovlp' if event_class.startswith('Overlap') else 'Ph'
+    state = 'Yellow' if 'Yellow' in event_class else 'Red'
+    return f"{prefix} {int(row['EventValue'])} {state}"
+
+
+def _format_clearance_details(row):
+    sample_count = int(row['SampleCount'])
+    details = [f"Of {sample_count} samples"]
+
+    short_count = int(row.get('ShortCount', 0) or 0)
+    long_count = int(row.get('LongCount', 0) or 0)
+    clauses = []
+    if short_count > 0:
+        clauses.append(
+            f"{short_count} {_were(short_count)} short "
+            f"({_format_seconds(row.get('RepresentativeShortDuration'))} at "
+            f"{_format_timestamp(row.get('RepresentativeShortTime'))})"
+        )
+    if long_count > 0:
+        clauses.append(
+            f"{long_count} {_were(long_count)} long "
+            f"({_format_seconds(row.get('RepresentativeLongDuration'))} at "
+            f"{_format_timestamp(row.get('RepresentativeLongTime'))})"
+        )
+
+    if clauses:
+        return f"{details[0]}, " + ", ".join(clauses)
+    return details[0]
+
+
+def _were(count):
+    return "was" if int(count) == 1 else "were"
+
+
+def _format_seconds(value):
+    if pd.isna(value):
+        return "n/a"
+    return f"{float(value):.1f}s"
+
+
+def _format_timestamp(value):
+    timestamp = pd.to_datetime(value, errors='coerce')
+    if pd.isna(timestamp):
+        return "n/a"
+    hour = timestamp.hour % 12 or 12
+    am_pm = "AM" if timestamp.hour < 12 else "PM"
+    tenths = int(timestamp.microsecond / 100000)
+    return (
+        f"{timestamp.month}/{timestamp.day}/{timestamp.year % 100:02d} "
+        f"{hour}:{timestamp.minute:02d}:{timestamp.second:02d}.{tenths} {am_pm}"
+    )

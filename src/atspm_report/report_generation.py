@@ -21,6 +21,7 @@ from .table_generation import (
     prepare_ped_alerts_table,
     prepare_missing_data_alerts_table,
     prepare_system_outages_table,
+    prepare_clearance_interval_alerts_table,
     create_reportlab_table
 )
 from .utils import log_message
@@ -274,6 +275,9 @@ def generate_pdf_report(
         phase_skip_figures: List[tuple[plt.Figure, str]] = None,
         phase_skip_alerts_df: Optional[pd.DataFrame] = None,
         phase_skip_threshold: Optional[float] = None,
+        clearance_alerts_df: Optional[pd.DataFrame] = None,
+        clearance_yellow_min_seconds: float = 3.5,
+        clearance_red_min_seconds: float = 0.5,
         joke_index: int = None,
         custom_logo_path: str = None
 ) -> Dict[str, BytesIO]:
@@ -298,6 +302,9 @@ def generate_pdf_report(
         phase_skip_figures: List of (figure, region) tuples for Phase Skip charts
         phase_skip_alerts_df: DataFrame with Phase Skip alerts after suppression
         phase_skip_threshold: Minimum per-row skips to display in the Phase Skip table
+        clearance_alerts_df: DataFrame with clearance interval alerts after suppression
+        clearance_yellow_min_seconds: Yellow clearance threshold used in report text
+        clearance_red_min_seconds: Red clearance threshold used in report text
         joke_index: Specific joke index to use (0-based), None for date-based cycling
         custom_logo_path: Path to custom logo file, None for default ODOT logo
         
@@ -331,6 +338,14 @@ def generate_pdf_report(
             .merge(signals_df[['DeviceId', 'Region']], on='DeviceId', how='left')
         )
         regions.update(alert_region_lookup['Region'].dropna().tolist())
+
+    if clearance_alerts_df is not None and not clearance_alerts_df.empty and signals_df is not None:
+        clearance_region_lookup = (
+            clearance_alerts_df[['DeviceId']]
+            .drop_duplicates()
+            .merge(signals_df[['DeviceId', 'Region']], on='DeviceId', how='left')
+        )
+        regions.update(clearance_region_lookup['Region'].dropna().tolist())
 
     if not regions and signals_df is not None:
         regions.update(signals_df['Region'].unique().tolist())
@@ -429,6 +444,41 @@ def generate_pdf_report(
         """
         content.append(Paragraph(intro_text, styles['Normal']))
         content.append(Spacer(1, 0.2*inch))
+
+        if clearance_alerts_df is not None and not clearance_alerts_df.empty and signals_df is not None:
+            region_clearance_rows, total_clearance_alerts = prepare_clearance_interval_alerts_table(
+                clearance_alerts_df,
+                signals_df,
+                region=region,
+                max_rows=max_table_rows
+            )
+        else:
+            region_clearance_rows = pd.DataFrame()
+            total_clearance_alerts = 0
+
+        if region_clearance_rows is not None and not region_clearance_rows.empty:
+            content.append(Paragraph("Clearance Interval Alerts", styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+
+            explanation = (
+                "Clearance interval alerts identify irregular yellow or red clearance intervals, "
+                f"or any that were shorter than {clearance_yellow_min_seconds:g}s for yellow "
+                f"and {clearance_red_min_seconds:g}s for red, which are the configured thresholds "
+                "for this report."
+            )
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+
+            table_content = create_reportlab_table(
+                region_clearance_rows,
+                "Clearance Interval Alerts",
+                styles,
+                total_count=total_clearance_alerts,
+                max_rows=max_table_rows,
+                include_trend=False
+            )
+            content.extend(table_content)
+            content.append(Spacer(1, 0.3*inch))
         
         # Joke section
         content.append(Paragraph(joke_title, styles['SectionHeading']))
@@ -646,6 +696,7 @@ def generate_pdf_report(
             region_missing_data_figures,
             region_phase_skip_figures,
             not region_phase_skip_rows.empty,
+            not region_clearance_rows.empty,
             not region_system_outages.empty
         ])
         
