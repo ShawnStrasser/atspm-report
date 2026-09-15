@@ -83,8 +83,31 @@ def cusum(df, k_value=0.5, forgetfulness=2):
 
     return result
 
-def alert(table):
-    """Generate alerts based on CUSUM analysis results"""
+# Phase termination alerting thresholds. A day is flagged only when all four are
+# exceeded, so raising any one of them makes the check less sensitive.
+MAXOUT_ALERT_DEFAULTS = {
+    'maxout_cusum_threshold': 0.25,      # cumulative sum of the shift, over a 7-day window
+    'maxout_zscore_threshold': 4.0,      # standard deviations above the phase's 21-day mean
+    'maxout_percent_threshold': 0.2,     # share of terminations that maxed out that day
+    'maxout_min_services': 30,           # ignore phases that barely ran
+}
+
+# Days back from the newest data an alert may have occurred and still be
+# reported. 0 means it must have happened on the most recent day: an issue that
+# came and went earlier in the week is not a live problem.
+DEFAULT_ALERT_RECENCY_DAYS = 0
+
+
+def alert(table, maxout_thresholds: dict = None,
+          recency_days: int = DEFAULT_ALERT_RECENCY_DAYS):
+    """Generate alerts based on CUSUM analysis results.
+
+    maxout_thresholds overrides MAXOUT_ALERT_DEFAULTS for phase terminations; the
+    detector and missing-data conditions are unaffected. recency_days is how far
+    back from the newest data an alert may have occurred and still be reported.
+    """
+    limits = {**MAXOUT_ALERT_DEFAULTS, **(maxout_thresholds or {})}
+
     if 'Percent MaxOut' in table.columns:
         cusum_column_name = 'CUSUM_Percent MaxOut'
         column = 'Percent MaxOut'
@@ -109,10 +132,10 @@ def alert(table):
         # Include Services in alert conditions for Percent MaxOut
         result = result.mutate(
             Alert=(
-                (result[cusum_column_name] > 0.25) &
-                (result['Services'] > 30) &
-                (result['z_score'] > 4) &
-                (result[column] > 0.2)
+                (result[cusum_column_name] > limits['maxout_cusum_threshold']) &
+                (result['Services'] > limits['maxout_min_services']) &
+                (result['z_score'] > limits['maxout_zscore_threshold']) &
+                (result[column] > limits['maxout_percent_threshold'])
             ).cast('int32')  # Convert boolean to 0/1
         )
     elif 'PercentAnomalous' in table.columns:
@@ -139,12 +162,12 @@ def alert(table):
         days_from_max=result['Date'].delta(result['_MaxDate'], unit='days').abs(),
     )
 
-    # Find DeviceId/Group pairs that have alerts within the last week
+    # Find DeviceId/Group pairs that alerted recently enough to report
     if group_column:
         alert_pairs = (
             result.filter(
                 (result['Alert'] == 1) &
-                (result['days_from_max'] <= 6)  # Within last week (0 to 6 days)
+                (result['days_from_max'] <= recency_days)
             )
             .select('DeviceId', group_column)
             .distinct()
@@ -160,7 +183,7 @@ def alert(table):
         alert_devices = (
             result.filter(
                 (result['Alert'] == 1) &
-                (result['days_from_max'] <= 6)  # Within last week (0 to 6 days)
+                (result['days_from_max'] <= recency_days)
             )
             .select('DeviceId')
             .distinct()

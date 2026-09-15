@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atspm-report"
-version = "0.2.2"
+version = "2.0.0"
 authors = [
   { name="Shawn Strasser", email="shawn.strasser@odot.oregon.gov" },
 ]
@@ -19,7 +19,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "pandas>=1.5.0",
+    'duckdb>=1.2.0',
+    "pandas>=2.2.0",
     "ibis-framework[duckdb]>=11.0.0,<12.0.0",
     "reportlab>=4.0.0",
     "matplotlib>=3.5.0",

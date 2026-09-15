@@ -5,8 +5,59 @@ from matplotlib.ticker import FuncFormatter
 from typing import List, Optional, Tuple
 import pandas as pd
 import warnings
+from math import ceil
 warnings.filterwarnings('ignore', message='More than.*figures have been opened') # default is 20 and thats too low
 
+
+
+# Vertical room a one-row legend needs between the axes and the title, in points,
+# plus what each extra wrapped row adds.
+_LEGEND_TITLE_PAD = 34
+_LEGEND_ROW_HEIGHT = 16
+_LEGEND_MAX_COLUMNS = 4
+
+
+def _legend_above(ax, handles=None, labels=None, ncol=None):
+    """Put the legend above the plot, under the title, rather than over the data.
+
+    Anchored inside the axes it routinely sat over the first hours of the series,
+    which on these charts is exactly where the interesting peaks tend to be. The
+    title is pushed up to make room, since otherwise the two land on each other.
+    """
+    if handles is None:
+        handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        return None
+
+    # Cap the columns: a legend wider than the axes makes the layout engine shrink
+    # the plot to fit it, which turned busy charts into a thin strip. Wrapping to a
+    # second row costs a little height instead.
+    if ncol is None:
+        ncol = min(len(handles), _LEGEND_MAX_COLUMNS)
+    rows = ceil(len(handles) / ncol)
+
+    legend = ax.legend(
+        handles, labels,
+        frameon=False,
+        loc='lower left',
+        bbox_to_anchor=(0, 1.01),
+        borderaxespad=0,
+        ncol=ncol,
+        fontsize=11,
+        handletextpad=0.5,
+        columnspacing=1.4,
+    )
+
+    # The title has to clear however many rows the legend ended up using.
+    title_text = ax.get_title()
+    if title_text:
+        ax.set_title(
+            title_text,
+            pad=_LEGEND_TITLE_PAD + (rows - 1) * _LEGEND_ROW_HEIGHT,
+            fontweight=ax.title.get_fontweight(),
+            fontsize=ax.title.get_fontsize(),
+        )
+    return legend
 
 def _format_time_axis(ax: 'plt.Axes', timestamps: 'pd.Series') -> None:
     """Format time axes consistently across daily, intraday, and multi-day charts."""
@@ -195,15 +246,14 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 
                 # Customize the plot with improved styling
                 ax.set_title(f'{time_granularity} {plot_title} - {region}',
-                            pad=20, fontweight='bold')
+                            pad=_LEGEND_TITLE_PAD, fontweight='bold')
                 
                 ax.set_ylabel(y_label, fontweight='bold')
                 ax.grid(True, alpha=0.3, linestyle='--')
                 
                 # Add legend
-                ax.legend(frameon=True, fancybox=True, framealpha=0.9, 
-                         loc='upper left', bbox_to_anchor=(0.01, 1))
-                
+                _legend_above(ax)
+
                 # Set fixed y-axis limits if specified
                 if fixed_y_limits:
                     ax.set_ylim(fixed_y_limits)
@@ -327,13 +377,13 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                 
                 # Customize the plot with improved styling
                 ax1.set_title(f'Hourly {plot_title}\n{name}',
-                              pad=20, fontweight='bold')
+                              pad=_LEGEND_TITLE_PAD, fontweight='bold')
                 
                 ax1.grid(True, alpha=0.3, linestyle='--')
                 
                 # Add the combined legend
-                ax1.legend(handles=legend_elements, frameon=True, fancybox=True, framealpha=0.9,
-                           loc='upper left', bbox_to_anchor=(0.01, 1))
+                _legend_above(ax1, handles=legend_elements,
+                              labels=[h.get_label() for h in legend_elements])
                 
                 # Rotate x-axis labels for better readability and add padding
                 plt.xticks(rotation=45, ha='right')
@@ -455,8 +505,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
                         other_detector_lines[0].set_label("Other Detectors")
                     
                     # Add the legend
-                    ax.legend(frameon=True, fancybox=True, framealpha=0.9, 
-                              loc='upper left', bbox_to_anchor=(0.01, 1))
+                    _legend_above(ax)
                       # Add a note about forecasts below the plot
                     if 'Forecast' in plot_data.columns:
                         fig.text(0.5, 0.01, 'Note: Dotted lines represent forecasted values from historical data', 
@@ -551,7 +600,7 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
             
             # Customize the plot with improved styling
             ax.set_title(f'{time_granularity} {plot_title}\n{name}',
-                        pad=20, fontweight='bold')
+                        pad=_LEGEND_TITLE_PAD, fontweight='bold')
             
             ax.set_ylabel(y_label, fontweight='bold')
             ax.grid(True, alpha=0.3, linestyle='--')
@@ -559,9 +608,8 @@ def create_device_plots(df_daily: 'pd.DataFrame', signals_df: 'pd.DataFrame', nu
             # Always show legend for phase termination and detector health charts
             # Moved legend to left side
             if group_column:
-                ax.legend(frameon=True, fancybox=True, framealpha=0.9, 
-                         loc='upper left', bbox_to_anchor=(0.01, 1))
-            
+                _legend_above(ax)
+
             # Set fixed y-axis limits if specified
             if fixed_y_limits:
                 ax.set_ylim(fixed_y_limits)
@@ -605,18 +653,24 @@ def create_phase_skip_plots(
     signals_df: 'pd.DataFrame',
     device_rankings_df: 'pd.DataFrame',
     num_figures: int,
-    cycle_length_df: Optional['pd.DataFrame'] = None
+    cycle_length_df: Optional['pd.DataFrame'] = None,
+    skip_multiplier: float = 1.5,
+    assumed_cycle_length: float = 140.0,
+    days_plotted: Optional[int] = None
 ) -> List[Tuple['plt.Figure', str]]:
     """Generate per-device Phase Skip (Phase Wait Time) plots with styling identical to the main device charts.
-    
+
     Args:
         phase_waits_df: DataFrame with columns DeviceId, TimeStamp, Phase, AvgPhaseWait, MaxPhaseWait, TotalSkips
         signals_df: DataFrame with columns DeviceId, Name, Region
         device_rankings_df: DataFrame with columns DeviceId, TotalSkips for ranking
         num_figures: Number of figures to generate per region
         cycle_length_df: Optional DataFrame with columns DeviceId, TimeStamp, CycleLength
-                        for plotting cycle length as a step function (from coordination_agg)
-    
+                        and optionally IsAssumed, from coordination_agg
+        skip_multiplier: Multiple of the cycle length a wait must exceed to count as a skip
+        assumed_cycle_length: Cycle length the skip test falls back to when the signal ran free
+        days_plotted: Trailing days of history to draw; None keeps everything supplied
+
     Returns:
         List of tuples containing (matplotlib figure, region)
     """
@@ -636,6 +690,22 @@ def create_phase_skip_plots(
         'ytick.labelsize': 12,
         'legend.fontsize': 12
     })
+
+    # A new alert is about what just happened, so its chart shows the day it
+    # happened on. An ongoing one is about persistence, so it gets the week.
+    if days_plotted is not None and not phase_waits_df.empty:
+        phase_waits_df = phase_waits_df.copy()
+        phase_waits_df['TimeStamp'] = pd.to_datetime(phase_waits_df['TimeStamp'])
+        latest = phase_waits_df['TimeStamp'].max()
+        if pd.notna(latest):
+            window_start = latest.normalize() - pd.Timedelta(days=days_plotted - 1)
+            phase_waits_df = phase_waits_df[phase_waits_df['TimeStamp'] >= window_start]
+            if cycle_length_df is not None and not cycle_length_df.empty:
+                cycle_length_df = cycle_length_df.copy()
+                cycle_length_df['TimeStamp'] = pd.to_datetime(cycle_length_df['TimeStamp'])
+                cycle_length_df = cycle_length_df[cycle_length_df['TimeStamp'] >= window_start]
+        if phase_waits_df.empty:
+            return []
 
     rankings = device_rankings_df.copy()
     rankings['DeviceId'] = rankings['DeviceId'].astype(str)
@@ -729,12 +799,14 @@ def create_phase_skip_plots(
                     zorder=5
                 )
 
-            # Plot cycle length as a step function if data is available
+            # Cycle length runs on top of the phase traces so it stays readable,
+            # and every wait that crossed the skip threshold gets a marker. The
+            # threshold itself is not drawn: the markers say which points crossed
+            # it without adding another line to an already busy chart.
             if cycle_length_df is not None and not cycle_length_df.empty:
                 device_cycle_data = cycle_length_df[cycle_length_df['DeviceId'] == device_id].copy()
                 if not device_cycle_data.empty:
                     device_cycle_data = device_cycle_data.sort_values('TimeStamp')
-                    # Use step function with 'post' to step up/down at the exact time of change
                     ax.step(
                         device_cycle_data['TimeStamp'],
                         device_cycle_data['CycleLength'],
@@ -742,8 +814,32 @@ def create_phase_skip_plots(
                         color='#4d4d4d',
                         linestyle='--',
                         linewidth=1.5,
-                        zorder=2,
+                        zorder=10,
                         label='Cycle Length'
+                    )
+
+            # Mark the bins the detector actually counted a skip in. Recomputing
+            # the threshold here would only approximate it: the detector tests each
+            # wait event against the cycle lengths at its own start and end, while
+            # MaxPhaseWait is a bin aggregate, so the two disagree on exactly the
+            # marginal cases that make up most single-skip alerts. TotalSkips is
+            # the detector's own answer, so the markers cannot drift from it.
+            if 'TotalSkips' in device_data.columns:
+                for phase_value in alert_phases:
+                    data = device_data[device_data['Phase'] == phase_value]
+                    if data.empty:
+                        continue
+                    data = data.sort_values('TimeStamp')
+                    skipped = pd.to_numeric(data['TotalSkips'], errors='coerce').fillna(0) > 0
+                    if not skipped.any():
+                        continue
+                    ax.scatter(
+                        pd.to_datetime(data.loc[skipped, 'TimeStamp']).values,
+                        data.loc[skipped, 'MaxPhaseWait'].values,
+                        s=14,
+                        color=phase_colors.get(phase_value, colors[0]),
+                        zorder=11,
+                        label='_nolegend_',
                     )
 
             signal_label = device_row.get('Name') or device_id
@@ -765,7 +861,7 @@ def create_phase_skip_plots(
             # Title and labels with bold, same padding and font sizes
             ax.set_title(
                 f"Max Phase Wait Time (15-minute bins)\n{signal_label} - {date_str}",
-                pad=20,
+                pad=_LEGEND_TITLE_PAD,
                 fontweight='bold',
                 fontsize=title_fontsize
             )
@@ -781,14 +877,7 @@ def create_phase_skip_plots(
             ax.tick_params(axis='both', labelsize=12)
 
             # Legend placed exactly like the other charts
-            ax.legend(
-                frameon=True,
-                fancybox=True,
-                framealpha=0.9,
-                loc='upper left',
-                bbox_to_anchor=(0.01, 1),
-                ncol=2
-            )
+            _legend_above(ax)
 
             # Thicker spines for consistent look
             for spine in ax.spines.values():

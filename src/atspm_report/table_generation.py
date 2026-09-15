@@ -7,6 +7,52 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Table, TableStyle, Paragraph, Image, Spacer
 from reportlab.lib.units import inch
+from reportlab.pdfbase.pdfmetrics import stringWidth
+
+# Ongoing-issue rows arrive carrying the date their current run of repeats started.
+# Every prepare_* function passes that column through untouched and renders it as
+# the display column below, so a table looks exactly as it does today unless the
+# caller supplied ongoing rows.
+ONGOING_SINCE_COLUMN = 'OngoingSince'
+ONGOING_DISPLAY_COLUMN = 'Ongoing'
+
+# Hours per point in the pedestrian sparkline. The underlying data is hourly,
+# which is 168 points across the seven days the column covers - far too fine to
+# read at that size.
+PED_SPARKLINE_BUCKET_HOURS = 4
+
+
+def _format_ongoing_since(value):
+    """Render an ongoing-since date as 'M/D/YY (Nd)'."""
+    timestamp = pd.to_datetime(value, errors='coerce')
+    if pd.isna(timestamp):
+        return ''
+    days = (pd.Timestamp.today().normalize() - timestamp.normalize()).days
+    return f"{timestamp.month}/{timestamp.day}/{timestamp:%y} ({days}d)"
+
+
+def _add_ongoing_column(result, output_columns):
+    """Append the formatted ongoing column when the rows carry an ongoing date."""
+    if ONGOING_SINCE_COLUMN not in result.columns:
+        return result, output_columns
+    result = result.copy()
+    result[ONGOING_DISPLAY_COLUMN] = result[ONGOING_SINCE_COLUMN].apply(_format_ongoing_since)
+    return result, list(output_columns) + [ONGOING_DISPLAY_COLUMN]
+
+
+def _carry_ongoing_column(source_columns, columns):
+    """Add the ongoing date to a column subset when the source frame has one."""
+    if ONGOING_SINCE_COLUMN in source_columns:
+        return list(columns) + [ONGOING_SINCE_COLUMN]
+    return list(columns)
+
+
+def _ongoing_aggregation(source_columns):
+    """Aggregation kwargs that keep the longest-running ongoing date for a group."""
+    if ONGOING_SINCE_COLUMN in source_columns:
+        return {ONGOING_SINCE_COLUMN: (ONGOING_SINCE_COLUMN, 'min')}
+    return {}
+
 
 def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10):
     """
@@ -37,8 +83,10 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10)
         
     # Merge with signals dataframe to get names
     result = pd.merge(
-        alert_rows[['DeviceId', 'Phase', 'Date', 'Alert', 'Percent MaxOut']],
-        signals_df[['DeviceId', 'Name', 'Region']], # Added Region for consistency 
+        alert_rows[_carry_ongoing_column(
+            alert_rows.columns, ['DeviceId', 'Phase', 'Date', 'Alert', 'Percent MaxOut']
+        )],
+        signals_df[['DeviceId', 'Name', 'Region']], # Added Region for consistency
         on='DeviceId',
         how='left'
     )
@@ -80,8 +128,11 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10)
     )
     
     # Select and order columns
-    result = result[['Signal', 'Phase', 'Date', 'MaxOut %', 'Sparkline_Data']]
-    
+    result, output_columns = _add_ongoing_column(
+        result, ['Signal', 'Phase', 'Date', 'MaxOut %', 'Sparkline_Data']
+    )
+    result = result[output_columns]
+
     # Sort by MaxOut % in descending order, then by Signal, Phase
     result = result.sort_values(by=['MaxOut %', 'Signal', 'Phase'], ascending=[False, True, True])
     
@@ -147,11 +198,14 @@ def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, al
     result = result.rename(columns={'Name': 'Signal'})
     
     # Group by Signal and Date, aggregating phases and summing skips
+    # A Signal/Date row can cover several phases, so the group inherits the
+    # earliest of their ongoing dates - the longest-running of the bunch.
     aggregated = (
         result.groupby(['Signal', 'Date'], as_index=False)
         .agg(
             Phases=('Phase', lambda x: ', '.join(sorted(set(str(p) for p in x)))),
-            TotalSkips=('TotalSkips', 'sum')
+            TotalSkips=('TotalSkips', 'sum'),
+            **_ongoing_aggregation(result.columns)
         )
     )
     
@@ -167,7 +221,10 @@ def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, al
     
     # Rename and select final columns
     aggregated = aggregated.rename(columns={'TotalSkips': 'Total Skips'})
-    aggregated = aggregated[['Signal', 'Date', 'Phases', 'Total Skips']]
+    aggregated, output_columns = _add_ongoing_column(
+        aggregated, ['Signal', 'Date', 'Phases', 'Total Skips']
+    )
+    aggregated = aggregated[output_columns]
     aggregated = aggregated.sort_values(by=['Total Skips', 'Signal', 'Date'], ascending=[False, True, True])
     
     # Limit the number of rows
@@ -177,7 +234,8 @@ def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, al
     return aggregated, total_alerts_count
 
 
-def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max_rows=10):
+def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max_rows=10,
+                                         detector_hourly_df=None):
     """
     Prepare a sorted table of detector health alerts with signal name, detector, and date
     
@@ -185,6 +243,8 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max
         filtered_df_actuations: DataFrame containing detector health alerts
         signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
         max_rows: Maximum number of rows to include in the table
+        detector_hourly_df: Optional hourly actuation counts, used for the sparkline
+            so the trend shows the shape of a day rather than a handful of daily totals
         
     Returns:
         Tuple of (Sorted DataFrame with Signal Name, Detector, Date and Alert columns, total_alerts_count)
@@ -206,7 +266,10 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max
         
     # Merge with signals dataframe to get names
     result = pd.merge(
-        alert_rows[['DeviceId', 'Detector', 'Date', 'Alert', 'PercentAnomalous', 'Total']],
+        alert_rows[_carry_ongoing_column(
+            alert_rows.columns,
+            ['DeviceId', 'Detector', 'Date', 'Alert', 'PercentAnomalous', 'Total'],
+        )],
         signals_df[['DeviceId', 'Name', 'Region']],  # Updated column names to match signals_df
         on='DeviceId',
         how='left'
@@ -241,6 +304,21 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max
             device_data = device_data.sort_values('Date')
             # Store the Total values for sparklines instead of PercentAnomalous
             sparkline_data[(device_id, detector)] = device_data['Total'].tolist()
+
+    # Hourly counts make a far more legible trend than a dozen daily totals: a
+    # detector that dies mid-morning, or only fails at night, is invisible once a
+    # day is collapsed to one point.
+    if detector_hourly_df is not None and not detector_hourly_df.empty:
+        hourly = detector_hourly_df.copy()
+        hourly['DeviceId'] = hourly['DeviceId'].astype(str)
+        hourly['TimeStamp'] = pd.to_datetime(hourly['TimeStamp'])
+        for device_id, detector in device_detector_pairs:
+            pair_data = hourly[(hourly['DeviceId'] == str(device_id)) &
+                               (hourly['Detector'] == detector)]
+            if pair_data.empty:
+                continue
+            pair_data = pair_data.sort_values('TimeStamp')
+            sparkline_data[(device_id, detector)] = pair_data['Total'].tolist()
     
     # Add the sparkline data to the result dataframe
     result['Sparkline_Data'] = result.apply(
@@ -249,8 +327,11 @@ def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max
     )
     
     # Select and order columns
-    result = result[['Signal', 'Detector', 'Date', 'Anomalous %', 'Sparkline_Data']]
-    
+    result, output_columns = _add_ongoing_column(
+        result, ['Signal', 'Detector', 'Date', 'Anomalous %', 'Sparkline_Data']
+    )
+    result = result[output_columns]
+
     # Sort by Anomalous % in descending order, then by Signal, Detector
     result = result.sort_values(by=['Anomalous %', 'Signal', 'Detector'], ascending=[False, True, True])
     
@@ -318,6 +399,119 @@ def create_sparkline(data, width=1.0, height=0.25, color='#1f77b4'):
     
     return Image(buf, width=width*inch, height=height*inch)
 
+# The space a table actually gets on the page: letter paper with the half-inch
+# side margins and 1.2in/0.5in top and bottom margins the report uses, less the
+# 6pt of padding a frame keeps on every side.
+TABLE_AVAILABLE_WIDTH = 528.0
+TABLE_AVAILABLE_HEIGHT = 657.6
+
+# Reportlab's default cell padding, 6pt on each side.
+_CELL_PADDING = 12.0
+_HEADER_FONT = ('Helvetica-Bold', 10)
+_BODY_FONT = ('Helvetica', 9)
+
+# Columns holding a sentence rather than a value. Left to size themselves these
+# end up as wide as their longest word, which wraps the sentence into six or
+# seven lines and makes the row taller than it has any need to be, so they take
+# whatever width the value columns do not need instead.
+FLEX_COLUMNS = ('Details',)
+MIN_FLEX_WIDTH = 1.75 * inch
+
+
+def _natural_width(header_text, values):
+    """Width that fits the header and every value in a column without wrapping."""
+    width = stringWidth(str(header_text), *_HEADER_FONT)
+    for value in values:
+        width = max(width, stringWidth(str(value), *_BODY_FONT))
+    return width + _CELL_PADDING
+
+
+def _column_widths(df_display, header, trend_width=None):
+    """Size the value columns to their content and give the rest to the sentence.
+
+    Returns None when there is no sentence column, which leaves reportlab to size
+    everything itself exactly as it did before.
+    """
+    if not any(name in FLEX_COLUMNS for name in header):
+        return None
+
+    widths = []
+    for index, name in enumerate(header):
+        if trend_width is not None and index == len(header) - 1:
+            widths.append(trend_width)
+        elif name in FLEX_COLUMNS:
+            widths.append(None)
+        else:
+            values = df_display[name] if name in df_display.columns else []
+            widths.append(_natural_width(name, values))
+
+    flex = [i for i, width in enumerate(widths) if width is None]
+    fixed = sum(width for width in widths if width is not None)
+    slack = TABLE_AVAILABLE_WIDTH - fixed
+    if slack < MIN_FLEX_WIDTH * len(flex):
+        # The value columns alone want more room than the page has. Shrink them
+        # proportionally rather than running off the edge.
+        keep = TABLE_AVAILABLE_WIDTH - MIN_FLEX_WIDTH * len(flex)
+        scale = keep / fixed if fixed else 1.0
+        widths = [MIN_FLEX_WIDTH if width is None else width * scale for width in widths]
+    else:
+        share = slack / len(flex)
+        widths = [share if width is None else width for width in widths]
+    return widths
+
+
+def _blocks_that_fit(first_row, length, row_heights, max_height):
+    """Break one group's rows into blocks no taller than the page.
+
+    A merged cell cannot be split across pages, so a group taller than the frame
+    leaves reportlab with nothing it can place anywhere and it gives up with a
+    LayoutError. Splitting the merge into page-sized blocks keeps the grouping
+    visible and lets the table flow.
+    """
+    blocks = []
+    block_start = first_row
+    block_height = 0.0
+    for row in range(first_row, first_row + length):
+        height = row_heights[row] if row < len(row_heights) and row_heights[row] else 0.0
+        if block_height and block_height + height > max_height:
+            blocks.append((block_start, row - block_start))
+            block_start, block_height = row, height
+        else:
+            block_height += height
+    blocks.append((block_start, first_row + length - block_start))
+    return blocks
+
+
+# Tables all lead with the signal name. Repeated names are merged into one
+# centered cell so the rows for a signal read as a visual group.
+GROUP_COLUMN = 'Signal'
+
+
+def _cluster_rows_by_group(values):
+    """Order row positions so equal values are contiguous.
+
+    Groups keep the order in which they first appeared, and rows keep their
+    order within a group, so any ranking the caller applied still holds.
+    """
+    first_seen = {}
+    for position, value in enumerate(values):
+        first_seen.setdefault(value, position)
+    return sorted(range(len(values)), key=lambda i: (first_seen[values[i]], i))
+
+
+def _contiguous_runs(values):
+    """Return (start, length) for each run of consecutive equal values."""
+    runs = []
+    start = 0
+    while start < len(values):
+        end = start
+        while end + 1 < len(values) and values[end + 1] == values[start]:
+            end += 1
+        runs.append((start, end - start + 1))
+        start = end + 1
+    return runs
+
+
 def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, include_trend=True, trend_header='Trend'):
     """Create a ReportLab table from a pandas DataFrame
     
@@ -356,6 +550,19 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
     for col in df_display.columns:
         df_display[col] = df_display[col].astype(str)
     
+    # Group the rows for each signal together and blank the repeated labels; the
+    # blanked cells are merged away by SPAN commands added to the table style.
+    group_runs = None
+    if len(df_display.columns) and df_display.columns[0] == GROUP_COLUMN:
+        order = _cluster_rows_by_group(df_display[GROUP_COLUMN].tolist())
+        df_display = df_display.iloc[order].reset_index(drop=True)
+        if sparkline_data is not None:
+            sparkline_data = [sparkline_data[i] for i in order]
+        group_runs = _contiguous_runs(df_display[GROUP_COLUMN].tolist())
+        # The repeated labels are blanked further down, once the row heights are
+        # known and the merges have been placed: a label that ends up starting a
+        # continued block has to stay.
+
     # Add Trend column header only if requested
     if include_trend:
         df_display[trend_header] = ""
@@ -372,10 +579,13 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
             values[details_index] = Paragraph(str(values[details_index]), styles['Normal'])
         data.append(values)
       # Create the table
-    if include_trend:
-        colWidths = [None] * (len(header) - 1) + [1.2*inch]  # Make the Trend column wider
-    else:
-        colWidths = [None] * len(header)  # Equal width for all columns
+    trend_width = 1.2*inch if include_trend else None  # Make the Trend column wider
+    colWidths = _column_widths(df_display, header, trend_width)
+    if colWidths is None:
+        # No sentence column to lay out around, so leave the sizing to reportlab.
+        colWidths = [None] * len(header)
+        if include_trend:
+            colWidths[-1] = trend_width
     table = Table(data, colWidths=colWidths)
     
     # Style the table
@@ -395,9 +605,22 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
     ])
     
-    # Add alternating row colors
-    for i in range(1, len(data), 2):
-        table_style.add('BACKGROUND', (0, i), (-1, i), colors.lightgrey)
+    if group_runs is not None:
+        # The merges themselves are added after the table has been measured, so
+        # that none of them ends up taller than a page.
+        table_style.add('ALIGN', (0, 1), (0, -1), 'CENTER')
+        table_style.add('VALIGN', (0, 1), (0, -1), 'MIDDLE')
+        # Shade whole groups rather than single rows, so the banding reinforces
+        # the grouping instead of cutting across it.
+        for index, (start, length) in enumerate(group_runs):
+            if index % 2:
+                table_style.add(
+                    'BACKGROUND', (0, start + 1), (-1, start + length), colors.lightgrey
+                )
+    else:
+        # Add alternating row colors
+        for i in range(1, len(data), 2):
+            table_style.add('BACKGROUND', (0, i), (-1, i), colors.lightgrey)
     
     # Apply the table style
     table.setStyle(table_style)
@@ -413,7 +636,31 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
                 
                 # Replace the content of the last column with the sparkline image
                 table._cellvalues[row_index][-1] = sparkline
-    
+
+    if group_runs is not None:
+        # Merge each signal's repeated cells into one, centered across its rows.
+        # Measuring first, with every label still in place, gives an upper bound
+        # on the row heights, so a merge placed here is certain to fit its page.
+        table.wrap(TABLE_AVAILABLE_WIDTH, TABLE_AVAILABLE_HEIGHT)
+        row_heights = list(table._rowHeights or [])
+        header_height = row_heights[0] if row_heights else 0.0
+        span_budget = TABLE_AVAILABLE_HEIGHT - header_height
+        span_style = TableStyle([])
+        for start, length in group_runs:
+            for block_start, block_length in _blocks_that_fit(
+                start + 1, length, row_heights, span_budget
+            ):
+                if block_length > 1:
+                    span_style.add(
+                        'SPAN', (0, block_start), (0, block_start + block_length - 1)
+                    )
+                # Only the row a merge begins on keeps the label; the rest are
+                # covered by it. A group split across pages repeats its label,
+                # which is what the reader needs anyway.
+                for offset in range(1, block_length):
+                    table._cellvalues[block_start + offset][0] = ""
+        table.setStyle(span_style)
+
     result_elements = [
         Paragraph(table_notice, styles['Normal']),
         Spacer(1, 0.05*inch),
@@ -499,8 +746,11 @@ def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_
     )
     
     # Select and order columns
-    result = result[['Signal', 'Date', 'Missing Data %', 'Sparkline_Data']]
-    
+    result, output_columns = _add_ongoing_column(
+        result, ['Signal', 'Date', 'Missing Data %', 'Sparkline_Data']
+    )
+    result = result[output_columns]
+
     # Sort by Missing Data % in descending order, then by Signal
     result = result.sort_values(by=['Missing Data %', 'Signal'], ascending=[False, True])
     
@@ -534,7 +784,10 @@ def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_row
     ped_hourly_df = ped_hourly_df.copy()
     ped_hourly_df['DeviceId'] = ped_hourly_df['DeviceId'].astype(str)
       # Group all dates for each DeviceId/Phase combination
-    dates_grouped = filtered_df_ped.groupby(['DeviceId', 'Phase'])['Date'].agg(list).reset_index()
+    dates_grouped = filtered_df_ped.groupby(['DeviceId', 'Phase'], as_index=False).agg(
+        Date=('Date', list),
+        **_ongoing_aggregation(filtered_df_ped.columns)
+    )
     
     # Join with signals data to get signal names
     result = pd.merge(
@@ -581,8 +834,12 @@ def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_row
         if not hourly_data.empty:
             # Sort by timestamp to ensure correct time series
             hourly_data = hourly_data.sort_values('TimeStamp')
-            # Store the PedServices data for sparklines
-            sparkline_data[(device_id, phase)] = hourly_data['PedServices'].tolist()
+            # A week of hourly points is far more detail than a one-inch sparkline
+            # can show, so roll them up into wider buckets before drawing.
+            bucketed = hourly_data.groupby(
+                hourly_data['TimeStamp'].dt.floor(f'{PED_SPARKLINE_BUCKET_HOURS}h')
+            )['PedServices'].sum()
+            sparkline_data[(device_id, phase)] = bucketed.tolist()
     
     # Add the sparkline data to the result dataframe
     result['Services (7d)'] = result.apply(
@@ -591,8 +848,11 @@ def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_row
     )
     
     # Select and order columns
-    result = result[['Signal', 'Phase', 'Alert Dates', 'Services (7d)']]
-    
+    result, output_columns = _add_ongoing_column(
+        result, ['Signal', 'Phase', 'Alert Dates', 'Services (7d)']
+    )
+    result = result[output_columns]
+
     # Sort by Signal and Phase
     result = result.sort_values(by=['Signal', 'Phase'])
     
@@ -624,8 +884,10 @@ def prepare_system_outages_table(system_outages_df, max_rows=10):
     
     # Convert MissingData to percentage and rename columns
     result['Missing Data %'] = result['MissingData']
-    result = result[['Date', 'Region', 'Missing Data %']]
-    
+    result, output_columns = _add_ongoing_column(result, ['Date', 'Region', 'Missing Data %'])
+    result = result[output_columns]
+
+
     # Sort by Date descending (most recent first), then by Region
     result = result.sort_values(by=['Date', 'Region'], ascending=[False, True])
     
@@ -636,7 +898,7 @@ def prepare_system_outages_table(system_outages_df, max_rows=10):
     return result, total_outages_count
 
 
-def prepare_clearance_interval_alerts_table(clearance_alerts_df, signals_df, region=None, max_rows=10):
+def prepare_clearance_interval_alerts_table(clearance_alerts_df, signals_df, region=None, max_rows=10, include_region=False):
     """
     Prepare clearance interval alerts with compact details text.
 
@@ -696,7 +958,12 @@ def prepare_clearance_interval_alerts_table(clearance_alerts_df, signals_df, reg
         ascending=[True, True, True, True]
     )
 
-    return result[['Signal', 'Movement', 'Median', 'Details']], total_alerts_count
+    output_columns = ['Signal', 'Movement', 'Median', 'Details']
+    if include_region:
+        output_columns = ['Region'] + output_columns
+    result, output_columns = _add_ongoing_column(result, output_columns)
+
+    return result[output_columns], total_alerts_count
 
 
 def _format_clearance_movement(row):
@@ -711,6 +978,7 @@ def _format_clearance_details(row):
     details = [f"Of {sample_count} samples"]
 
     short_count = int(row.get('ShortCount', 0) or 0)
+    irregular_count = int(row.get('IrregularCount', 0) or 0)
     long_count = int(row.get('LongCount', 0) or 0)
     clauses = []
     if short_count > 0:
@@ -718,6 +986,17 @@ def _format_clearance_details(row):
             f"{short_count} {_were(short_count)} short "
             f"({_format_seconds(row.get('RepresentativeShortDuration'))} at "
             f"{_format_timestamp(row.get('RepresentativeShortTime'))})"
+        )
+    if irregular_count > 0:
+        irregular_duration = _format_seconds(
+            row.get('RepresentativeIrregularDuration')
+        )
+        irregular_time = _format_timestamp(
+            row.get('RepresentativeIrregularTime')
+        )
+        clauses.append(
+            f'{irregular_count} {_were(irregular_count)} irregular '
+            f'({irregular_duration} at {irregular_time})'
         )
     if long_count > 0:
         clauses.append(
@@ -741,6 +1020,140 @@ def _format_seconds(value):
     return f"{float(value):.1f}s"
 
 
+def prepare_signal_conflicts_table(
+    conflicts_df,
+    signals_df,
+    region=None,
+    max_rows=10,
+):
+    '''Prepare grouped phase/overlap interval conflicts for a report table.'''
+    if conflicts_df is None or conflicts_df.empty:
+        return pd.DataFrame(), 0
+
+    conflicts = conflicts_df.copy()
+    conflicts['DeviceId'] = conflicts['DeviceId'].astype(str)
+    conflicts['ConflictStart'] = pd.to_datetime(
+        conflicts['ConflictStart'], errors='coerce'
+    )
+    signals = signals_df.copy()
+    signals['DeviceId'] = signals['DeviceId'].astype(str)
+    result = conflicts.merge(
+        signals[['DeviceId', 'Name', 'Region']],
+        on='DeviceId',
+        how='left',
+    ).dropna(subset=['Name', 'ConflictStart'])
+    result['DurationSeconds'] = pd.to_numeric(
+        result['DurationSeconds'], errors='coerce'
+    )
+    result = result.dropna(subset=['DurationSeconds'])
+
+    if region and region != 'All Regions':
+        result = result[result['Region'] == region]
+    if result.empty:
+        return pd.DataFrame(), 0
+
+    group_cols = [
+        'Name',
+        'Movement1Type',
+        'Movement1Number',
+        'Movement2Type',
+        'Movement2Number',
+    ]
+    grouped_counts = (
+        result
+        .groupby(group_cols, dropna=False)
+        .size()
+        .rename('Conflicts')
+        .reset_index()
+    )
+    max_duration_indices = result.groupby(group_cols, dropna=False)['DurationSeconds'].idxmax()
+    max_events = result.loc[
+        max_duration_indices,
+        _carry_ongoing_column(result.columns, group_cols + ['ConflictStart', 'DurationSeconds']),
+    ]
+    summary = grouped_counts.merge(max_events, on=group_cols, how='left')
+
+    total_alerts_count = len(summary)
+    summary = summary.sort_values(
+        ['Name', 'Movement1Type', 'Movement1Number', 'Movement2Type', 'Movement2Number'],
+        ascending=True,
+    )
+    if max_rows > 0:
+        summary = summary.head(max_rows)
+
+    summary['Signal'] = summary['Name']
+    summary['Pair'] = summary.apply(
+        _format_conflict_pair,
+        axis=1,
+    )
+    summary['Max Event'] = summary['ConflictStart'].apply(_format_timestamp)
+    summary['Max Duration'] = summary['DurationSeconds'].apply(
+        lambda value: f'{float(value):.1f}s'
+    )
+    summary, output_columns = _add_ongoing_column(
+        summary, ['Signal', 'Pair', 'Conflicts', 'Max Event', 'Max Duration']
+    )
+    return summary[output_columns], total_alerts_count
+
+
+def _format_conflict_pair(row):
+    movement_1_type = 'Ovlp' if str(row['Movement1Type']) == 'Overlap' else 'Ph'
+    movement_2_type = 'Ovlp' if str(row['Movement2Type']) == 'Overlap' else 'Ph'
+    movement_1_number = int(row['Movement1Number'])
+    movement_2_number = int(row['Movement2Number'])
+    return f'{movement_1_type} {movement_1_number} / {movement_2_type} {movement_2_number}'
+
+
+def _format_conflict_movement(row, movement_number):
+    movement_type = str(row[f'Movement{movement_number}Type'])
+    number = int(row[f'Movement{movement_number}Number'])
+    indication = str(row[f'Movement{movement_number}Indication'])
+    indication = indication.replace('Overlap ', '')
+    prefix = 'Ovlp' if movement_type == 'Overlap' else 'Ph'
+    return f'{prefix} {number} {indication}'
+
+
+def prepare_overlap_dual_indications_table(
+    conflicts_df,
+    signals_df,
+    region=None,
+    max_rows=10,
+):
+    '''Prepare phase-green/same-numbered-overlap conflict rows for a report.'''
+    if conflicts_df is None or conflicts_df.empty:
+        return pd.DataFrame(), 0
+
+    conflicts = conflicts_df.copy()
+    conflicts['DeviceId'] = conflicts['DeviceId'].astype(str)
+    conflicts['ConflictStart'] = pd.to_datetime(conflicts['ConflictStart'], errors='coerce')
+
+    signals = signals_df.copy()
+    signals['DeviceId'] = signals['DeviceId'].astype(str)
+    result = conflicts.merge(
+        signals[['DeviceId', 'Name', 'Region']],
+        on='DeviceId',
+        how='left',
+    ).dropna(subset=['Name', 'ConflictStart'])
+
+    if region and region != 'All Regions':
+        result = result[result['Region'] == region]
+    if result.empty:
+        return pd.DataFrame(), 0
+
+    total_alerts_count = len(result)
+    result = result.sort_values('ConflictStart', ascending=False)
+    if max_rows > 0:
+        result = result.head(max_rows)
+
+    result['Signal'] = result['Name']
+    result['Phase'] = pd.to_numeric(result['Phase'], errors='coerce').astype('Int64')
+    result['Overlap'] = result['OverlapIndication'].str.replace('Overlap ', '', regex=False)
+    result['Start'] = result['ConflictStart'].apply(_format_timestamp)
+    result['Duration'] = result['DurationSeconds'].apply(lambda value: f'{float(value):.1f}s')
+
+    return result[['Signal', 'Phase', 'Overlap', 'Start', 'Duration']], total_alerts_count
+
+
 def _format_timestamp(value):
     timestamp = pd.to_datetime(value, errors='coerce')
     if pd.isna(timestamp):
@@ -752,3 +1165,100 @@ def _format_timestamp(value):
         f"{timestamp.month}/{timestamp.day}/{timestamp.year % 100:02d} "
         f"{hour}:{timestamp.minute:02d}:{timestamp.second:02d}.{tenths} {am_pm}"
     )
+
+
+def prepare_alarms_table(
+    alarms_df,
+    signals_df,
+    region=None,
+    max_rows=10,
+):
+    '''Prepare controller alarm rows for a report.
+
+    One row per signal and alarm type. Rows are present only for pairs that
+    alarmed again on the report day; the count shown covers the trailing six
+    weeks. Sorted by signal, then alarm type.
+    '''
+    if alarms_df is None or alarms_df.empty:
+        return pd.DataFrame(), 0
+
+    alarms = alarms_df.copy()
+    alarms['DeviceId'] = alarms['DeviceId'].astype(str)
+    alarms['LatestAlarm'] = pd.to_datetime(alarms['LatestAlarm'], errors='coerce')
+
+    signals = signals_df.copy()
+    signals['DeviceId'] = signals['DeviceId'].astype(str)
+    result = alarms.merge(
+        signals[['DeviceId', 'Name', 'Region']],
+        on='DeviceId',
+        how='left',
+    ).dropna(subset=['Name'])
+
+    if region and region != 'All Regions':
+        result = result[result['Region'] == region]
+    if result.empty:
+        return pd.DataFrame(), 0
+
+    total_alerts_count = len(result)
+    result = result.sort_values(['Name', 'AlarmType'])
+    if max_rows > 0:
+        result = result.head(max_rows)
+
+    result['Signal'] = result['Name']
+    result['Alarm'] = result['AlarmType']
+    result['6-Week Total'] = result['TotalCount'].astype(int)
+    result['Most Recent'] = result['LatestAlarm'].apply(_format_timestamp)
+
+    return (
+        result[['Signal', 'Alarm', '6-Week Total', 'Most Recent']],
+        total_alerts_count,
+    )
+
+
+def prepare_preempt_alerts_table(
+    preempt_alerts_df,
+    signals_df,
+    region=None,
+    max_rows=10,
+):
+    '''Prepare preempt frequency alert rows for a report.
+
+    One row per signal and preempt number, sorted by CUSUM score so the
+    largest shifts come first. Sparkline_Data carries the pair's daily call
+    counts over the retained history.
+    '''
+    if preempt_alerts_df is None or preempt_alerts_df.empty:
+        return pd.DataFrame(), 0
+
+    alerts = preempt_alerts_df.copy()
+    alerts['DeviceId'] = alerts['DeviceId'].astype(str)
+
+    signals = signals_df.copy()
+    signals['DeviceId'] = signals['DeviceId'].astype(str)
+    result = alerts.merge(
+        signals[['DeviceId', 'Name', 'Region']],
+        on='DeviceId',
+        how='left',
+    ).dropna(subset=['Name'])
+
+    if region and region != 'All Regions':
+        result = result[result['Region'] == region]
+    if result.empty:
+        return pd.DataFrame(), 0
+
+    total_alerts_count = len(result)
+    result = result.sort_values(['CusumScore', 'Name', 'Preempt'], ascending=[False, True, True])
+    if max_rows > 0:
+        result = result.head(max_rows)
+
+    result['Signal'] = result['Name']
+    result['Preempt'] = pd.to_numeric(result['Preempt'], errors='coerce').astype('Int64')
+    result['Change'] = result['Direction']
+    result['Baseline/Day'] = result['BaselinePerDay'].apply(lambda value: f'{float(value):.1f}')
+    result['Recent/Day'] = result['RecentPerDay'].apply(lambda value: f'{float(value):.1f}')
+    result['Sparkline_Data'] = result['DailyCounts']
+
+    result, output_columns = _add_ongoing_column(
+        result, ['Signal', 'Preempt', 'Change', 'Baseline/Day', 'Recent/Day', 'Sparkline_Data']
+    )
+    return result[output_columns], total_alerts_count

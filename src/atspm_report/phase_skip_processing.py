@@ -31,7 +31,7 @@ PHASE_SKIP_ALERT_COLUMNS = [
 ]
 
 COORDINATION_COLUMNS = [
-    'DeviceId', 'TimeStamp', 'CycleLength'
+    'DeviceId', 'TimeStamp', 'CycleLength', 'IsAssumed'
 ]
 
 
@@ -142,16 +142,19 @@ def _extract_cycle_length(coordination_agg: Optional[Union[pd.DataFrame, ir.Tabl
     if 'ActualCycleLength' not in coord_tbl.columns:
         return ibis.memtable(pd.DataFrame(columns=COORDINATION_COLUMNS))
     
-    # Filter, cast, rename columns
+    # A cycle length of zero means the signal was running free. The skip test does
+    # not go blind there - it falls back to the assumed cycle length - so neither
+    # should the chart. Dropping those bins made the trace disappear exactly where
+    # a reader most needs to know what threshold was being applied.
     cycle_length = (
         coord_tbl
-        .filter(coord_tbl.ActualCycleLength > 0)
         .mutate(
             DeviceId=coord_tbl.DeviceId.cast('string'),
-            CycleLength=coord_tbl.ActualCycleLength.cast('float64')
+            CycleLength=coord_tbl.ActualCycleLength.cast('float64'),
+            IsAssumed=coord_tbl.ActualCycleLength <= 0,
         )
-        .select(['DeviceId', 'TimeStamp', 'CycleLength'])
+        .select(['DeviceId', 'TimeStamp', 'CycleLength', 'IsAssumed'])
         .order_by(['DeviceId', 'TimeStamp'])
     )
-    
+
     return cycle_length

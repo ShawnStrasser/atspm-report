@@ -16,3 +16,14 @@ build/
 *.egg-info/
 test_phase_wait.ipynb
 test_save_data.py
+odot_ingest.py
+odot_data/
+reports/
+odot_backfill.py
+odot_validate.py
+email_module.py
+raw_event_fetching.py
+tests/test_raw_event_fetching.py
+temp_*
+.tmp/
+debug.log

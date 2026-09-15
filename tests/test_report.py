@@ -94,7 +94,7 @@ class TestReportGenerator(unittest.TestCase):
         alerts = result['alerts']
         
         # Check that all alert types are present
-        for alert_type in ['maxout', 'actuations', 'missing_data', 'pedestrian', 'phase_skips', 'clearance_intervals', 'system_outages']:
+        for alert_type in ['maxout', 'actuations', 'missing_data', 'pedestrian', 'phase_skips', 'clearance_intervals', 'overlap_dual_indications', 'general_phase_conflicts', 'overlap_conflicts', 'system_outages']:
             self.assertIn(alert_type, alerts, f"Missing alert type: {alert_type}")
             actual = alerts[alert_type]
             
@@ -112,6 +112,13 @@ class TestReportGenerator(unittest.TestCase):
                     required_cols = ['DeviceId', 'Phase', 'Date']
                 elif alert_type == 'clearance_intervals':
                     required_cols = ['DeviceId', 'EventClass', 'EventValue', 'Date']
+                elif alert_type == 'overlap_dual_indications':
+                    required_cols = ['DeviceId', 'Phase', 'Date', 'ConflictStart']
+                elif alert_type in ['general_phase_conflicts', 'overlap_conflicts']:
+                    required_cols = [
+                        'DeviceId', 'Date', 'ConflictStart',
+                        'Movement1Number', 'Movement2Number',
+                    ]
                 elif alert_type == 'system_outages':
                     required_cols = ['Date', 'Region']
                 else:
@@ -309,6 +316,192 @@ class TestReportGenerator(unittest.TestCase):
         self.assertIn('clearance_alerts_df', pdf_mock.call_args.kwargs)
 
 
+class TestOngoingSectionLayout(unittest.TestCase):
+    """Each check's charts sit under its own table, new alerts before ongoing ones."""
+
+    def _maxout_frame(self, phase, percent, ongoing_since=None):
+        rows = [
+            {
+                'DeviceId': '1', 'Phase': phase, 'Date': datetime(2026, 9, 8 + day),
+                'Alert': 1 if day else 0, 'Percent MaxOut': percent,
+            }
+            for day in range(2)
+        ]
+        frame = pd.DataFrame(rows)
+        if ongoing_since is not None:
+            frame['OngoingSince'] = ongoing_since
+        return frame
+
+    def test_charts_follow_their_own_table_and_ongoing_comes_last(self):
+        import matplotlib.pyplot as plt
+        from atspm_report.report_generation import generate_pdf_report
+
+        signals = pd.DataFrame([
+            {'DeviceId': '1', 'Name': 'Signal 1', 'Region': 'Region 1'},
+        ])
+        new_figure, ongoing_figure = plt.figure(), plt.figure()
+        events = []
+
+        def record_table(df, title, styles, **kwargs):
+            events.append(('table', title))
+            return []
+
+        def record_charts(figures):
+            if figures:
+                events.append(('charts', len(figures)))
+            return []
+
+        with patch('atspm_report.report_generation.create_reportlab_table', side_effect=record_table), \
+             patch('atspm_report.report_generation._chart_flowables', side_effect=record_charts):
+            generate_pdf_report(
+                filtered_df_maxouts=self._maxout_frame(2, 0.5),
+                filtered_df_actuations=pd.DataFrame(),
+                filtered_df_ped=pd.DataFrame(),
+                ped_hourly_df=pd.DataFrame(),
+                filtered_df_missing_data=pd.DataFrame(),
+                system_outages_df=pd.DataFrame(),
+                phase_figures=[(new_figure, 'Region 1')],
+                detector_figures=[], ped_figures=[], missing_data_figures=[],
+                signals_df=signals,
+                ongoing_alerts={
+                    'maxout': self._maxout_frame(4, 0.6, pd.Timestamp('2026-08-30')),
+                },
+                ongoing_phase_figures=[(ongoing_figure, 'Region 1')],
+                verbosity=0,
+            )
+
+        # "All Regions" is rendered first and holds no region-tagged figures, so
+        # anchor on the region that does have both sets of charts.
+        start = events.index(('table', 'Phase Termination Alerts'))
+        self.assertEqual(
+            events[start:start + 4],
+            [
+                ('table', 'Phase Termination Alerts'),
+                ('charts', 1),
+                ('table', 'Ongoing Phase Termination Alerts'),
+                ('charts', 1),
+            ],
+        )
+
+
+class TestOngoingIssuesSections(unittest.TestCase):
+    """The Ongoing Issues subsections reach the PDF with their own rows and dates."""
+
+    def _render(self, ongoing_alerts):
+        """Run generate_pdf_report, capturing every table it builds."""
+        from atspm_report.report_generation import generate_pdf_report
+
+        signals = pd.DataFrame([
+            {'DeviceId': '1', 'Name': 'Signal 1', 'Region': 'Region 1'},
+        ])
+        clearance_alerts = pd.DataFrame([
+            {
+                'DeviceId': '1', 'EventClass': 'Yellow', 'EventValue': 2,
+                'MedianDuration': 3.0, 'MaxAbsDelta': 0.5, 'SampleCount': 4,
+                'ShortCount': 4, 'LongCount': 0, 'IrregularCount': 0,
+                'MinDuration': 3.0, 'MaxDuration': 3.0,
+                'FirstEventTime': datetime(2026, 9, 9, 8, 0),
+                'MaxDeltaEventTime': datetime(2026, 9, 9, 8, 0),
+                'Date': datetime(2026, 9, 9),
+            },
+        ])
+
+        tables = []
+
+        def record_table(df, title, styles, **kwargs):
+            tables.append((title, df))
+            return []
+
+        with patch('atspm_report.report_generation.create_reportlab_table', side_effect=record_table):
+            generate_pdf_report(
+                filtered_df_maxouts=pd.DataFrame(),
+                filtered_df_actuations=pd.DataFrame(),
+                filtered_df_ped=pd.DataFrame(),
+                ped_hourly_df=pd.DataFrame(),
+                filtered_df_missing_data=pd.DataFrame(),
+                system_outages_df=pd.DataFrame(),
+                phase_figures=[], detector_figures=[], ped_figures=[],
+                missing_data_figures=[],
+                signals_df=signals,
+                clearance_alerts_df=clearance_alerts,
+                ongoing_alerts=ongoing_alerts,
+                verbosity=0,
+            )
+        return tables
+
+    def test_no_ongoing_alerts_leaves_the_report_unchanged(self):
+        titles = [title for title, _ in self._render(None)]
+        self.assertIn('Clearance Interval Alerts', titles)
+        self.assertNotIn('Ongoing Clearance Interval Alerts', titles)
+
+    def test_ongoing_alerts_add_a_subsection_with_an_ongoing_column(self):
+        ongoing = pd.DataFrame([
+            {
+                'DeviceId': '1', 'EventClass': 'Yellow', 'EventValue': 4,
+                'MedianDuration': 3.0, 'MaxAbsDelta': 0.9, 'SampleCount': 6,
+                'ShortCount': 6, 'LongCount': 0, 'IrregularCount': 0,
+                'MinDuration': 3.0, 'MaxDuration': 3.0,
+                'FirstEventTime': datetime(2026, 9, 9, 9, 0),
+                'MaxDeltaEventTime': datetime(2026, 9, 9, 9, 0),
+                'Date': datetime(2026, 9, 9),
+                'OngoingSince': pd.Timestamp('2026-08-25'),
+            },
+        ])
+        tables = self._render({'clearance_intervals': ongoing})
+        by_title = dict(tables)
+
+        self.assertIn('Ongoing Clearance Interval Alerts', by_title)
+        ongoing_rows = by_title['Ongoing Clearance Interval Alerts']
+        self.assertIn('Ongoing', ongoing_rows.columns)
+        self.assertTrue(ongoing_rows['Ongoing'].iloc[0].startswith('8/25/26 ('))
+        # The new-alert table for the same section keeps its original columns.
+        self.assertNotIn('Ongoing', by_title['Clearance Interval Alerts'].columns)
+
+    def test_a_section_with_only_ongoing_rows_still_renders(self):
+        ongoing = pd.DataFrame([
+            {
+                'DeviceId': '1', 'EventClass': 'Red', 'EventValue': 6,
+                'MedianDuration': 0.4, 'MaxAbsDelta': 0.2, 'SampleCount': 3,
+                'ShortCount': 3, 'LongCount': 0, 'IrregularCount': 0,
+                'MinDuration': 0.4, 'MaxDuration': 0.4,
+                'FirstEventTime': datetime(2026, 9, 9, 7, 0),
+                'MaxDeltaEventTime': datetime(2026, 9, 9, 7, 0),
+                'Date': datetime(2026, 9, 9),
+                'OngoingSince': pd.Timestamp('2026-09-01'),
+            },
+        ])
+        from atspm_report.report_generation import generate_pdf_report
+
+        signals = pd.DataFrame([
+            {'DeviceId': '1', 'Name': 'Signal 1', 'Region': 'Region 1'},
+        ])
+        tables = []
+
+        def record_table(df, title, styles, **kwargs):
+            tables.append((title, df))
+            return []
+
+        with patch('atspm_report.report_generation.create_reportlab_table', side_effect=record_table):
+            generate_pdf_report(
+                filtered_df_maxouts=pd.DataFrame(),
+                filtered_df_actuations=pd.DataFrame(),
+                filtered_df_ped=pd.DataFrame(),
+                ped_hourly_df=pd.DataFrame(),
+                filtered_df_missing_data=pd.DataFrame(),
+                system_outages_df=pd.DataFrame(),
+                phase_figures=[], detector_figures=[], ped_figures=[],
+                missing_data_figures=[],
+                signals_df=signals,
+                clearance_alerts_df=pd.DataFrame(),
+                ongoing_alerts={'clearance_intervals': ongoing},
+                verbosity=0,
+            )
+
+        titles = [title for title, _ in tables]
+        self.assertIn('Ongoing Clearance Interval Alerts', titles)
+        self.assertNotIn('Clearance Interval Alerts', titles)
+
+
 class TestPackageMetadata(unittest.TestCase):
     """Test package metadata and configuration."""
     
@@ -345,6 +538,16 @@ class TestClearanceIntervals(unittest.TestCase):
             "EventValue": [event_value] * len(durations),
         })
 
+    def _with_preceding_overlap_green(self, overlap_yellows):
+        overlap_greens = overlap_yellows.copy()
+        overlap_greens['EventClass'] = 'Overlap Green'
+        overlap_greens['EndTime'] = overlap_yellows['StartTime']
+        overlap_greens['StartTime'] = (
+            overlap_greens['EndTime'] - pd.Timedelta(seconds=5)
+        )
+        overlap_greens['Duration'] = 5.0
+        return pd.concat([overlap_greens, overlap_yellows], ignore_index=True)
+
     def test_hard_minimum_uses_point_one_second_tolerance(self):
         allowed = self._timeline([3.5, 3.5, 3.5, 3.4])
         self.assertTrue(process_clearance_intervals(allowed).empty)
@@ -364,7 +567,8 @@ class TestClearanceIntervals(unittest.TestCase):
         alerts = process_clearance_intervals(flagged)
 
         self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts.iloc[0]['IrregularCount'], 1)
+        self.assertEqual(alerts.iloc[0]['IrregularCount'], 0)
+        self.assertEqual(alerts.iloc[0]['LongCount'], 1)
 
     def test_invalid_timeline_rows_are_excluded(self):
         timeline = self._timeline([3.5, 3.5, 3.0], valid=[True, True, False])
@@ -373,6 +577,33 @@ class TestClearanceIntervals(unittest.TestCase):
     def test_clearance_rows_longer_than_25_seconds_are_excluded(self):
         timeline = self._timeline([3.5, 3.5, 3.5, 30.0])
         self.assertTrue(process_clearance_intervals(timeline).empty)
+
+    def test_clearance_intervals_within_one_minute_of_midnight_are_excluded(self):
+        timeline = self._timeline([3.5, 3.5, 3.5])
+        near_midnight = pd.concat([
+            self._timeline([3.0], start=pd.Timestamp("2026-05-26 23:59:30")),
+            self._timeline([3.0], start=pd.Timestamp("2026-05-27 00:00:30")),
+        ], ignore_index=True)
+
+        self.assertTrue(
+            process_clearance_intervals(
+                pd.concat([timeline, near_midnight], ignore_index=True)
+            ).empty
+        )
+
+    def test_clearance_interval_outside_midnight_window_is_retained(self):
+        timeline = self._timeline([3.5, 3.5, 3.5])
+        outside_midnight_window = self._timeline(
+            [3.0],
+            start=pd.Timestamp("2026-05-27 00:01:01"),
+        )
+
+        alerts = process_clearance_intervals(
+            pd.concat([timeline, outside_midnight_window], ignore_index=True)
+        )
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['ShortCount'], 1)
 
     def test_short_clearance_rows_near_invalid_events_are_not_excluded_by_device(self):
         timeline = self._timeline([3.5, 3.5, 3.5, 3.3])
@@ -395,6 +626,80 @@ class TestClearanceIntervals(unittest.TestCase):
         alerts = process_clearance_intervals(pd.concat([timeline, other_device_invalid], ignore_index=True))
 
         self.assertEqual(len(alerts), 1)
+
+    def test_clearance_rows_overlapping_any_invalid_interval_are_excluded(self):
+        timeline = self._timeline([3.5, 3.5, 3.5, 3.3])
+        invalid_event = pd.DataFrame([{
+            'DeviceId': '1',
+            'StartTime': pd.Timestamp('2026-05-26 14:03:01'),
+            'EndTime': pd.Timestamp('2026-05-26 14:03:02'),
+            'Duration': 1.0,
+            'IsValid': False,
+            'EventClass': 'Green',
+            'EventValue': 6,
+        }])
+
+        alerts = process_clearance_intervals(
+            pd.concat([timeline, invalid_event], ignore_index=True)
+        )
+        self.assertTrue(alerts.empty)
+
+        other_device_invalid = invalid_event.copy()
+        other_device_invalid['DeviceId'] = '2'
+        alerts = process_clearance_intervals(
+            pd.concat([timeline, other_device_invalid], ignore_index=True)
+        )
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['ShortCount'], 1)
+
+    def test_invalid_non_indication_intervals_do_not_mask_clearance(self):
+        """Ped Service intervals are invalid by construction and must not hide alerts.
+
+        A full timeline carries an invalid Ped Service interval for every ped
+        service of the day, running concurrently with vehicle clearances. Treating
+        those as evidence of bad signal-state data suppressed most samples.
+        """
+        timeline = self._timeline([3.5, 3.5, 3.5, 3.3])
+        ped_service = pd.DataFrame([{
+            'DeviceId': '1',
+            'StartTime': pd.Timestamp('2026-05-26 14:03:01'),
+            'EndTime': pd.Timestamp('2026-05-26 14:03:02'),
+            'Duration': 1.0,
+            'IsValid': False,
+            'EventClass': 'Ped Service',
+            'EventValue': 6,
+        }])
+
+        alerts = process_clearance_intervals(
+            pd.concat([timeline, ped_service], ignore_index=True)
+        )
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['ShortCount'], 1)
+
+        # An invalid indication interval at the same instant still masks it.
+        indication = ped_service.assign(EventClass='Green')
+        self.assertTrue(process_clearance_intervals(
+            pd.concat([timeline, indication], ignore_index=True)
+        ).empty)
+
+    def test_validity_event_classes_are_configurable(self):
+        timeline = self._timeline([3.5, 3.5, 3.5, 3.3])
+        ped_service = pd.DataFrame([{
+            'DeviceId': '1',
+            'StartTime': pd.Timestamp('2026-05-26 14:03:01'),
+            'EndTime': pd.Timestamp('2026-05-26 14:03:02'),
+            'Duration': 1.0,
+            'IsValid': False,
+            'EventClass': 'Ped Service',
+            'EventValue': 6,
+        }])
+        combined = pd.concat([timeline, ped_service], ignore_index=True)
+
+        widened = process_clearance_intervals(
+            combined,
+            {'clearance_validity_event_classes': ['Green', 'Ped Service']},
+        )
+        self.assertTrue(widened.empty)
 
     def test_invalid_event_cushion_seconds_is_configurable(self):
         timeline = self._timeline([3.5, 3.5, 3.5, 7.0])
@@ -467,22 +772,152 @@ class TestClearanceIntervals(unittest.TestCase):
 
         self.assertTrue(process_clearance_intervals(timeline).empty)
 
+    def test_overlap_yellow_requires_immediately_preceding_same_numbered_green(self):
+        yellows = self._timeline(
+            [4.0, 4.0, 4.0, 4.3],
+            event_class='Overlap Yellow',
+            event_value=5,
+        )
+        self.assertTrue(process_clearance_intervals(yellows).empty)
+
+        wrong_number_greens = self._with_preceding_overlap_green(yellows)
+        wrong_number_greens.loc[
+            wrong_number_greens['EventClass'] == 'Overlap Green',
+            'EventValue',
+        ] = 6
+        self.assertTrue(process_clearance_intervals(wrong_number_greens).empty)
+
+        delayed_greens = self._with_preceding_overlap_green(yellows)
+        delayed_greens.loc[
+            delayed_greens['EventClass'] == 'Overlap Green',
+            'EndTime',
+        ] -= pd.Timedelta(milliseconds=100)
+        self.assertTrue(process_clearance_intervals(delayed_greens).empty)
+
     def test_overlap_rows_must_behave_like_fixed_clearance(self):
         fixed = self._timeline([4.0, 4.0, 4.0, 4.3], event_class="Overlap Yellow", event_value=5)
         variable = self._timeline([4.0] * 9 + [7.0], event_class="Overlap Yellow", event_value=6)
+        fixed = self._with_preceding_overlap_green(fixed)
+        variable = self._with_preceding_overlap_green(variable)
         alerts = process_clearance_intervals(pd.concat([fixed, variable], ignore_index=True))
 
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts.iloc[0]['EventClass'], "Overlap Yellow")
         self.assertEqual(alerts.iloc[0]['EventValue'], 5)
 
+    def test_red_clearance_variation_is_ignored_unless_below_global_minimum(self):
+        variable_red = self._timeline(
+            [1.0, 1.0, 1.0, 0.8, 1.4],
+            event_class='Red',
+        )
+        self.assertTrue(process_clearance_intervals(variable_red).empty)
+
+        at_minimum = self._timeline(
+            [1.0, 1.0, 1.0, 0.5],
+            event_class='Red',
+        )
+        self.assertTrue(process_clearance_intervals(at_minimum).empty)
+
+        short_red = self._timeline(
+            [1.0, 1.0, 1.0, 0.49],
+            event_class='Red',
+        )
+        alerts = process_clearance_intervals(short_red)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['ShortCount'], 1)
+        self.assertEqual(alerts.iloc[0]['IrregularCount'], 0)
+        self.assertEqual(alerts.iloc[0]['LongCount'], 0)
+
+    def test_variable_overlap_red_still_flags_below_global_minimum(self):
+        variable_overlap_red = self._timeline(
+            [0.49, 1.0, 1.0, 1.0, 10.0],
+            event_class='Overlap Red',
+        )
+
+        alerts = process_clearance_intervals(variable_overlap_red)
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['EventClass'], 'Overlap Red')
+        self.assertEqual(alerts.iloc[0]['ShortCount'], 1)
+        self.assertEqual(alerts.iloc[0]['IrregularCount'], 0)
+        self.assertEqual(alerts.iloc[0]['LongCount'], 0)
+
     def test_representative_irregular_sample_is_farthest_from_median(self):
-        timeline = self._timeline([1.0, 1.0, 1.0, 0.8, 1.4], event_class="Red")
+        timeline = self._timeline(
+            [4.0, 4.0, 4.0, 3.8, 4.4],
+            event_class="Yellow",
+        )
         alerts = process_clearance_intervals(timeline)
 
         self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts.iloc[0]['IrregularCount'], 2)
-        self.assertAlmostEqual(alerts.iloc[0]['RepresentativeIrregularDuration'], 1.4)
+        self.assertEqual(alerts.iloc[0]['IrregularCount'], 1)
+        self.assertEqual(alerts.iloc[0]['LongCount'], 1)
+        self.assertAlmostEqual(alerts.iloc[0]['RepresentativeIrregularDuration'], 3.8)
+        self.assertAlmostEqual(alerts.iloc[0]['RepresentativeLongDuration'], 4.4)
+
+    def test_stop_time_input_filters_04009_like_irregular_yellow_alert(self):
+        signal_id = "2f75782b-6ac0-46b4-b900-ac45075dd812"
+        irregular_time = pd.Timestamp("2026-05-25 20:43:21.100")
+        starts = pd.date_range(irregular_time - pd.Timedelta(minutes=468), irregular_time, freq="min")
+        timeline = pd.DataFrame({
+            "DeviceId": [signal_id] * 469,
+            "StartTime": starts,
+            "EndTime": starts + pd.to_timedelta([4.0] * 468 + [4.5], unit="s"),
+            "Duration": [4.0] * 468 + [4.5],
+            "IsValid": [True] * 469,
+            "EventClass": ["Yellow"] * 469,
+            "EventValue": [2] * 469,
+        })
+        stop_time = pd.DataFrame([{
+            "DeviceId": signal_id,
+            "StartTime": pd.Timestamp("2026-05-25 20:43:21.000"),
+            "EndTime": pd.Timestamp("2026-05-25 20:43:21.200"),
+            "Duration": 1.0,
+            "IsValid": True,
+            "EventClass": "Stop Time Input",
+            "EventValue": 1,
+        }])
+
+        alerts = process_clearance_intervals(pd.concat([timeline, stop_time], ignore_index=True))
+
+        self.assertTrue(alerts.empty)
+
+    def test_stop_time_input_overlap_filter_can_be_disabled(self):
+        signal_id = "2f75782b-6ac0-46b4-b900-ac45075dd812"
+        irregular_time = pd.Timestamp("2026-05-25 20:43:21.100")
+        starts = pd.date_range(irregular_time - pd.Timedelta(minutes=468), irregular_time, freq="min")
+        timeline = pd.DataFrame({
+            "DeviceId": [signal_id] * 469,
+            "StartTime": starts,
+            "EndTime": starts + pd.to_timedelta([4.0] * 468 + [4.5], unit="s"),
+            "Duration": [4.0] * 468 + [4.5],
+            "IsValid": [True] * 469,
+            "EventClass": ["Yellow"] * 469,
+            "EventValue": [2] * 469,
+        })
+        stop_time = pd.DataFrame([{
+            "DeviceId": signal_id,
+            "StartTime": pd.Timestamp("2026-05-25 20:43:21.000"),
+            "EndTime": pd.Timestamp("2026-05-25 20:43:21.200"),
+            "Duration": 1.0,
+            "IsValid": True,
+            "EventClass": "Stop Time Input",
+            "EventValue": 1,
+        }])
+
+        alerts = process_clearance_intervals(
+            pd.concat([timeline, stop_time], ignore_index=True),
+            {"filter_stoptime": False},
+        )
+
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts.iloc[0]['DeviceId'], signal_id)
+        self.assertEqual(alerts.iloc[0]['EventClass'], "Yellow")
+        self.assertEqual(alerts.iloc[0]['EventValue'], 2)
+        self.assertEqual(alerts.iloc[0]['SampleCount'], 469)
+        self.assertEqual(alerts.iloc[0]['IrregularCount'], 0)
+        self.assertEqual(alerts.iloc[0]['LongCount'], 1)
+        self.assertAlmostEqual(alerts.iloc[0]['RepresentativeLongDuration'], 4.5)
 
     def test_clearance_table_prioritizes_phases_then_sorts_for_display(self):
         timestamp = pd.Timestamp("2026-05-26 14:54:33.200")
@@ -506,7 +941,7 @@ class TestClearanceIntervals(unittest.TestCase):
                 "Date": timestamp.normalize(), "MedianDuration": 3.5, "SampleCount": 18,
                 "MaxAbsDelta": 2.0, "ShortCount": 3, "IrregularCount": 5, "LongCount": 2,
                 "AvgSignedDeviation": -0.2, "RepresentativeShortDuration": 3.1,
-                "RepresentativeShortTime": timestamp, "RepresentativeIrregularDuration": 5.1,
+                "RepresentativeShortTime": timestamp, "RepresentativeIrregularDuration": 3.4,
                 "RepresentativeIrregularTime": pd.Timestamp("2026-05-26 14:34:33.200"),
                 "RepresentativeLongDuration": 5.1,
                 "RepresentativeLongTime": pd.Timestamp("2026-05-26 14:34:33.200"),
@@ -532,7 +967,10 @@ class TestClearanceIntervals(unittest.TestCase):
         self.assertEqual(table.iloc[0]['Median'], "3.5s")
         self.assertIn("Of 18 samples, 3 were short (3.1s at 5/26/26 2:54:33.2 PM)", table.iloc[0]['Details'])
         self.assertIn("2 were long (5.1s at 5/26/26 2:34:33.2 PM)", table.iloc[0]['Details'])
-        self.assertNotIn("irregular", table.iloc[0]['Details'])
+        self.assertIn(
+            '5 were irregular (3.4s at 5/26/26 2:34:33.2 PM)',
+            table.iloc[0]['Details'],
+        )
         self.assertNotIn("Ovlp 5 Red", table['Movement'].tolist())
 
 

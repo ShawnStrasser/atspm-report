@@ -22,9 +22,72 @@ from .table_generation import (
     prepare_missing_data_alerts_table,
     prepare_system_outages_table,
     prepare_clearance_interval_alerts_table,
-    create_reportlab_table
+    prepare_overlap_dual_indications_table,
+    prepare_alarms_table,
+    prepare_preempt_alerts_table,
+    prepare_signal_conflicts_table,
+    create_reportlab_table,
+    ONGOING_SINCE_COLUMN,
 )
 from .utils import log_message
+
+# Repeat alerts are normally held back so they do not crowd out new ones. When the
+# caller passes them in, each check gets a second "Ongoing ..." section - its own
+# table and charts - directly after the "New ..." section for that same check.
+ONGOING_SECTION_EXPLANATION = (
+    'These issues were reported previously and are still occurring, so they are held '
+    'out of the new alerts above to keep genuinely new problems visible. Ongoing gives '
+    'the date the current run of repeat alerts started, and how many days ago that was.'
+)
+
+
+def _has_rows(df: Optional[pd.DataFrame]) -> bool:
+    """True when a DataFrame exists and holds at least one row."""
+    return df is not None and not df.empty
+
+
+def _chart_flowables(figures: list) -> list:
+    """Lay out alert charts one per row, each kept whole on a single page."""
+    elements = []
+    for figure in figures:
+        elements.append(KeepTogether([MatplotlibFigure(figure, width=6.5*inch, height=2.8*inch)]))
+        elements.append(Spacer(1, 0.15*inch))
+        plt.close(figure)
+    return elements
+
+
+def _ongoing_section(
+        title: str,
+        rows_df: Optional[pd.DataFrame],
+        total_count: int,
+        styles,
+        max_rows: int,
+        figures: Optional[list] = None,
+        include_trend: bool = False,
+        trend_header: str = 'Trend',
+) -> list:
+    """Build the 'Ongoing <title>' section, or nothing when there is nothing ongoing."""
+    if not _has_rows(rows_df):
+        return []
+
+    elements = [
+        Paragraph(f'Ongoing {title}', styles['SectionHeading']),
+        Spacer(1, 0.1*inch),
+        Paragraph(ONGOING_SECTION_EXPLANATION, styles['Normal']),
+        Spacer(1, 0.2*inch),
+    ]
+    elements.extend(create_reportlab_table(
+        rows_df,
+        f'Ongoing {title}',
+        styles,
+        total_count=total_count,
+        max_rows=max_rows,
+        include_trend=include_trend,
+        trend_header=trend_header,
+    ))
+    elements.append(Spacer(1, 0.3*inch))
+    elements.extend(_chart_flowables(figures or []))
+    return elements
 
 # Load jokes from package data
 def _load_jokes() -> list[str]:
@@ -268,6 +331,7 @@ def generate_pdf_report(
         ped_figures: List[tuple[plt.Figure, str]],
         missing_data_figures: List[tuple[plt.Figure, str]],
         signals_df: pd.DataFrame = None,
+        detector_hourly_df: pd.DataFrame = None,
         save_to_disk: bool = False,
         max_table_rows: int = 10,
         verbosity: int = 1,
@@ -276,10 +340,22 @@ def generate_pdf_report(
         phase_skip_alerts_df: Optional[pd.DataFrame] = None,
         phase_skip_threshold: Optional[float] = None,
         clearance_alerts_df: Optional[pd.DataFrame] = None,
+        overlap_dual_indications_df: Optional[pd.DataFrame] = None,
+        general_phase_conflicts_df: Optional[pd.DataFrame] = None,
+        overlap_conflicts_df: Optional[pd.DataFrame] = None,
+        same_movement_color_conflicts_df: Optional[pd.DataFrame] = None,
+        alarms_df: Optional[pd.DataFrame] = None,
+        preempt_alerts_df: Optional[pd.DataFrame] = None,
         clearance_yellow_min_seconds: float = 3.5,
         clearance_red_min_seconds: float = 0.5,
         joke_index: int = None,
-        custom_logo_path: str = None
+        custom_logo_path: str = None,
+        ongoing_alerts: Optional[Dict[str, pd.DataFrame]] = None,
+        ongoing_phase_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        ongoing_detector_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        ongoing_ped_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        ongoing_missing_data_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        ongoing_phase_skip_figures: Optional[List[tuple[plt.Figure, str]]] = None
 ) -> Dict[str, BytesIO]:
     """Generate PDF reports for each region with the plots.
     
@@ -288,6 +364,8 @@ def generate_pdf_report(
         filtered_df_actuations: DataFrame with detector health alerts
         filtered_df_ped: DataFrame with pedestrian alerts
         ped_hourly_df: DataFrame with pedestrian hourly data
+        detector_hourly_df: DataFrame with hourly detector actuation counts, used for
+            the detector health sparklines
         filtered_df_missing_data: DataFrame with missing data alerts
         system_outages_df: DataFrame with system-wide outages (Date, Region, MissingData)
         phase_figures: List of (figure, region) tuples for phase termination
@@ -303,11 +381,25 @@ def generate_pdf_report(
         phase_skip_alerts_df: DataFrame with Phase Skip alerts after suppression
         phase_skip_threshold: Minimum per-row skips to display in the Phase Skip table
         clearance_alerts_df: DataFrame with clearance interval alerts after suppression
+        overlap_dual_indications_df: Same-numbered phase/overlap conflicts after suppression
+        general_phase_conflicts_df: Standard conflicting phase indications after suppression
+        overlap_conflicts_df: Conflicting phase/overlap indications after suppression
+        same_movement_color_conflicts_df: Same phase/overlap multi-color conflicts after suppression
+        alarms_df: Controller alarms listed this run (never suppressed)
+        preempt_alerts_df: Preempt frequency shift alerts after suppression
         clearance_yellow_min_seconds: Yellow clearance threshold used in report text
         clearance_red_min_seconds: Red clearance threshold used in report text
         joke_index: Specific joke index to use (0-based), None for date-based cycling
         custom_logo_path: Path to custom logo file, None for default ODOT logo
-        
+        ongoing_alerts: Alert type -> repeat alerts held back by suppression, carrying an
+            OngoingSince column. Each type present adds an 'Ongoing ...' section after the
+            matching 'New ...' one; pass None or empty frames for new alerts only
+        ongoing_phase_figures: Charts for the ongoing phase termination section
+        ongoing_detector_figures: Charts for the ongoing detector health section
+        ongoing_ped_figures: Charts for the ongoing pedestrian detector section
+        ongoing_missing_data_figures: Charts for the ongoing missing data section
+        ongoing_phase_skip_figures: Charts for the ongoing phase skip section
+
     Returns:
         Dict mapping region name to BytesIO containing PDF bytes
     """
@@ -347,6 +439,43 @@ def generate_pdf_report(
         )
         regions.update(clearance_region_lookup['Region'].dropna().tolist())
 
+    if overlap_dual_indications_df is not None and not overlap_dual_indications_df.empty and signals_df is not None:
+        overlap_region_lookup = (
+            overlap_dual_indications_df[['DeviceId']]
+            .drop_duplicates()
+            .merge(signals_df[['DeviceId', 'Region']], on='DeviceId', how='left')
+        )
+        regions.update(overlap_region_lookup['Region'].dropna().tolist())
+
+    for conflict_df in [
+        general_phase_conflicts_df,
+        overlap_conflicts_df,
+        same_movement_color_conflicts_df,
+        preempt_alerts_df,
+    ]:
+        if conflict_df is not None and not conflict_df.empty and signals_df is not None:
+            conflict_region_lookup = (
+                conflict_df[['DeviceId']]
+                .drop_duplicates()
+                .merge(signals_df[['DeviceId', 'Region']], on='DeviceId', how='left')
+            )
+            regions.update(conflict_region_lookup['Region'].dropna().tolist())
+
+    # A region can have nothing new today yet still have ongoing issues worth a report.
+    ongoing_alerts = ongoing_alerts or {}
+    for ongoing_df in ongoing_alerts.values():
+        if not _has_rows(ongoing_df):
+            continue
+        if 'Region' in ongoing_df.columns:
+            regions.update(ongoing_df['Region'].dropna().unique().tolist())
+        elif 'DeviceId' in ongoing_df.columns and signals_df is not None:
+            ongoing_region_lookup = (
+                ongoing_df[['DeviceId']]
+                .drop_duplicates()
+                .merge(signals_df[['DeviceId', 'Region']], on='DeviceId', how='left')
+            )
+            regions.update(ongoing_region_lookup['Region'].dropna().tolist())
+
     if not regions and signals_df is not None:
         regions.update(signals_df['Region'].unique().tolist())
 
@@ -356,6 +485,21 @@ def generate_pdf_report(
     allowed_phase_skip_pairs = None
     if phase_skip_alerts_df is not None and not phase_skip_alerts_df.empty:
         allowed_phase_skip_pairs = phase_skip_alerts_df[['DeviceId', 'Phase']].drop_duplicates()
+
+    # Phase skip tables are built from the full wait-time rows rather than the alert
+    # frame, so the ongoing dates have to be carried onto those rows by device/phase.
+    ongoing_phase_skip_pairs = None
+    ongoing_phase_skip_rows = None
+    ongoing_phase_skips_df = ongoing_alerts.get('phase_skips')
+    if _has_rows(ongoing_phase_skips_df) and _has_rows(phase_skip_rows):
+        ongoing_phase_skip_pairs = ongoing_phase_skips_df[['DeviceId', 'Phase']].drop_duplicates()
+        ongoing_phase_skip_rows = phase_skip_rows.merge(
+            ongoing_phase_skips_df[['DeviceId', 'Phase', ONGOING_SINCE_COLUMN]]
+            .drop_duplicates(subset=['DeviceId', 'Phase']),
+            on=['DeviceId', 'Phase'],
+            how='inner',
+        )
+
     buffer_objects = []
 
     # Get joke for this report
@@ -370,6 +514,15 @@ def generate_pdf_report(
         region_detector_figures = [fig for fig, reg in detector_figures if reg == region]
         region_ped_figures = [fig for fig, reg in ped_figures if reg == region]
         region_missing_data_figures = [fig for fig, reg in missing_data_figures if reg == region]
+        region_ongoing_phase_figures = [fig for fig, reg in (ongoing_phase_figures or []) if reg == region]
+        region_ongoing_detector_figures = [fig for fig, reg in (ongoing_detector_figures or []) if reg == region]
+        region_ongoing_ped_figures = [fig for fig, reg in (ongoing_ped_figures or []) if reg == region]
+        region_ongoing_missing_data_figures = [
+            fig for fig, reg in (ongoing_missing_data_figures or []) if reg == region
+        ]
+        region_ongoing_phase_skip_figures = [
+            fig for fig, reg in (ongoing_phase_skip_figures or []) if reg == region
+        ]
 
         # Filter signals
         if region == "All Regions":
@@ -439,11 +592,114 @@ def generate_pdf_report(
         content.append(Spacer(1, 0.2*inch))
 
         # Introduction text
-        intro_text = f"""This report for {region} includes alerts for phase skips, increased percent maxout, vehicle & pedestrian detector performance, and data completeness. 
-        These are new alerts only, recurring issues are not shown but will be added in a future update.
+        any_ongoing = any(_has_rows(df) for df in ongoing_alerts.values())
+        recurring_note = (
+            """Each section lists new alerts first, followed by an Ongoing Issues table of
+            problems that were reported before and are still occurring."""
+            if any_ongoing else
+            """These are new alerts only, recurring issues are not shown but will be added in a future update."""
+        )
+        intro_text = f"""This report for {region} includes alerts for phase skips, increased percent maxout, vehicle & pedestrian detector performance, and data completeness.
+        {recurring_note}
         """
         content.append(Paragraph(intro_text, styles['Normal']))
         content.append(Spacer(1, 0.2*inch))
+
+        # Joke section comes first in the report body.
+        content.append(Paragraph(joke_title, styles['SectionHeading']))
+        content.append(Paragraph(joke_text, styles['Normal']))
+        content.append(Spacer(1, 0.3*inch))
+
+        # Section: Controller Alarms
+        if alarms_df is not None and not alarms_df.empty and signals_df is not None:
+            region_alarm_rows, total_alarm_alerts = prepare_alarms_table(
+                alarms_df,
+                signals_df,
+                region=region,
+                max_rows=max_table_rows,
+            )
+        else:
+            region_alarm_rows = pd.DataFrame()
+            total_alarm_alerts = 0
+
+        if not region_alarm_rows.empty:
+            content.append(Paragraph('Controller Alarms', styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            explanation = (
+                'Controller alarm events reported by the cabinet. A signal and alarm type '
+                'is listed only when it alarmed again on the most recent day, so a pair '
+                'drops off once the underlying problem is resolved. The count covers the '
+                'trailing six weeks, which shows how long a recurring problem has persisted.'
+            )
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+            content.extend(create_reportlab_table(
+                region_alarm_rows,
+                'Controller Alarms',
+                styles,
+                total_count=total_alarm_alerts,
+                max_rows=max_table_rows,
+                include_trend=False,
+            ))
+            content.append(Spacer(1, 0.3*inch))
+
+        # Section: Preempt Monitoring
+        if preempt_alerts_df is not None and not preempt_alerts_df.empty and signals_df is not None:
+            region_preempt_rows, total_preempt_alerts = prepare_preempt_alerts_table(
+                preempt_alerts_df,
+                signals_df,
+                region=region,
+                max_rows=max_table_rows,
+            )
+        else:
+            region_preempt_rows = pd.DataFrame()
+            total_preempt_alerts = 0
+
+        if _has_rows(ongoing_alerts.get('preempts')) and signals_df is not None:
+            region_preempt_ongoing_rows, total_preempt_ongoing = prepare_preempt_alerts_table(
+                ongoing_alerts['preempts'],
+                signals_df,
+                region=region,
+                max_rows=max_table_rows,
+            )
+        else:
+            region_preempt_ongoing_rows = pd.DataFrame()
+            total_preempt_ongoing = 0
+
+        if not region_preempt_rows.empty:
+            content.append(Paragraph('New Preempt Monitoring Alerts', styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            explanation = (
+                'Preempt call frequency is tracked for each signal and preempt number. '
+                'Baseline/Day is the typical (median) number of calls per day over the '
+                'trailing six weeks, excluding the most recent seven days of data, which '
+                'are compared against it as Recent/Day. A pair is listed when its recent '
+                'calls shifted well outside the day-to-day variation expected at its '
+                'baseline, in either direction. A Decrease is only reported for preempts '
+                'that normally fire at least once a day. Each signal and preempt is '
+                'reported once per shift; the trend shows daily calls over the history.'
+            )
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+            content.extend(create_reportlab_table(
+                region_preempt_rows,
+                'Preempt Monitoring',
+                styles,
+                total_count=total_preempt_alerts,
+                max_rows=max_table_rows,
+                trend_header='Calls/Day (6wk)',
+            ))
+            content.append(Spacer(1, 0.3*inch))
+
+        content.extend(_ongoing_section(
+            'Preempt Monitoring Alerts',
+            region_preempt_ongoing_rows,
+            total_preempt_ongoing,
+            styles,
+            max_table_rows,
+            include_trend=True,
+            trend_header='Calls/Day (6wk)',
+        ))
 
         if clearance_alerts_df is not None and not clearance_alerts_df.empty and signals_df is not None:
             region_clearance_rows, total_clearance_alerts = prepare_clearance_interval_alerts_table(
@@ -456,72 +712,257 @@ def generate_pdf_report(
             region_clearance_rows = pd.DataFrame()
             total_clearance_alerts = 0
 
-        if region_clearance_rows is not None and not region_clearance_rows.empty:
-            content.append(Paragraph("Clearance Interval Alerts", styles['SectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
+        if _has_rows(ongoing_alerts.get('clearance_intervals')) and signals_df is not None:
+            region_clearance_ongoing_rows, total_clearance_ongoing = (
+                prepare_clearance_interval_alerts_table(
+                    ongoing_alerts['clearance_intervals'],
+                    signals_df,
+                    region=region,
+                    max_rows=max_table_rows,
+                )
+            )
+        else:
+            region_clearance_ongoing_rows = pd.DataFrame()
+            total_clearance_ongoing = 0
 
+        if (
+            overlap_dual_indications_df is not None
+            and not overlap_dual_indications_df.empty
+            and signals_df is not None
+        ):
+            region_overlap_dual_rows, total_overlap_dual_alerts = (
+                prepare_overlap_dual_indications_table(
+                    overlap_dual_indications_df,
+                    signals_df,
+                    region=region,
+                    max_rows=max_table_rows,
+                )
+            )
+        else:
+            region_overlap_dual_rows = pd.DataFrame()
+            total_overlap_dual_alerts = 0
+
+        if not region_overlap_dual_rows.empty:
+            content.append(Paragraph('Overlap Dual Indications', styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
             explanation = (
-                "Clearance interval alerts identify irregular yellow or red clearance intervals, "
-                f"or any that were shorter than {clearance_yellow_min_seconds:g}s for yellow "
-                f"and {clearance_red_min_seconds:g}s for red, which are the configured thresholds "
-                "for this report."
+                'These conflicts occur when a phase is green while the same-numbered '
+                'overlap is yellow or red. Invalid timeline intervals are excluded.'
             )
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
+            content.extend(create_reportlab_table(
+                region_overlap_dual_rows,
+                'Overlap Dual Indications',
+                styles,
+                total_count=total_overlap_dual_alerts,
+                max_rows=max_table_rows,
+                include_trend=False,
+            ))
+            content.append(Spacer(1, 0.3*inch))
 
-            table_content = create_reportlab_table(
+        if (
+            general_phase_conflicts_df is not None
+            and not general_phase_conflicts_df.empty
+            and signals_df is not None
+        ):
+            region_general_phase_rows, total_general_phase_conflicts = (
+                prepare_signal_conflicts_table(
+                    general_phase_conflicts_df,
+                    signals_df,
+                    region=region,
+                    max_rows=max_table_rows,
+                )
+            )
+        else:
+            region_general_phase_rows = pd.DataFrame()
+            total_general_phase_conflicts = 0
+
+        if _has_rows(ongoing_alerts.get('general_phase_conflicts')) and signals_df is not None:
+            region_general_phase_ongoing_rows, total_general_phase_ongoing = (
+                prepare_signal_conflicts_table(
+                    ongoing_alerts['general_phase_conflicts'],
+                    signals_df,
+                    region=region,
+                    max_rows=max_table_rows,
+                )
+            )
+        else:
+            region_general_phase_ongoing_rows = pd.DataFrame()
+            total_general_phase_ongoing = 0
+
+        if not region_general_phase_rows.empty:
+            content.append(Paragraph('New General Phase Conflicts', styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            explanation = (
+                'These conflicts identify overlapping green, yellow, or red-clearance '
+                'intervals for phase pairs prohibited by the standard dual-ring sequence. '
+                'Intervals that only touch at a shared end/start timestamp are allowed. '
+                'This check assumes default sequence operation and can raise false alarms '
+                'for signals using non-standard phasing; configure those signals as excluded.'
+            )
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+            content.extend(create_reportlab_table(
+                region_general_phase_rows,
+                'General Phase Conflicts',
+                styles,
+                total_count=total_general_phase_conflicts,
+                max_rows=max_table_rows,
+                include_trend=False,
+            ))
+            content.append(Spacer(1, 0.3*inch))
+
+        content.extend(_ongoing_section(
+            'General Phase Conflicts',
+            region_general_phase_ongoing_rows,
+            total_general_phase_ongoing,
+            styles,
+            max_table_rows,
+        ))
+
+        if (
+            overlap_conflicts_df is not None
+            and not overlap_conflicts_df.empty
+            and signals_df is not None
+        ):
+            region_overlap_conflict_rows, total_overlap_conflicts = (
+                prepare_signal_conflicts_table(
+                    overlap_conflicts_df,
+                    signals_df,
+                    region=region,
+                    max_rows=max_table_rows,
+                )
+            )
+        else:
+            region_overlap_conflict_rows = pd.DataFrame()
+            total_overlap_conflicts = 0
+
+        if _has_rows(ongoing_alerts.get('overlap_conflicts')) and signals_df is not None:
+            region_overlap_conflict_ongoing_rows, total_overlap_conflict_ongoing = (
+                prepare_signal_conflicts_table(
+                    ongoing_alerts['overlap_conflicts'],
+                    signals_df,
+                    region=region,
+                    max_rows=max_table_rows,
+                )
+            )
+        else:
+            region_overlap_conflict_ongoing_rows = pd.DataFrame()
+            total_overlap_conflict_ongoing = 0
+
+        if not region_overlap_conflict_rows.empty:
+            content.append(Paragraph('New Overlap Conflicts', styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            explanation = (
+                'These conflicts identify configured overlap green or yellow intervals '
+                'running with a prohibited phase or overlap green/yellow interval. '
+                'Red indications are not included in this check. This check assumes default '
+                'sequence and overlap compatibility groups and can raise false alarms for '
+                'signals using non-standard phasing; configure those signals as excluded.'
+            )
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+            content.extend(create_reportlab_table(
+                region_overlap_conflict_rows,
+                'Overlap Conflicts',
+                styles,
+                total_count=total_overlap_conflicts,
+                max_rows=max_table_rows,
+                include_trend=False,
+            ))
+            content.append(Spacer(1, 0.3*inch))
+
+        content.extend(_ongoing_section(
+            'Overlap Conflicts',
+            region_overlap_conflict_ongoing_rows,
+            total_overlap_conflict_ongoing,
+            styles,
+            max_table_rows,
+        ))
+
+        if _has_rows(region_clearance_rows):
+            content.append(Paragraph('New Clearance Interval Alerts', styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            explanation = (
+                'Clearance interval alerts identify short, irregular, or long yellow '
+                'intervals and red intervals below the configured global minimum. Each '
+                'movement is judged against a single day of data - the most recent day '
+                'available - so the median shown is that day\'s median for that movement.'
+            )
+            content.append(Paragraph(explanation, styles['Normal']))
+            content.append(Spacer(1, 0.2*inch))
+            content.extend(create_reportlab_table(
                 region_clearance_rows,
-                "Clearance Interval Alerts",
+                'Clearance Interval Alerts',
                 styles,
                 total_count=total_clearance_alerts,
                 max_rows=max_table_rows,
-                include_trend=False
-            )
-            content.extend(table_content)
+                include_trend=False,
+            ))
             content.append(Spacer(1, 0.3*inch))
-        
-        # Joke section
-        content.append(Paragraph(joke_title, styles['SectionHeading']))
-        content.append(Paragraph(joke_text, styles['Normal']))
-        content.append(Spacer(1, 0.3*inch))
+
+        content.extend(_ongoing_section(
+            'Clearance Interval Alerts',
+            region_clearance_ongoing_rows,
+            total_clearance_ongoing,
+            styles,
+            max_table_rows,
+        ))
 
         # Section: Phase Terminations - Changed to a single header
+        if _has_rows(ongoing_alerts.get('maxout')) and region_signals_df is not None:
+            region_maxout_ongoing_rows, total_maxout_ongoing = prepare_phase_termination_alerts_table(
+                ongoing_alerts['maxout'],
+                region_signals_df,
+                max_rows=max_table_rows,
+            )
+        else:
+            region_maxout_ongoing_rows = pd.DataFrame()
+            total_maxout_ongoing = 0
+
         if len(filtered_df_maxouts) > 0 and region_phase_figures:
-            content.append(Paragraph("Phase Termination Alerts", styles['SectionHeading']))
+            content.append(Paragraph("New Phase Termination Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
-            explanation = """The following tables and charts display phase termination patterns that have been flagged as anomalous. 
-            Points marked with dots in the charts indicate periods where the system detected unusual max-out or force-off behavior."""
+            explanation = """The following tables and charts display phase termination patterns that have been flagged as anomalous.
+            Points marked with dots in the charts indicate periods where the system detected unusual max-out or force-off behavior.
+            A phase is listed when it was flagged within the last 7 days, measured against a 21-day baseline for that phase."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
             
             if region_signals_df is not None:
                 # Create phase termination table with row limit
                 phase_alerts_df, total_phase_alerts = prepare_phase_termination_alerts_table(
-                    filtered_df_maxouts, 
+                    filtered_df_maxouts,
                     region_signals_df,
                     max_rows=max_table_rows
                 )
-                
+
                 table_content = create_reportlab_table(
-                    phase_alerts_df, 
-                    "Phase Termination Alerts", 
+                    phase_alerts_df,
+                    "Phase Termination Alerts",
                     styles,
                     total_count=total_phase_alerts,
                     max_rows=max_table_rows,
-                    trend_header='MaxOut (21d)'
+                    trend_header='MaxOut (7d)'
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
-            
-            # Add phase termination charts without additional header
-            for fig in region_phase_figures:
-                # Wrap each chart in a KeepTogether to ensure it stays on one page
-                chart_elements = []
-                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
-                content.append(KeepTogether(chart_elements))
-                content.append(Spacer(1, 0.15*inch))
-                plt.close(fig)
+
+            # Charts for the new alerts belong directly under their own table
+            content.extend(_chart_flowables(region_phase_figures))
+
+        content.extend(_ongoing_section(
+            'Phase Termination Alerts',
+            region_maxout_ongoing_rows,
+            total_maxout_ongoing,
+            styles,
+            max_table_rows,
+            figures=region_ongoing_phase_figures,
+            include_trend=True,
+            trend_header='MaxOut (7d)',
+        ))
 
         region_phase_skip_figures = [fig for fig, reg in (phase_skip_figures or []) if reg == region]
         if (
@@ -541,8 +982,24 @@ def generate_pdf_report(
             region_phase_skip_rows = pd.DataFrame()
             total_phase_skip_alerts = 0
 
-        if (region_phase_skip_rows is not None and not region_phase_skip_rows.empty) or region_phase_skip_figures:
-            content.append(Paragraph("Phase Skip Alerts", styles['SectionHeading']))
+        if _has_rows(ongoing_phase_skip_rows) and signals_df is not None:
+            region_phase_skip_ongoing_rows, total_phase_skip_ongoing = prepare_phase_skip_alerts_table(
+                ongoing_phase_skip_rows,
+                signals_df,
+                region=region,
+                allowed_pairs=ongoing_phase_skip_pairs,
+                min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0,
+                max_rows=max_table_rows,
+            )
+        else:
+            region_phase_skip_ongoing_rows = pd.DataFrame()
+            total_phase_skip_ongoing = 0
+
+        if (
+            (region_phase_skip_rows is not None and not region_phase_skip_rows.empty)
+            or region_phase_skip_figures
+        ):
+            content.append(Paragraph("New Phase Skip Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
             explanation = """Phase Skip alerts highlight phases where wait times exceeded 1.5x the cycle length without an active preempt window.
@@ -562,73 +1019,106 @@ def generate_pdf_report(
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
 
-            for fig in region_phase_skip_figures:
-                chart_elements = []
-                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
-                content.append(KeepTogether(chart_elements))
-                content.append(Spacer(1, 0.15*inch))
-                plt.close(fig)
+            content.extend(_chart_flowables(region_phase_skip_figures))
+
+        content.extend(_ongoing_section(
+            'Phase Skip Alerts',
+            region_phase_skip_ongoing_rows,
+            total_phase_skip_ongoing,
+            styles,
+            max_table_rows,
+            figures=region_ongoing_phase_skip_figures,
+        ))
 
         # Section: Detector Health - Changed to a single header
+        if _has_rows(ongoing_alerts.get('actuations')) and region_signals_df is not None:
+            region_detector_ongoing_rows, total_detector_ongoing = prepare_detector_health_alerts_table(
+                ongoing_alerts['actuations'],
+                region_signals_df,
+                max_rows=max_table_rows,
+                detector_hourly_df=detector_hourly_df,
+            )
+        else:
+            region_detector_ongoing_rows = pd.DataFrame()
+            total_detector_ongoing = 0
+
         if len(filtered_df_actuations) > 0 and region_detector_figures:
-            content.append(Paragraph("Detector Health Alerts", styles['SectionHeading']))
+            content.append(Paragraph("New Detector Health Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
-            explanation = """The following tables and charts display detector health metrics that have been flagged as anomalous. 
-            Points marked with dots in the charts indicate periods where the system detected unusual detector behavior."""
+            explanation = """The following tables and charts display detector health metrics that have been flagged as anomalous.
+            Points marked with dots in the charts indicate periods where the system detected unusual detector behavior.
+            A detector is listed when it was flagged within the last 7 days, measured against a 21-day baseline for that detector."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
-            
+
             if region_signals_df is not None:
                 # Create detector health table with row limit
                 detector_alerts_df, total_detector_alerts = prepare_detector_health_alerts_table(
-                    filtered_df_actuations, 
+                    filtered_df_actuations,
                     region_signals_df,
-                    max_rows=max_table_rows
+                    max_rows=max_table_rows,
+                    detector_hourly_df=detector_hourly_df,
                 )
-                
+
                 table_content = create_reportlab_table(
-                    detector_alerts_df, 
-                    "Detector Health Alerts", 
+                    detector_alerts_df,
+                    "Detector Health Alerts",
                     styles,
                     total_count=total_detector_alerts,
                     max_rows=max_table_rows,
-                    trend_header='Count (21d)'
+                    trend_header='Count (7d)'
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
-            
+
             # Add detector health charts without additional header
-            for fig in region_detector_figures:
-                # Wrap each chart in a KeepTogether to ensure it stays on one page
-                chart_elements = []
-                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
-                content.append(KeepTogether(chart_elements))
-                content.append(Spacer(1, 0.15*inch))
-                plt.close(fig)
+            content.extend(_chart_flowables(region_detector_figures))
+
+        content.extend(_ongoing_section(
+            'Detector Health Alerts',
+            region_detector_ongoing_rows,
+            total_detector_ongoing,
+            styles,
+            max_table_rows,
+            figures=region_ongoing_detector_figures,
+            include_trend=True,
+            trend_header='Count (7d)',
+        ))
 
 
         # Section: Ped Detector Health
+        if _has_rows(ongoing_alerts.get('pedestrian')) and region_signals_df is not None:
+            region_ped_ongoing_rows, total_ped_ongoing = prepare_ped_alerts_table(
+                ongoing_alerts['pedestrian'],
+                ped_hourly_df,
+                region_signals_df,
+                max_rows=max_table_rows,
+            )
+        else:
+            region_ped_ongoing_rows = pd.DataFrame()
+            total_ped_ongoing = 0
+
         if len(filtered_df_ped) > 0 and region_ped_figures:
-            content.append(Paragraph("Pedestrian Detector Alerts", styles['SectionHeading']))
+            content.append(Paragraph("New Pedestrian Detector Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
             explanation = """Pedestrian detector alerts are are generated when an anomaly in ped services and/or actuations is detected."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
-            
+
             if region_signals_df is not None:
                 # Create detector health table with row limit
                 detector_alerts_df, total_detector_alerts = prepare_ped_alerts_table(
-                    filtered_df_ped, 
+                    filtered_df_ped,
                     ped_hourly_df,
                     region_signals_df,
                     max_rows=max_table_rows
                 )
-                
+
                 table_content = create_reportlab_table(
-                    detector_alerts_df, 
-                    "Ped Detector Alerts", 
+                    detector_alerts_df,
+                    "Ped Detector Alerts",
                     styles,
                     total_count=total_detector_alerts,
                     max_rows=max_table_rows,
@@ -636,59 +1126,96 @@ def generate_pdf_report(
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
-            
-            # Add detector health charts without additional header
-            for fig in region_ped_figures:
-                # Wrap each chart in a KeepTogether to ensure it stays on one page
-                chart_elements = []
-                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
-                content.append(KeepTogether(chart_elements))
-                content.append(Spacer(1, 0.15*inch))
-                plt.close(fig)
+
+            # Add ped detector charts without additional header
+            content.extend(_chart_flowables(region_ped_figures))
+
+        content.extend(_ongoing_section(
+            'Pedestrian Detector Alerts',
+            region_ped_ongoing_rows,
+            total_ped_ongoing,
+            styles,
+            max_table_rows,
+            figures=region_ongoing_ped_figures,
+            include_trend=True,
+            trend_header='Svc (7d)',
+        ))
 
         # Section: Missing Data - Changed to a single header
+        if _has_rows(ongoing_alerts.get('missing_data')) and region_signals_df is not None:
+            region_missing_data_ongoing_rows, total_missing_data_ongoing = prepare_missing_data_alerts_table(
+                ongoing_alerts['missing_data'],
+                region_signals_df,
+                max_rows=max_table_rows,
+            )
+        else:
+            region_missing_data_ongoing_rows = pd.DataFrame()
+            total_missing_data_ongoing = 0
+
         if len(filtered_df_missing_data) > 0 and region_missing_data_figures:
-            content.append(Paragraph("Missing Data Alerts", styles['SectionHeading']))
+            content.append(Paragraph("New Missing Data Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
-            explanation = """The following tables and charts display missing data patterns that have been flagged as anomalous. 
-            Higher values indicate a greater percentage of missing data. Points marked with dots in the charts indicate periods 
-            where the system detected significant data loss which may affect signal operation analysis."""
+            explanation = """The following tables and charts display missing data patterns that have been flagged as anomalous.
+            Higher values indicate a greater percentage of missing data. Points marked with dots in the charts indicate periods
+            where the system detected significant data loss which may affect signal operation analysis.
+            A signal is listed when it was flagged within the last 7 days, measured against a 21-day baseline for that signal."""
             content.append(Paragraph(explanation, styles['Normal']))
             content.append(Spacer(1, 0.2*inch))
-            
+
             if region_signals_df is not None:
                 # Create missing data table with row limit - each signal appears only once with its worst day
                 missing_data_alerts_df, total_missing_data_alerts = prepare_missing_data_alerts_table(
-                    filtered_df_missing_data, 
+                    filtered_df_missing_data,
                     region_signals_df,
                     max_rows=max_table_rows
                 )
-                
+
                 table_content = create_reportlab_table(
-                    missing_data_alerts_df, 
-                    "Missing Data Alerts", 
+                    missing_data_alerts_df,
+                    "Missing Data Alerts",
                     styles,
                     total_count=total_missing_data_alerts,
                     max_rows=max_table_rows,
-                    trend_header='Missing (21d)'
+                    trend_header='Missing (7d)'
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
-              # Add missing data charts without additional header
-            for fig in region_missing_data_figures:
-                # Wrap each chart in a KeepTogether to ensure it stays on one page
-                chart_elements = []
-                chart_elements.append(MatplotlibFigure(fig, width=6.5*inch, height=2.8*inch))
-                content.append(KeepTogether(chart_elements))
-                content.append(Spacer(1, 0.15*inch))
-                plt.close(fig)        # Section: System Outages
+
+            # Add missing data charts without additional header
+            content.extend(_chart_flowables(region_missing_data_figures))
+
+        content.extend(_ongoing_section(
+            'Missing Data Alerts',
+            region_missing_data_ongoing_rows,
+            total_missing_data_ongoing,
+            styles,
+            max_table_rows,
+            figures=region_ongoing_missing_data_figures,
+            include_trend=True,
+            trend_header='Missing (7d)',
+        ))
+
+        # Section: System Outages
         # Filter system outages for this region (or show all for "All Regions")
         if region == "All Regions":
             region_system_outages = system_outages_df if not system_outages_df.empty else pd.DataFrame()
         else:
             region_system_outages = system_outages_df[system_outages_df['Region'] == region] if not system_outages_df.empty else pd.DataFrame()
 
+        ongoing_system_outages = ongoing_alerts.get('system_outages')
+        if _has_rows(ongoing_system_outages) and region != "All Regions":
+            ongoing_system_outages = ongoing_system_outages[ongoing_system_outages['Region'] == region]
+        if _has_rows(ongoing_system_outages):
+            region_system_outages_ongoing_rows, total_system_outages_ongoing = prepare_system_outages_table(
+                ongoing_system_outages,
+                max_rows=max_table_rows,
+            )
+        else:
+            region_system_outages_ongoing_rows = pd.DataFrame()
+            total_system_outages_ongoing = 0
+
+        # A region earns a report when it has anything to say, new or ongoing.
         region_has_alerts = any([
             region_phase_figures,
             region_detector_figures,
@@ -697,11 +1224,25 @@ def generate_pdf_report(
             region_phase_skip_figures,
             not region_phase_skip_rows.empty,
             not region_clearance_rows.empty,
-            not region_system_outages.empty
+            not region_overlap_dual_rows.empty,
+            not region_general_phase_rows.empty,
+            not region_overlap_conflict_rows.empty,
+            not region_preempt_rows.empty,
+            not region_system_outages.empty,
+            not region_maxout_ongoing_rows.empty,
+            not region_detector_ongoing_rows.empty,
+            not region_ped_ongoing_rows.empty,
+            not region_missing_data_ongoing_rows.empty,
+            not region_phase_skip_ongoing_rows.empty,
+            not region_clearance_ongoing_rows.empty,
+            not region_general_phase_ongoing_rows.empty,
+            not region_overlap_conflict_ongoing_rows.empty,
+            not region_preempt_ongoing_rows.empty,
+            not region_system_outages_ongoing_rows.empty,
         ])
-        
+
         if not region_system_outages.empty:
-            content.append(Paragraph("System-Wide Outages", styles['SectionHeading']))
+            content.append(Paragraph("New System-Wide Outages", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
             explanation = """The following table shows dates when more than 30% of devices in this region experienced missing data, 
@@ -714,10 +1255,10 @@ def generate_pdf_report(
                 region_system_outages,
                 max_rows=max_table_rows
             )
-            
+
             table_content = create_reportlab_table(
-                system_outages_table_df, 
-                "System-Wide Outages", 
+                system_outages_table_df,
+                "System-Wide Outages",
                 styles,
                 total_count=total_system_outages,
                 max_rows=max_table_rows,
@@ -725,6 +1266,14 @@ def generate_pdf_report(
             )
             content.extend(table_content)
             content.append(Spacer(1, 0.3*inch))
+
+        content.extend(_ongoing_section(
+            'System-Wide Outages',
+            region_system_outages_ongoing_rows,
+            total_system_outages_ongoing,
+            styles,
+            max_table_rows,
+        ))
 
         # Build the PDF with custom canvas for proper page numbering
         doc.build(content,
