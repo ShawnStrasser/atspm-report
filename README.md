@@ -76,9 +76,14 @@ All inputs except `signals` come straight from atspm's output tables. `DeviceId`
 | `pedestrian` | `full_ped` | ~21 days |
 | `phase_wait` | `phase_wait` | 14 days (`phase_skip_retention_days`) |
 | `coordination_agg` | `coordination_agg` | same as `phase_wait`, chart decoration only |
-| `timeline` | `timeline` | **exactly 1 day** |
+| `timeline` | `timeline` | 1 day, or up to 42 days (see below) |
 
-The CUSUM detectors compute each entity's baseline from everything you pass, so keep the window consistent. `timeline` must be a single day: the clearance, alarm, preempt, and conflict checks all assume it, and alarm and preempt history is accumulated across runs for you.
+The CUSUM detectors compute each entity's baseline from everything you pass, so keep the window consistent.
+
+The latest day in `timeline` is the report day, and the clearance and conflict checks only ever look at that day. The controller alarm and preempt checks need six weeks of daily counts, which you can supply either way:
+
+- **One day of timeline.** Persist the returned `updated_alarm_history` and `updated_preempt_history` and pass them back as `alarm_history` and `preempt_history`; the counts build up over runs. Days present in the timeline replace the matching history rows, so re-running a day does not double count it.
+- **Up to 42 days of timeline.** The counts are rebuilt from it every run and there is nothing to persist. Older days can be trimmed to the `ALARM_EVENT_CLASSES` and `Preempt` rows to keep it small. Add **`device_days`** (columns `DeviceId`, `Date`: the days each signal reported data) so the preempt check counts a reported day with no calls as zero; without it, reported days are inferred from each day's timeline span, which a trimmed day no longer has.
 
 `detector_health` needs the `prediction` and `anomaly` columns, which come from atspm's `detector_health` aggregation, not the plain `actuations` one.
 
@@ -116,6 +121,7 @@ result = ReportGenerator(config).generate(
 # 1. Persist history for the next run. Store it verbatim.
 for alert_type, df in result['updated_past_alerts'].items():
     df.to_parquet(STATE / f'past_{alert_type}.parquet', index=False)
+# Only needed when timeline is a single day (see Inputs).
 result['updated_alarm_history'].to_parquet(STATE / 'alarm_history.parquet', index=False)
 result['updated_preempt_history'].to_parquet(STATE / 'preempt_history.parquet', index=False)
 
@@ -150,7 +156,7 @@ result = ReportGenerator(config).generate(
 
 ### State between runs
 
-`generate()` never writes anything. Save the three `updated_*` values and pass them back unchanged next run. Every retention and suppression rule is already applied inside, so do not filter, dedupe, or reshape them. Dropping them does not error; it silently resets suppression, alarm totals, or the preempt baseline.
+`generate()` never writes anything. Save `updated_past_alerts` and pass it back unchanged next run; do the same with `updated_alarm_history` and `updated_preempt_history` unless you pass a multi-day `timeline`, in which case those two are rebuilt every run and need not be stored. Every retention and suppression rule is already applied inside, so do not filter, dedupe, or reshape them. Dropping them does not error; it silently resets suppression, alarm totals, or the preempt baseline.
 
 ## Configuration
 

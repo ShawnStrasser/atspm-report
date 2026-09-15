@@ -71,6 +71,22 @@ def _get_shape_str(data: Union[pd.DataFrame, ir.Table]) -> str:
     return "unknown"
 
 
+def _split_timeline_days(timeline: pd.DataFrame):
+    """Return (all rows, rows on the latest day, latest day) for a pandas timeline.
+
+    The latest day in the timeline is the report day. Clearance and conflict
+    checks only ever look at that day; the alarm and preempt counters use every
+    day present, so a caller with its own timeline store can pass several weeks
+    and have the six-week counts rebuilt each run instead of accumulated.
+    """
+    starts = pd.to_datetime(timeline['StartTime'], errors='coerce')
+    report_day = starts.max()
+    if pd.isna(report_day):
+        return timeline, timeline.head(0), None
+    report_day = pd.Timestamp(report_day).normalize()
+    return timeline, timeline[starts >= report_day], report_day
+
+
 def _normalize_deviceid(data: Union[pd.DataFrame, ir.Table, None]) -> Union[pd.DataFrame, ir.Table, None]:
     """Convert DeviceId column to string type if present, works for both pandas and Ibis."""
     if data is None:
@@ -297,6 +313,7 @@ class ReportGenerator:
         past_alerts: Optional[Dict[str, pd.DataFrame]] = None,
         alarm_history: Optional[pd.DataFrame] = None,
         preempt_history: Optional[pd.DataFrame] = None,
+        device_days: Optional[Union[pd.DataFrame, ir.Table]] = None,
     ) -> dict:
         """
         Generate reports from provided DataFrames or Ibis tables.
@@ -319,13 +336,23 @@ class ReportGenerator:
                 (15-minute bin aggregated data for cycle length plotting)
             timeline: ATSPM timeline data with columns:
                 DeviceId, StartTime, EndTime, Duration, IsValid, EventClass, EventValue
+                Usually the report day alone. The latest day present is the report
+                day and is the only day the clearance and conflict checks look at;
+                the alarm and preempt counters use every day present, so passing
+                up to six weeks (older days trimmed to alarm and Preempt rows is
+                fine) rebuilds those counts each run with no history to persist.
             alarm_history: Accumulated daily controller alarm counts with columns:
-                DeviceId, AlarmType, Date, Count, LatestAlarm. Timeline only covers
-                one day, so six-week alarm totals are carried across runs here.
+                DeviceId, AlarmType, Date, Count, LatestAlarm. For callers that
+                pass one day of timeline: six-week totals are carried across runs
+                here. Days present in the timeline replace the matching history rows.
             preempt_history: Accumulated daily preempt call counts with columns:
                 DeviceId, Preempt, Date, Count, ValidCount, TotalDuration, MaxDuration.
                 Carried across runs like alarm_history; the preempt frequency
                 baseline is built from it.
+            device_days: Which days each signal reported data, columns DeviceId, Date.
+                Only needed with a multi-day timeline whose older days were trimmed:
+                the preempt check treats a reported day with no calls as zero, and
+                without this it infers reported days from each day's timeline span.
             past_alerts: Dict of alert_type -> DataFrame for suppression.
                 Keys: 'maxout', 'actuations', 'missing_data', 'pedestrian',
                       'phase_skips', 'clearance_intervals', 'overlap_dual_indications',
@@ -363,9 +390,17 @@ class ReportGenerator:
         phase_wait = _normalize_deviceid(phase_wait)
         coordination_agg = _normalize_deviceid(coordination_agg)
         timeline = _normalize_deviceid(timeline)
+        device_days = _normalize_deviceid(device_days)
         
         # Convert signals to pandas (needed for downstream operations)
         signals = _to_pandas(signals)
+
+        # Latest day = report day for the clearance and conflict checks; every day
+        # feeds the alarm and preempt counters (see _split_timeline_days).
+        timeline_latest, report_day = None, None
+        if not _is_empty(timeline):
+            timeline, timeline_latest, report_day = _split_timeline_days(_to_pandas(timeline))
+        device_days = _to_pandas(device_days) if not _is_empty(device_days) else None
         
         verbosity = self.config['verbosity']
         log_message("Starting signal analysis...", 1, verbosity)
@@ -527,9 +562,9 @@ class ReportGenerator:
             self.cycle_length_data = pd.DataFrame()
 
         # Process clearance interval data if provided
-        if not _is_empty(timeline):
+        if not _is_empty(timeline_latest):
             log_message("Processing clearance interval data...", 1, verbosity)
-            clearance_alerts = process_clearance_intervals(timeline, self.config)
+            clearance_alerts = process_clearance_intervals(timeline_latest, self.config)
             new_alerts['clearance_intervals'] = clearance_alerts
             log_message(f"Processed clearance interval data. Shape: {clearance_alerts.shape}", 1, verbosity)
         else:
@@ -539,13 +574,13 @@ class ReportGenerator:
         # never suppressed against past alerts. The section is self-clearing
         # because a pair is only listed when it alarmed again on the report day.
         log_message("Processing controller alarms...", 1, verbosity)
-        daily_alarms = summarize_daily_alarms(_to_pandas(timeline))
+        daily_alarms = summarize_daily_alarms(timeline)
         updated_alarm_history = update_alarm_history(
             daily_alarms,
             alarm_history if alarm_history is not None else pd.DataFrame(),
             verbosity=verbosity,
         )
-        alarm_alerts = build_alarm_alerts(updated_alarm_history)
+        alarm_alerts = build_alarm_alerts(updated_alarm_history, report_date=report_day)
         log_message(
             f"Processed controller alarms. Shape: {alarm_alerts.shape}",
             1,
@@ -556,13 +591,13 @@ class ReportGenerator:
         # its alerts DO go through suppression (keyed on direction) so each
         # signal/preempt shows up once per change rather than daily.
         log_message("Processing preempt frequency...", 1, verbosity)
-        daily_preempts = summarize_daily_preempts(_to_pandas(timeline))
+        daily_preempts = summarize_daily_preempts(timeline, device_days=device_days)
         updated_preempt_history = update_preempt_history(
             daily_preempts,
             preempt_history if preempt_history is not None else pd.DataFrame(),
             verbosity=verbosity,
         )
-        preempt_alerts = build_preempt_alerts(updated_preempt_history)
+        preempt_alerts = build_preempt_alerts(updated_preempt_history, report_date=report_day)
         new_alerts['preempts'] = preempt_alerts
         log_message(
             f"Processed preempt frequency. Shape: {preempt_alerts.shape}",
@@ -574,7 +609,7 @@ class ReportGenerator:
         # same-numbered phase/overlap relationships.
         if self.config['overlap_dual_indications_enabled']:
             log_message('Processing overlap dual indications...', 1, verbosity)
-            overlap_dual_indications = process_overlap_dual_indications(timeline, self.config)
+            overlap_dual_indications = process_overlap_dual_indications(timeline_latest, self.config)
             new_alerts['overlap_dual_indications'] = overlap_dual_indications
             log_message(
                 f'Processed overlap dual indications. Shape: {overlap_dual_indications.shape}',
@@ -593,7 +628,7 @@ class ReportGenerator:
                 'general_phase_conflict_excluded_device_ids',
             )
             general_phase_conflicts = process_general_phase_conflicts(
-                timeline,
+                timeline_latest,
                 general_phase_config,
             )
             new_alerts['general_phase_conflicts'] = general_phase_conflicts
@@ -614,7 +649,7 @@ class ReportGenerator:
                 'overlap_conflict_excluded_device_ids',
             )
             overlap_conflicts = process_overlap_conflicts(
-                timeline,
+                timeline_latest,
                 overlap_conflict_config,
             )
             new_alerts['overlap_conflicts'] = overlap_conflicts
@@ -629,7 +664,7 @@ class ReportGenerator:
         if self.config['same_movement_color_conflicts_enabled']:
             log_message('Processing same movement color conflicts...', 1, verbosity)
             same_movement_color_conflicts = process_same_movement_color_conflicts(
-                timeline,
+                timeline_latest,
                 self.config,
             )
             new_alerts['same_movement_color_conflicts'] = same_movement_color_conflicts

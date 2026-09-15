@@ -20,6 +20,8 @@ that a day with no calls counts as zero rather than as a gap, and so a preempt
 number that first appears at a signal is compared against a baseline of zeros.
 """
 
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -95,6 +97,7 @@ def _clean_history(history: pd.DataFrame) -> pd.DataFrame:
 def summarize_daily_preempts(
     timeline: pd.DataFrame,
     min_coverage_hours: float = PREEMPT_MIN_COVERAGE_HOURS,
+    device_days: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Collapse timeline preempt intervals into one row per device, preempt and day.
 
@@ -102,8 +105,9 @@ def summarize_daily_preempts(
     started that day; ValidCount, TotalDuration and MaxDuration only cover
     calls whose 102/104 pair closed cleanly, since an unmatched call's
     duration is just the gap to the next call. A ``Preempt == 0`` row is added
-    for every device whose timeline data spans at least ``min_coverage_hours``
-    that day, recording that the device reported data.
+    for every device/day the device reported data: the rows of ``device_days``
+    (columns DeviceId, Date) when given, otherwise every device whose timeline
+    data spans at least ``min_coverage_hours`` that day.
     """
     if timeline is None or timeline.empty or 'EventClass' not in timeline.columns:
         return _empty_history()
@@ -111,15 +115,23 @@ def summarize_daily_preempts(
     starts = pd.to_datetime(timeline['StartTime'], errors='coerce')
     device_ids = timeline['DeviceId'].astype(str)
 
-    coverage = (
-        pd.DataFrame({'DeviceId': device_ids, 'StartTime': starts})
-        .dropna(subset=['StartTime'])
-        .assign(Date=lambda df: df['StartTime'].dt.normalize())
-        .groupby(['DeviceId', 'Date'])['StartTime']
-        .agg(['min', 'max'])
-    )
-    coverage_hours = (coverage['max'] - coverage['min']).dt.total_seconds() / 3600
-    presence = coverage[coverage_hours >= min_coverage_hours].reset_index()[['DeviceId', 'Date']]
+    if device_days is not None and not device_days.empty:
+        presence = pd.DataFrame({
+            'DeviceId': device_days['DeviceId'].astype(str),
+            'Date': pd.to_datetime(device_days['Date'], errors='coerce'),
+        }).dropna(subset=['Date'])
+        presence['Date'] = presence['Date'].dt.normalize()
+        presence = presence.drop_duplicates().reset_index(drop=True)
+    else:
+        coverage = (
+            pd.DataFrame({'DeviceId': device_ids, 'StartTime': starts})
+            .dropna(subset=['StartTime'])
+            .assign(Date=lambda df: df['StartTime'].dt.normalize())
+            .groupby(['DeviceId', 'Date'])['StartTime']
+            .agg(['min', 'max'])
+        )
+        coverage_hours = (coverage['max'] - coverage['min']).dt.total_seconds() / 3600
+        presence = coverage[coverage_hours >= min_coverage_hours].reset_index()[['DeviceId', 'Date']]
     presence['Preempt'] = PRESENCE_PREEMPT
     presence['Count'] = 0
     presence['ValidCount'] = 0
