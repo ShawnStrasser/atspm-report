@@ -1247,7 +1247,7 @@ def prepare_preempt_alerts_table(
         return pd.DataFrame(), 0
 
     total_alerts_count = len(result)
-    result = result.sort_values(['CusumScore', 'Name', 'Preempt'], ascending=[False, True, True])
+    result = result.sort_values(['Score', 'Name', 'Preempt'], ascending=[False, True, True])
     if max_rows > 0:
         result = result.head(max_rows)
 

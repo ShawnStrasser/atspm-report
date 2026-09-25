@@ -671,12 +671,13 @@ def generate_pdf_report(
             content.append(Spacer(1, 0.1*inch))
             explanation = (
                 'Preempt call frequency is tracked for each signal and preempt number. '
-                'Baseline/Day is the typical (median) number of calls per day over the '
-                'trailing six weeks, excluding the most recent seven days of data, which '
-                'are compared against it as Recent/Day. A pair is listed when its recent '
-                'calls shifted well outside the day-to-day variation expected at its '
-                'baseline, in either direction. A Decrease is only reported for preempts '
-                'that normally fire at least once a day. Each signal and preempt is '
+                'Baseline/Day is the average number of calls per day over the trailing '
+                'six weeks, excluding the most recent seven days of data, which are '
+                'compared against it as Recent/Day. The check looks for broken detection, '
+                'not changes in real preemption: a pair is listed when its recent calls at '
+                'least tripled (rising by five or more a day), or all but stopped (a tenth '
+                'or less of a baseline of at least one a day), and the change is well '
+                'outside its own day-to-day variation. Each signal and preempt is '
                 'reported once per shift; the trend shows daily calls over the history.'
             )
             content.append(Paragraph(explanation, styles['Normal']))

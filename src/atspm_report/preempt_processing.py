@@ -6,12 +6,15 @@ ATSPM timeline query pairs into one ``Preempt`` interval per call with
 signal, preempt number and day, and flags signal/preempt pairs whose recent
 call frequency has shifted away from their own baseline.
 
-Daily counts are sparse Poisson-like integers (most pairs fire about once a
-day), so the percentage-based CUSUM in ``statistical_analysis`` does not fit:
-a sample standard deviation near zero makes every blip a multi-sigma event.
-Instead, each pair gets a robust baseline (the median daily count over the
-older history) and a Poisson spread (``sqrt`` of the baseline, floored at 1),
-and a two-sided CUSUM accumulates excesses over the most recent days of data.
+Daily counts are sparse integers (most pairs fire a few times a day at most)
+and overdispersed: emergency runs cluster, and neighbouring signals on one
+route rise and fall together, so day-to-day variance runs well above the
+Poisson value. A preempt's call rate also drifts with traffic, which is not an
+equipment problem. The check is for broken detection, so each pair's
+recent-week total is tested against a negative binomial fitted to its own
+baseline days (mean and variance, never narrower than Poisson), and an alert
+also needs a change only a fault explains: a busy preempt going silent, or an
+input firing erratically at several times its usual rate.
 
 Timeline only ever covers a single day, so daily counts are accumulated across
 runs in a history file, exactly like controller alarms. The history also
@@ -20,6 +23,7 @@ that a day with no calls counts as zero rather than as a gap, and so a preempt
 number that first appears at a signal is compared against a baseline of zeros.
 """
 
+import math
 from typing import Optional
 
 import numpy as np
@@ -33,7 +37,7 @@ PREEMPT_HISTORY_COLUMNS = [
 ]
 PREEMPT_ALERT_COLUMNS = [
     'DeviceId', 'Preempt', 'Date', 'Direction', 'BaselinePerDay', 'RecentPerDay',
-    'BaselineDays', 'RecentDays', 'CusumScore', 'DailyCounts',
+    'BaselineDays', 'RecentDays', 'Score', 'DailyCounts',
 ]
 
 # Preempt numbers are 1-based, so 0 is free to mark "device reported data this
@@ -48,22 +52,33 @@ PREEMPT_MIN_COVERAGE_HOURS = 12
 # Six weeks, inclusive of the report day.
 PREEMPT_HISTORY_DAYS = 42
 
-# Most recent days of data that the CUSUM accumulates over. Everything older
-# forms the baseline, which must have at least PREEMPT_MIN_BASELINE_DAYS.
+# Most recent days of data that form the test window. Everything older forms
+# the baseline, which must have at least PREEMPT_MIN_BASELINE_DAYS.
 PREEMPT_RECENT_DAYS = 7
 PREEMPT_MIN_BASELINE_DAYS = 10
 
-# Textbook CUSUM settings, in units of the pair's spread (sigma). k is the
-# slack subtracted from each day's deviation before it accumulates; h is the
-# accumulated total that raises an alert. Decreases use a lower h because a
-# pair can lose at most its baseline per day, so the low side accumulates
-# slowly; 3 sigma catches a once-a-day preempt that goes silent for a week.
-PREEMPT_CUSUM_K = 0.5
-PREEMPT_CUSUM_H_INCREASE = 5.0
-PREEMPT_CUSUM_H_DECREASE = 3.0
+# Chance of the recent week's total (or a more extreme one) under the baseline
+# that raises an alert. Every signal/preempt pair is tested every day, so this
+# is kept small. Backtested on six weeks of a city's preempts, together with
+# the size gates below, it flagged only a busy preempt that went silent for
+# six days.
+PREEMPT_MAX_P_VALUE = 1e-3
 
-# Drops are only meaningful for preempts that normally fire at least daily; a
-# quiet week from a preempt that fires every few days is not evidence of much.
+# Baseline rate assumed for a preempt that barely fired before, so a new
+# preempt number is judged against about one call every four days, not zero.
+PREEMPT_MIN_BASELINE_PER_DAY = 0.25
+
+# An increase must triple the baseline and add at least this many calls a day,
+# which an erratic input does (3 a day jumping to 20) but busy weeks on an
+# emergency route (1 a day rising to 3 or 4) do not.
+PREEMPT_INCREASE_MIN_RATIO = 3.0
+PREEMPT_INCREASE_MIN_EXTRA_PER_DAY = 5.0
+
+# A decrease must drop to a tenth of the baseline or less, i.e. the preempt
+# has all but stopped, and is only considered for preempts that normally fire
+# at least daily; a quiet week from a preempt that fires every few days, or a
+# few quiet days in a week, is not evidence of a fault.
+PREEMPT_DECREASE_MAX_RATIO = 0.1
 PREEMPT_DECREASE_MIN_BASELINE_PER_DAY = 1.0
 
 DIRECTION_INCREASE = 'Increase'
@@ -212,14 +227,41 @@ def update_preempt_history(
     return combined.reindex(columns=PREEMPT_HISTORY_COLUMNS).reset_index(drop=True)
 
 
+def _count_cdf(count: int, mean: float, var: float) -> float:
+    """P(X <= count) for the negative binomial with this mean and variance.
+
+    Poisson when the variance is not above the mean. Terms are built by the
+    ratio P(k+1)/P(k) in log space, which stays accurate when the variance is
+    barely above the mean (a huge NB size, where lgamma differences lose all
+    precision) and for large means (where P(0) underflows).
+    """
+    if count < 0:
+        return 0.0
+    if var <= mean:
+        log_term = -mean
+        ratio = lambda k: math.log(mean) - math.log(k + 1)
+    else:
+        size = mean * mean / (var - mean)
+        log_q = math.log(mean / (size + mean))  # log(1 - p)
+        log_term = size * math.log1p(-mean / (size + mean))  # size * log(p)
+        ratio = lambda k: math.log(k + size) - math.log(k + 1) + log_q
+    total = 0.0
+    for k in range(count + 1):
+        total += math.exp(log_term)
+        log_term += ratio(k)
+    return min(1.0, total)
+
+
 def build_preempt_alerts(
     history: pd.DataFrame,
     report_date=None,
     recent_days: int = PREEMPT_RECENT_DAYS,
     min_baseline_days: int = PREEMPT_MIN_BASELINE_DAYS,
-    k: float = PREEMPT_CUSUM_K,
-    h_increase: float = PREEMPT_CUSUM_H_INCREASE,
-    h_decrease: float = PREEMPT_CUSUM_H_DECREASE,
+    max_p_value: float = PREEMPT_MAX_P_VALUE,
+    min_baseline: float = PREEMPT_MIN_BASELINE_PER_DAY,
+    increase_min_ratio: float = PREEMPT_INCREASE_MIN_RATIO,
+    increase_min_extra: float = PREEMPT_INCREASE_MIN_EXTRA_PER_DAY,
+    decrease_max_ratio: float = PREEMPT_DECREASE_MAX_RATIO,
     decrease_min_baseline: float = PREEMPT_DECREASE_MIN_BASELINE_PER_DAY,
 ) -> pd.DataFrame:
     """Flag signal/preempt pairs whose recent call frequency shifted from baseline.
@@ -227,18 +269,22 @@ def build_preempt_alerts(
     Only devices that reported data on ``report_date`` (default: the latest
     date in the history) are evaluated, so a pair is judged on fresh data.
     For each pair, days the device reported but the preempt did not fire count
-    as zero. The most recent ``recent_days`` reported days form the CUSUM
+    as zero. The most recent ``recent_days`` reported days form the test
     window; all earlier reported days form the baseline, which needs at least
     ``min_baseline_days`` days.
 
-    With mu = median baseline daily count and sigma = sqrt(max(mu, 1)):
+    With mu = max(baseline mean, ``min_baseline``) and v = max(baseline
+    variance, mu), the recent total S over n days is compared with a negative
+    binomial of mean n*mu and variance n*v:
 
-        increase score = sum(max(0, count - mu - k*sigma)) / sigma  > h_increase
-        decrease score = sum(max(0, mu - count - k*sigma)) / sigma  > h_decrease
+        increase: recent/day >= increase_min_ratio * mu,
+                  recent/day >= mu + increase_min_extra, and P(X >= S) < max_p_value
+        decrease: baseline mean >= decrease_min_baseline,
+                  recent/day <= decrease_max_ratio * baseline mean, and P(X <= S) < max_p_value
 
-    A decrease is only considered when mu >= ``decrease_min_baseline``.
-    Returns one row per alerting pair with the PREEMPT_ALERT_COLUMNS;
-    DailyCounts holds the pair's full daily series for plotting.
+    Returns one row per alerting pair with the PREEMPT_ALERT_COLUMNS; Score is
+    -log10 of the p-value (higher is more certain) and DailyCounts holds the
+    pair's full daily series for plotting.
     """
     hist = _clean_history(history)
     if hist.empty:
@@ -274,44 +320,55 @@ def build_preempt_alerts(
 
     stats = (
         baseline.groupby(pair_cols, as_index=False)
-        .agg(BaselinePerDay=('Count', 'median'), BaselineDays=('Count', 'size'))
+        .agg(
+            BaselinePerDay=('Count', 'mean'),
+            BaselineVar=('Count', 'var'),
+            BaselineDays=('Count', 'size'),
+        )
     )
     stats = stats[stats['BaselineDays'] >= min_baseline_days]
     if stats.empty:
         return _empty_alerts()
 
-    stats['Sigma'] = np.sqrt(np.maximum(stats['BaselinePerDay'], 1.0))
-    scored = recent.merge(stats, on=pair_cols, how='inner')
-    slack = k * scored['Sigma']
-    scored['HighExcess'] = np.maximum(0.0, scored['Count'] - scored['BaselinePerDay'] - slack)
-    scored['LowExcess'] = np.maximum(0.0, scored['BaselinePerDay'] - scored['Count'] - slack)
-
     summary = (
-        scored.groupby(pair_cols, as_index=False)
-        .agg(
-            RecentPerDay=('Count', 'mean'),
-            RecentDays=('Count', 'size'),
-            HighSum=('HighExcess', 'sum'),
-            LowSum=('LowExcess', 'sum'),
-        )
-        .merge(stats, on=pair_cols, how='left')
+        recent.groupby(pair_cols, as_index=False)
+        .agg(RecentTotal=('Count', 'sum'), RecentDays=('Count', 'size'))
+        .merge(stats, on=pair_cols, how='inner')
     )
-    summary['IncreaseScore'] = summary['HighSum'] / summary['Sigma']
-    summary['DecreaseScore'] = summary['LowSum'] / summary['Sigma']
+    summary['RecentPerDay'] = summary['RecentTotal'] / summary['RecentDays']
+    summary['Rate'] = np.maximum(summary['BaselinePerDay'], min_baseline)
 
-    increase = summary['IncreaseScore'] > h_increase
+    # Size-of-change gates first; the tail probability is only computed for
+    # the few pairs that pass them.
+    increase = (
+        (summary['RecentPerDay'] >= increase_min_ratio * summary['Rate'])
+        & (summary['RecentPerDay'] >= summary['Rate'] + increase_min_extra)
+    )
     decrease = (
-        (summary['DecreaseScore'] > h_decrease)
+        ~increase
         & (summary['BaselinePerDay'] >= decrease_min_baseline)
-        & ~increase
+        & (summary['RecentPerDay'] <= decrease_max_ratio * summary['BaselinePerDay'])
     )
     summary['Direction'] = np.select(
         [increase, decrease], [DIRECTION_INCREASE, DIRECTION_DECREASE], default=None,
     )
-    summary['CusumScore'] = np.where(increase, summary['IncreaseScore'], summary['DecreaseScore'])
-    alerts = summary[summary['Direction'].notna()].copy()
+    summary = summary[summary['Direction'].notna()].copy()
+    if summary.empty:
+        return _empty_alerts()
+
+    def p_value(row) -> float:
+        mean = row['RecentDays'] * row['Rate']
+        var = row['RecentDays'] * max(row['BaselineVar'], row['Rate'])
+        total = int(row['RecentTotal'])
+        if row['Direction'] == DIRECTION_INCREASE:
+            return max(0.0, 1.0 - _count_cdf(total - 1, mean, var))
+        return _count_cdf(total, mean, var)
+
+    summary['PValue'] = summary.apply(p_value, axis=1)
+    alerts = summary[summary['PValue'] < max_p_value].copy()
     if alerts.empty:
         return _empty_alerts()
+    alerts['Score'] = -np.log10(np.maximum(alerts['PValue'], 1e-15))
 
     daily_series = (
         grid.groupby(pair_cols)['Count']
@@ -325,10 +382,10 @@ def build_preempt_alerts(
     alerts['RecentPerDay'] = alerts['RecentPerDay'].astype(float)
     alerts['BaselineDays'] = alerts['BaselineDays'].astype(int)
     alerts['RecentDays'] = alerts['RecentDays'].astype(int)
-    alerts['CusumScore'] = alerts['CusumScore'].astype(float)
+    alerts['Score'] = alerts['Score'].astype(float)
 
     return (
-        alerts.sort_values(['CusumScore'], ascending=False)
+        alerts.sort_values(['Score'], ascending=False)
         [PREEMPT_ALERT_COLUMNS]
         .reset_index(drop=True)
     )

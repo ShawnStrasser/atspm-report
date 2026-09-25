@@ -32,7 +32,7 @@ It does **not** fetch data, read or write files, send email, or schedule anythin
 | Phase skip | `phase_wait` | Skips summed per phase over the retention window |
 | Clearance intervals | `timeline` | Yellow/red durations vs. each phase's median and absolute minimums |
 | Controller alarms | `timeline` | Alarms that fired again today, with six-week totals |
-| Preempt frequency | `timeline` | Two-sided Poisson CUSUM of recent daily call counts vs. baseline |
+| Preempt frequency | `timeline` | Recent week's calls vs. a negative binomial fitted to each preempt's baseline, gated to fault-sized changes (tripled and +5/day, or silent) |
 | Phase / overlap conflicts | `timeline` | Interval overlap of conflicting indications (opt-in) |
 
 Pass only the inputs you have; every argument except `signals` is optional and a missing input just leaves its section out.

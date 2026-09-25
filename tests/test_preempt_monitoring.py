@@ -172,7 +172,7 @@ def test_decrease_is_flagged():
 
 def test_new_preempt_number_compares_against_zero_baseline():
     # Preempt 3 fires steadily; preempt 7 only appears in the last week.
-    p7 = _history('sig-1', [0] * 14 + [4] * 7, preempt=7)
+    p7 = _history('sig-1', [0] * 14 + [10] * 7, preempt=7)
     history = pd.concat([
         _history('sig-1', [2] * 21, preempt=3),
         p7[p7['Preempt'] != PRESENCE_PREEMPT],
@@ -319,3 +319,65 @@ def test_generate_suppresses_repeat_but_not_opposite_direction():
     past_alerts['preempts']['Direction'] = DIRECTION_DECREASE
     result, _ = _generate(history, past_alerts)
     assert len(result['alerts']['preempts']) == 1
+
+
+# Six weeks of real daily counts (oldest first) from a city whose reports were
+# full of preempt alerts that were just emergency-route noise.
+NOISY_SERIES = {
+    # Flagged as a decrease from 4.0 to 2.9 a day.
+    'decrease_4_to_2.9': [4, 3, 6, 6, 6, 1, 5, 3, 2, 2, 9, 1, 4, 7, 3, 6, 6, 1, 0, 4, 0, 5, 2, 3, 6, 3, 0,
+                          4, 5, 3, 8, 1, 2, 9, 5, 6, 4, 1, 1, 1, 5, 2],
+    # Flagged as a decrease from 2.0 to 1.6 a day.
+    'decrease_2_to_1.6': [4, 2, 0, 0, 2, 1, 4, 4, 0, 0, 3, 1, 6, 0, 5, 0, 2, 0, 4, 9, 0, 0, 2, 2, 7, 2, 2,
+                          3, 0, 0, 1, 5, 2, 3, 4, 4, 0, 2, 0, 0, 0, 5],
+    # Flagged as an increase from 1.0 to 1.7 a day.
+    'increase_1_to_1.7': [0, 0, 1, 0, 2, 1, 2, 0, 2, 2, 2, 2, 0, 1, 1, 3, 0, 0, 1, 0, 0, 3, 2, 2, 1, 0, 3,
+                          1, 1, 0, 1, 2, 2, 1, 1, 0, 0, 4, 2, 2, 0, 4],
+    # A busier week on an emergency route (neighbouring signals rose with it).
+    'route_busy_week': [0, 0, 1, 0, 3, 0, 1, 1, 1, 0, 4, 0, 0, 0, 0, 1, 0, 2, 1, 0, 0, 0, 0, 1, 1, 1, 0,
+                        1, 1, 0, 0, 0, 2, 2, 0, 2, 3, 3, 5, 0, 0, 1],
+}
+
+
+@pytest.mark.parametrize('name', sorted(NOISY_SERIES))
+def test_overdispersed_noise_does_not_alert(name):
+    assert build_preempt_alerts(_history('sig-1', NOISY_SERIES[name])).empty
+
+
+def test_busy_preempt_going_silent_is_flagged():
+    # Real series: about 3.5 calls a day, then six days of nothing.
+    counts = [2, 2, 4, 5, 1, 3, 8, 3, 3, 1, 4, 6, 3, 4, 6, 2, 2, 0, 1, 0, 0, 0, 0, 0]
+
+    alerts = build_preempt_alerts(_history('sig-1', counts))
+
+    assert alerts['Direction'].tolist() == [DIRECTION_DECREASE]
+    assert alerts.iloc[0]['RecentPerDay'] == pytest.approx(1 / 7)
+
+
+def test_busier_emergency_route_does_not_alert():
+    # Real series: about 1.4 a day rising to 3.4, which is traffic, not a fault.
+    counts = [0, 1, 0, 0, 3, 1, 2, 1, 1, 1, 4, 3, 0, 2, 2, 3, 2, 0, 3, 3, 2, 5, 7, 1, 3]
+    assert build_preempt_alerts(_history('sig-1', counts)).empty
+
+
+def test_erratic_input_is_flagged():
+    counts = [3, 2, 4, 3, 3, 2, 4, 3, 2, 3, 4, 3, 2, 3, 20, 18, 25, 19, 22, 21, 20]
+    alerts = build_preempt_alerts(_history('sig-1', counts))
+    assert alerts['Direction'].tolist() == [DIRECTION_INCREASE]
+
+
+def test_few_quiet_days_do_not_alert():
+    # Real series: about 2 a day, then five days of nothing, then back.
+    counts = [2, 1, 0, 1, 5, 0, 6, 2, 1, 1, 5, 4, 0, 2, 1, 2, 0, 0, 0, 0, 0]
+    assert build_preempt_alerts(_history('sig-1', counts)).empty
+
+
+def test_count_cdf_is_accurate_near_poisson_and_for_large_means():
+    from atspm_report.preempt_processing import _count_cdf
+    poisson = _count_cdf(4, 2.8, 2.8)
+    # Variance a hair above the mean is effectively Poisson.
+    assert _count_cdf(4, 2.8, 2.8 * (1 + 1e-12)) == pytest.approx(poisson, rel=1e-6)
+    assert _count_cdf(4, 2.8, 2.8 * 1.0001) == pytest.approx(poisson, rel=1e-3)
+    # A busy preempt: P(0) underflows naively but the tail is still a real number.
+    assert 0.0 < _count_cdf(700, 1000.0, 1500.0) < 1e-10
+    assert _count_cdf(1000, 1000.0, 1500.0) == pytest.approx(0.5, abs=0.02)
