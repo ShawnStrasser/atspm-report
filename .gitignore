@@ -21,8 +21,14 @@ odot_data/
 reports/
 odot_backfill.py
 odot_validate.py
+odot_detector_health.py
+odot_power_bi.py
+odot_test_report.py
 email_module.py
 raw_event_fetching.py
+azure_auth.py
+requirements-odot.txt
+docs/auth.md
 tests/test_raw_event_fetching.py
 temp_*
 .tmp/

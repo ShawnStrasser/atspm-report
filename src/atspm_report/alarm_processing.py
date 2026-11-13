@@ -92,7 +92,8 @@ def summarize_daily_alarms(timeline: pd.DataFrame) -> pd.DataFrame:
 
     Returns columns DeviceId, AlarmType, Date, Count, LatestAlarm. Count is the
     number of alarm occurrences that started that day; LatestAlarm is the last
-    such start time.
+    such start time. An alarm reported at once and again when it ended has two
+    rows with the same start: it counts once.
     """
     if timeline is None or timeline.empty or 'EventClass' not in timeline.columns:
         return _empty_history()
@@ -109,6 +110,7 @@ def summarize_daily_alarms(timeline: pd.DataFrame) -> pd.DataFrame:
     alarms['DeviceId'] = alarms['DeviceId'].astype(str)
     alarms['AlarmType'] = alarms['EventClass'].astype(str)
     alarms['Date'] = alarms['StartTime'].dt.normalize()
+    alarms = alarms.drop_duplicates(['DeviceId', 'AlarmType', 'StartTime'])
 
     daily = (
         alarms.groupby(['DeviceId', 'AlarmType', 'Date'], as_index=False)
@@ -212,4 +214,14 @@ def build_alarm_alerts(
     result['TotalCount'] = result['TotalCount'].fillna(result['DayCount']).astype(int)
     result['DayCount'] = result['DayCount'].astype(int)
 
-    return result[ALARM_ALERT_COLUMNS].reset_index(drop=True)
+    # One count per calendar day for the trend sparkline. A day without alarms
+    # is a zero, not a gap. The series starts on the first day the history
+    # covers, so days before any data was collected are not shown as zeros.
+    days = pd.date_range(max(window_start, window['Date'].min()), report_date, freq='D')
+    daily = window.groupby(['DeviceId', 'AlarmType', 'Date'])['Count'].sum()
+    result['DailyCounts'] = [
+        daily.loc[(device, alarm)].reindex(days, fill_value=0).astype(int).tolist()
+        for device, alarm in zip(result['DeviceId'], result['AlarmType'])
+    ]
+
+    return result[ALARM_ALERT_COLUMNS + ['DailyCounts']].reset_index(drop=True)

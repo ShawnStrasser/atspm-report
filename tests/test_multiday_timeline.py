@@ -129,5 +129,23 @@ class TestMultiDayTimeline(unittest.TestCase):
         self.assertTrue(without_presence["alerts"]["preempts"].empty)
 
 
+class AlarmDailyCountsTest(unittest.TestCase):
+    def test_days_without_alarms_are_zero(self):
+        from atspm_report.alarm_processing import build_alarm_alerts
+
+        day = pd.Timestamp("2026-10-11")
+        history = pd.DataFrame({
+            "DeviceId": ["1", "1", "2"],
+            "AlarmType": ["Cycle Fault", "Cycle Fault", "Coord Fail"],
+            "Date": [day - pd.Timedelta(days=3), day, day - pd.Timedelta(days=4)],
+            "Count": [2, 5, 1],
+            "LatestAlarm": [day, day, day],
+        })
+        alerts = build_alarm_alerts(history, report_date=day)
+        self.assertEqual(len(alerts), 1)
+        # Series starts on the first day the history covers, zeros in between.
+        self.assertEqual(alerts.iloc[0]["DailyCounts"], [0, 2, 0, 0, 5])
+
+
 if __name__ == "__main__":
     unittest.main()

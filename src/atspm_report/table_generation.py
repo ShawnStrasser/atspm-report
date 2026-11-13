@@ -1,13 +1,15 @@
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+from .visualization import new_figure
 from io import BytesIO
-import base64
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.platypus import Table, TableStyle, Paragraph, Image, Spacer
 from reportlab.lib.units import inch
 from reportlab.pdfbase.pdfmetrics import stringWidth
+
+from .atspm_detector_health import PED, VEHICLE, affects_operations, health_table_order, signal_wide_rows
+from .preempt_cascade import bus_calls_text
+from .health_story import detector_label, health_story, story_difference
 
 # Ongoing-issue rows arrive carrying the date their current run of repeats started.
 # Every prepare_* function passes that column through untouched and renders it as
@@ -15,12 +17,6 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 # caller supplied ongoing rows.
 ONGOING_SINCE_COLUMN = 'OngoingSince'
 ONGOING_DISPLAY_COLUMN = 'Ongoing'
-
-# Hours per point in the pedestrian sparkline. The underlying data is hourly,
-# which is 168 points across the seven days the column covers - far too fine to
-# read at that size.
-PED_SPARKLINE_BUCKET_HOURS = 4
-
 
 def _format_ongoing_since(value):
     """Render an ongoing-since date as 'M/D/YY (Nd)'."""
@@ -38,6 +34,28 @@ def _add_ongoing_column(result, output_columns):
     result = result.copy()
     result[ONGOING_DISPLAY_COLUMN] = result[ONGOING_SINCE_COLUMN].apply(_format_ongoing_since)
     return result, list(output_columns) + [ONGOING_DISPLAY_COLUMN]
+
+
+def head_by_signal(result, max_rows, key='Signal'):
+    """The first max_rows rows of an already-sorted table, with every row of a signal kept together.
+
+    Signals keep the order of their best-ranked row and each signal's rows stay in
+    their order; whole signals are taken until max_rows is reached, so the last
+    signal can take the table past max_rows rather than leave some of its rows out.
+    A table without the key column (not per signal) is cut at max_rows as before.
+    """
+    if max_rows <= 0 or result.empty:
+        return result
+    if key not in result.columns:
+        return result.head(max_rows)
+    first = {}
+    for position, signal in enumerate(result[key]):
+        first.setdefault(signal, position)
+    ordered = result.assign(_signal_rank=result[key].map(first), _row=range(len(result)))
+    ordered = ordered.sort_values(['_signal_rank', '_row'], kind='stable')
+    sizes = ordered.groupby('_signal_rank', sort=True).size()
+    keep = sizes.index[(sizes.cumsum() - sizes) < max_rows]
+    return ordered[ordered['_signal_rank'].isin(keep)].drop(columns=['_signal_rank', '_row'])
 
 
 def _carry_ongoing_column(source_columns, columns):
@@ -138,7 +156,7 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10)
     
     # Limit the number of rows
     if max_rows > 0 and len(result) > max_rows:
-        result = result.head(max_rows)
+        result = head_by_signal(result, max_rows)
     
     return result, total_alerts_count
 
@@ -229,184 +247,104 @@ def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, al
     
     # Limit the number of rows
     if max_rows > 0 and len(aggregated) > max_rows:
-        aggregated = aggregated.head(max_rows)
+        aggregated = head_by_signal(aggregated, max_rows)
 
     return aggregated, total_alerts_count
 
 
-def prepare_detector_health_alerts_table(filtered_df_actuations, signals_df, max_rows=10,
-                                         detector_hourly_df=None):
-    """
-    Prepare a sorted table of detector health alerts with signal name, detector, and date
-    
-    Args:
-        filtered_df_actuations: DataFrame containing detector health alerts
-        signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
-        max_rows: Maximum number of rows to include in the table
-        detector_hourly_df: Optional hourly actuation counts, used for the sparkline
-            so the trend shows the shape of a day rather than a handful of daily totals
-        
-    Returns:
-        Tuple of (Sorted DataFrame with Signal Name, Detector, Date and Alert columns, total_alerts_count)
-    """
-    if filtered_df_actuations.empty:
-        return pd.DataFrame(), 0
-        
-    # Use all data for sparklines, not just alerts
-    detector_df = filtered_df_actuations.copy()
-    
-    # Ensure DeviceId is string type to avoid merge issues
-    signals_df = signals_df.copy()
-    signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
-    
-    # Filter alerts for table display
-    alert_rows = filtered_df_actuations[filtered_df_actuations['Alert'] == 1].copy()
-    if alert_rows.empty:
-        return pd.DataFrame(), 0
-        
-    # Merge with signals dataframe to get names
-    result = pd.merge(
-        alert_rows[_carry_ongoing_column(
-            alert_rows.columns,
-            ['DeviceId', 'Detector', 'Date', 'Alert', 'PercentAnomalous', 'Total'],
-        )],
-        signals_df[['DeviceId', 'Name', 'Region']],  # Updated column names to match signals_df
-        on='DeviceId',
-        how='left'
-    )
-    
-    # Filter out rows where Signal is NaN
-    result = result.dropna(subset=['Name'])
-    
-    if result.empty:
-        return pd.DataFrame(), 0
-    
-    # Get the total count of alerts after filtering but before limiting rows
-    total_alerts_count = len(result)
-    
-    # Rename and select columns
-    result = result.rename(columns={'Name': 'Signal', 'PercentAnomalous': 'Anomalous %'})
-    
-    # Add sparkline column - Group by Signal and Detector and collect time series data
-    sparkline_data = {}
-    
-    # Get all DeviceId and Detector pairs that have alerts
-    device_detector_pairs = result[['DeviceId', 'Detector']].drop_duplicates().values.tolist()
-    
-    # For each device/detector pair with alerts, collect all data for sparklines
-    for device_id, detector in device_detector_pairs:
-        # Get all data for this device/detector pair, not just alerts
-        device_data = detector_df[(detector_df['DeviceId'] == device_id) & 
-                                  (detector_df['Detector'] == detector)]
-        
-        if not device_data.empty:
-            # Sort by date to ensure correct time series
-            device_data = device_data.sort_values('Date')
-            # Store the Total values for sparklines instead of PercentAnomalous
-            sparkline_data[(device_id, detector)] = device_data['Total'].tolist()
+# Sparkline PNGs by their data: a row shows in its region's report and in All
+# Regions, and the same series often shows in several tables.
+_SPARKLINE_PNGS = {}
+_SPARKLINE_CACHE_SIZE = 4096
+# Share of the value range kept free above and below a sparkline's line.
+SPARKLINE_MARGIN = 0.1
+# The usual counts behind a health sparkline's actual ones: seen on white and on the grey bands, and no rival to the blue.
+SPARKLINE_EXPECTED_COLOR = '#808080'
+SPARKLINE_EXPECTED_WIDTH = 0.6
+SPARKLINE_EXPECTED_NOTE = "The grey line in a sparkline is the detector's usual count for that hour."
 
-    # Hourly counts make a far more legible trend than a dozen daily totals: a
-    # detector that dies mid-morning, or only fails at night, is invisible once a
-    # day is collapsed to one point.
-    if detector_hourly_df is not None and not detector_hourly_df.empty:
-        hourly = detector_hourly_df.copy()
-        hourly['DeviceId'] = hourly['DeviceId'].astype(str)
-        hourly['TimeStamp'] = pd.to_datetime(hourly['TimeStamp'])
-        for device_id, detector in device_detector_pairs:
-            pair_data = hourly[(hourly['DeviceId'] == str(device_id)) &
-                               (hourly['Detector'] == detector)]
-            if pair_data.empty:
-                continue
-            pair_data = pair_data.sort_values('TimeStamp')
-            sparkline_data[(device_id, detector)] = pair_data['Total'].tolist()
-    
-    # Add the sparkline data to the result dataframe
-    result['Sparkline_Data'] = result.apply(
-        lambda row: sparkline_data.get((row['DeviceId'], row['Detector']), []), 
-        axis=1
-    )
-    
-    # Select and order columns
-    result, output_columns = _add_ongoing_column(
-        result, ['Signal', 'Detector', 'Date', 'Anomalous %', 'Sparkline_Data']
-    )
-    result = result[output_columns]
 
-    # Sort by Anomalous % in descending order, then by Signal, Detector
-    result = result.sort_values(by=['Anomalous %', 'Signal', 'Detector'], ascending=[False, True, True])
-    
-    # Limit the number of rows
-    if max_rows > 0 and len(result) > max_rows:
-        result = result.head(max_rows)
-    
-    return result, total_alerts_count
-
-def create_sparkline(data, width=1.0, height=0.25, color='#1f77b4'):
+def create_sparkline(data, width=1.0, height=0.25, color='#1f77b4', expected=None):
     """
     Create a sparkline image from a list of values
-    
+
     Args:
         data: List of values to plot
         width: Width of the image in inches
         height: Height of the image in inches
         color: Color of the sparkline
-        
+        expected: Optional usual values of the same points, a thin muted line behind the actual ones
+
     Returns:
         ReportLab Image object
     """
-    if not data or len(data) < 2:
+    # repr tells 1 from 1.0 and an int from a numpy int, so a hit is the same drawing.
+    key = (repr(list(data) if data is not None else data), width, height, color, repr(list(expected)) if expected is not None else None)
+    png = _SPARKLINE_PNGS.get(key)
+    if png is None:
+        if len(_SPARKLINE_PNGS) >= _SPARKLINE_CACHE_SIZE:
+            _SPARKLINE_PNGS.clear()
+        png = _SPARKLINE_PNGS[key] = _sparkline_png(data, width, height, color, expected)
+    return Image(BytesIO(png), width=width*inch, height=height*inch)
+
+
+def _sparkline_png(data, width, height, color, expected=None) -> bytes:
+    values = [value for value in (data or []) if not pd.isna(value)]
+    if len(values) < 2:
         # Create an empty image if no data
-        fig, ax = plt.subplots(figsize=(width, height), dpi=150)
+        fig = new_figure((width, height), dpi=150)
+        ax = fig.subplots()
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.axis('off')
         
         buf = BytesIO()
         fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, transparent=True)
-        plt.close(fig)
-        buf.seek(0)
-        
-        return Image(buf, width=width*inch, height=height*inch)
+        return buf.getvalue()
     
-    # Create the sparkline
-    fig, ax = plt.subplots(figsize=(width, height), dpi=150)  # Increased DPI for better quality
+    # Create the sparkline. The axes fill the image exactly, so it is drawn at the size it is shown.
+    fig = new_figure((width, height), dpi=150)  # Increased DPI for better quality
+    ax = fig.add_axes((0, 0, 1, 1))
     
     # Plot data points as a line only - no markers
     x = list(range(len(data)))
-    ax.plot(x, data, color=color, linewidth=1.0)
+    usual = [value for value in (expected or []) if not pd.isna(value)]
+    if usual and len(expected) == len(data):
+        ax.plot(x, expected, color=SPARKLINE_EXPECTED_COLOR, linewidth=SPARKLINE_EXPECTED_WIDTH, zorder=1)
+        values = values + usual
+    ax.plot(x, data, color=color, linewidth=1.0, zorder=2)
     
     # No endpoint marker - removing this line
     # ax.scatter(x[-1], data[-1], color=color, s=15, zorder=3)
     
-    # Set limits with a bit of padding
-    y_min = min(data) * 0.9 if min(data) > 0 else min(data) * 1.1
-    y_max = max(data) * 1.1
+    # Room above and below the line, so the lowest and highest values keep their full thickness.
+    low, high = min(values), max(values)
+    span = (high - low) or max(abs(high), 1)
     ax.set_xlim(-0.5, len(data) - 0.5)
-    ax.set_ylim(y_min, y_max)
+    ax.set_ylim(low - SPARKLINE_MARGIN * span, high + SPARKLINE_MARGIN * span)
     
     # Remove axes and borders
     ax.axis('off')
     fig.patch.set_alpha(0)
-    
-    # Tighter layout to remove excess whitespace
-    plt.tight_layout(pad=0)
-    
-    # Convert to Image
+
     buf = BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, transparent=True)
-    plt.close(fig)
-    buf.seek(0)
-    
-    return Image(buf, width=width*inch, height=height*inch)
+    fig.savefig(buf, format='png', transparent=True)
+    return buf.getvalue()
 
 # The space a table actually gets on the page: letter paper with the half-inch
 # side margins and 1.2in/0.5in top and bottom margins the report uses, less the
 # 6pt of padding a frame keeps on every side.
 TABLE_AVAILABLE_WIDTH = 528.0
 TABLE_AVAILABLE_HEIGHT = 657.6
+# The tallest a signal's merged cell gets in the ranked health tables, whose signals with the most detectors come first. It cannot
+# split, so a taller one moves whole to the next page and can leave a heading alone on this one; a signal with more rows repeats
+# its name.
+MAX_MERGED_HEIGHT = 0.45 * TABLE_AVAILABLE_HEIGHT
 
-# Reportlab's default cell padding, 6pt on each side.
+# Reportlab's default cell padding, 6pt on each side, and the tighter one of a table
+# with more columns than the page has room for.
 _CELL_PADDING = 12.0
+_COMPACT_PADDING = 6.0
 _HEADER_FONT = ('Helvetica-Bold', 10)
 _BODY_FONT = ('Helvetica', 9)
 
@@ -414,8 +352,19 @@ _BODY_FONT = ('Helvetica', 9)
 # end up as wide as their longest word, which wraps the sentence into six or
 # seven lines and makes the row taller than it has any need to be, so they take
 # whatever width the value columns do not need instead.
-FLEX_COLUMNS = ('Details',)
+FLEX_COLUMNS = ('Details', 'What Is Wrong', 'What Happened')
 MIN_FLEX_WIDTH = 1.75 * inch
+# The health tables' narrative is the point of those tables, so it gets more room:
+# a line less per row is pages less.
+STORY_COLUMNS = ('What Is Wrong', 'What Happened')
+MIN_STORY_WIDTH = 4.1 * inch
+# A signal name wraps before anything else does, down to this.
+MIN_SIGNAL_WIDTH = 1.45 * inch
+# The sparkline's width when its column has room for it.
+SPARKLINE_WIDTH = 1.0 * inch
+# The detector triage's short label wraps inside a column of this width.
+IMPACT_COLUMN = 'Impact'
+IMPACT_WIDTH = 1.55 * inch
 
 
 def _natural_width(header_text, values):
@@ -426,38 +375,81 @@ def _natural_width(header_text, values):
     return width + _CELL_PADDING
 
 
+def _word_width(header_text, values, padding=_CELL_PADDING):
+    """Width of the longest single word in a column: the narrowest it can wrap to."""
+    width = max((stringWidth(w, *_HEADER_FONT) for w in str(header_text).split()), default=0)
+    for value in values:
+        for word in str(value).split():
+            width = max(width, stringWidth(word, *_BODY_FONT))
+    # A couple of points spare: a word exactly as wide as its cell still breaks.
+    return width + padding + 2
+
+
 def _column_widths(df_display, header, trend_width=None):
     """Size the value columns to their content and give the rest to the sentence.
 
-    Returns None when there is no sentence column, which leaves reportlab to size
-    everything itself exactly as it did before.
+    Returns (widths, compact). widths is None when there is no sentence column,
+    which leaves reportlab to size everything itself exactly as it did before.
+    compact says the table only fits with tighter cell padding. The trend column
+    keeps its width throughout, so its sparkline always fits its cell.
     """
+    flex_names = FLEX_COLUMNS
     if not any(name in FLEX_COLUMNS for name in header):
-        return None
+        # Without a sentence column, leave it to reportlab unless the row would
+        # run off the page. Then the signal name, usually the longest value,
+        # wraps to take whatever the other columns leave.
+        natural = sum(
+            trend_width if trend_width is not None and i == len(header) - 1
+            else _natural_width(name, df_display[name] if name in df_display.columns else [])
+            for i, name in enumerate(header)
+        )
+        if natural <= TABLE_AVAILABLE_WIDTH or not header or header[0] != GROUP_COLUMN:
+            return None, False
+        flex_names = (GROUP_COLUMN,)
 
+    def values(index):
+        return df_display[header[index]] if header[index] in df_display.columns else []
+
+    is_trend = [trend_width is not None and index == len(header) - 1 for index in range(len(header))]
     widths = []
     for index, name in enumerate(header):
-        if trend_width is not None and index == len(header) - 1:
+        if is_trend[index]:
             widths.append(trend_width)
-        elif name in FLEX_COLUMNS:
+        elif name == IMPACT_COLUMN:
+            widths.append(IMPACT_WIDTH)
+        elif name in flex_names:
             widths.append(None)
         else:
-            values = df_display[name] if name in df_display.columns else []
-            widths.append(_natural_width(name, values))
+            widths.append(_natural_width(name, values(index)))
 
     flex = [i for i, width in enumerate(widths) if width is None]
     fixed = sum(width for width in widths if width is not None)
-    slack = TABLE_AVAILABLE_WIDTH - fixed
-    if slack < MIN_FLEX_WIDTH * len(flex):
-        # The value columns alone want more room than the page has. Shrink them
-        # proportionally rather than running off the edge.
-        keep = TABLE_AVAILABLE_WIDTH - MIN_FLEX_WIDTH * len(flex)
-        scale = keep / fixed if fixed else 1.0
-        widths = [MIN_FLEX_WIDTH if width is None else width * scale for width in widths]
-    else:
-        share = slack / len(flex)
-        widths = [share if width is None else width for width in widths]
-    return widths
+    min_flex = MIN_STORY_WIDTH if any(name in STORY_COLUMNS for name in header) else MIN_FLEX_WIDTH
+    if TABLE_AVAILABLE_WIDTH - fixed >= min_flex * len(flex):
+        share = (TABLE_AVAILABLE_WIDTH - fixed) / len(flex)
+        return [share if width is None else width for width in widths], False
+
+    # The value columns alone want more room than the page has. The signal name
+    # gives first; the others shrink in proportion, wrapping but never narrower
+    # than their longest word. If even that leaves the sentence too little, the
+    # cells get tighter padding.
+    trend_total = (trend_width if trend_width is not None else 0.0) + (IMPACT_WIDTH if IMPACT_COLUMN in header else 0.0)
+    keep = TABLE_AVAILABLE_WIDTH - min_flex * len(flex) - trend_total
+    squeezable = [i for i, width in enumerate(widths) if width is not None and not is_trend[i] and header[i] != IMPACT_COLUMN]
+    for padding, compact in ((_CELL_PADDING, False), (_COMPACT_PADDING, True)):
+        floors = {i: _word_width(header[i], values(i), padding) for i in squeezable}
+        wanted = {i: widths[i] for i in squeezable}
+        if header and header[0] == GROUP_COLUMN and 0 in wanted:
+            floors[0] = max(floors[0], min(wanted[0], MIN_SIGNAL_WIDTH))
+            wanted[0] = max(floors[0], wanted[0] - max(sum(wanted.values()) - keep, 0.0))
+        total = sum(wanted.values())
+        scale = keep / total if total > keep and total else 1.0
+        squeezed = {i: max(wanted[i] * scale, floors[i]) for i in squeezable}
+        remaining = TABLE_AVAILABLE_WIDTH - trend_total - sum(squeezed.values())
+        if remaining >= MIN_FLEX_WIDTH * len(flex) or compact:
+            break
+    result = [squeezed.get(i, width) for i, width in enumerate(widths)]
+    return [max(remaining / len(flex), MIN_FLEX_WIDTH * 0.6) if width is None else width for width in result], compact
 
 
 def _blocks_that_fit(first_row, length, row_heights, max_height):
@@ -512,6 +504,35 @@ def _contiguous_runs(values):
     return runs
 
 
+def _merge_repeats(cells, span_style, df_display, header, story_name, story_style, block_start, block_length, trend_index):
+    """Say things once within a block of a signal's rows (table rows from block_start). A column's equal neighbours become one merged
+    cell; in the story, a detector keeps only what the story before it does not say, and one that adds nothing joins it."""
+    rows = range(block_start, block_start + block_length)
+    for index, name in enumerate(header):
+        if index == 0 or index == trend_index or name not in df_display.columns:
+            continue
+        values = [df_display[name].iloc[row - 1] for row in rows]
+        if name == story_name:
+            values = [values[0]] + [story_difference(values[position - 1], values[position]) for position in range(1, len(values))]
+            for position, value in enumerate(values[1:], start=1):
+                if value:
+                    cells[block_start + position][index] = Paragraph(value, story_style)
+            runs, position = [], 0
+            while position < len(values):
+                end = position
+                while end + 1 < len(values) and not values[end + 1]:
+                    end += 1
+                runs.append((position, end - position + 1))
+                position = end + 1
+        else:
+            runs = _contiguous_runs(values)
+        for run_start, run_length in runs:
+            if run_length > 1:
+                span_style.add('SPAN', (index, block_start + run_start), (index, block_start + run_start + run_length - 1))
+                for offset in range(1, run_length):
+                    cells[block_start + run_start + offset][index] = ''
+
+
 def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, include_trend=True, trend_header='Trend'):
     """Create a ReportLab table from a pandas DataFrame
     
@@ -539,11 +560,16 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
             df_display = df_display.drop(columns=[col])
             break
     
+    expected_data = None
+    if 'Sparkline_Expected' in df_display.columns:
+        expected_data = df_display['Sparkline_Expected'].tolist()
+        df_display = df_display.drop(columns=['Sparkline_Expected'])
+        if any(values for values in expected_data):
+            table_notice += f". {SPARKLINE_EXPECTED_NOTE}"
+
     # Format percentage columns if they exist
     if 'MaxOut %' in df_display.columns:
         df_display['MaxOut %'] = df_display['MaxOut %'].apply(lambda x: f"{x:.1%}")
-    if 'Anomalous %' in df_display.columns:
-        df_display['Anomalous %'] = df_display['Anomalous %'].apply(lambda x: f"{x:.1%}")
     if 'Missing Data %' in df_display.columns:
         df_display['Missing Data %'] = df_display['Missing Data %'].apply(lambda x: f"{x:.1%}")
       # Convert non-sparkline columns to strings
@@ -558,6 +584,8 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
         df_display = df_display.iloc[order].reset_index(drop=True)
         if sparkline_data is not None:
             sparkline_data = [sparkline_data[i] for i in order]
+        if expected_data is not None:
+            expected_data = [expected_data[i] for i in order]
         group_runs = _contiguous_runs(df_display[GROUP_COLUMN].tolist())
         # The repeated labels are blanked further down, once the row heights are
         # known and the merges have been placed: a label that ends up starting a
@@ -570,17 +598,46 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
     # Create header and data for the table
     header = df_display.columns.tolist()
     data = [header]
-    
+    story_style = ParagraphStyle('StoryCell', parent=styles['Normal'], fontSize=9, leading=11)
+
     # Add rows
     for _, row in df_display.iterrows():
         values = row.tolist()
-        if 'Details' in header:
-            details_index = header.index('Details')
-            values[details_index] = Paragraph(str(values[details_index]), styles['Normal'])
+        for flex_name in FLEX_COLUMNS:
+            if flex_name in header:
+                flex_index = header.index(flex_name)
+                flex_style = story_style if flex_name in STORY_COLUMNS else styles['Normal']
+                values[flex_index] = Paragraph(str(values[flex_index]), flex_style)
+        if IMPACT_COLUMN in header:
+            impact_index = header.index(IMPACT_COLUMN)
+            values[impact_index] = Paragraph(str(values[impact_index]), story_style)
         data.append(values)
       # Create the table
     trend_width = 1.2*inch if include_trend else None  # Make the Trend column wider
-    colWidths = _column_widths(df_display, header, trend_width)
+    colWidths, compact = _column_widths(df_display, header, trend_width)
+    padding = _COMPACT_PADDING if compact else _CELL_PADDING
+    if colWidths is not None:
+        # A column squeezed below its natural width would run into the next
+        # one, so wrap its text instead.
+        body = ParagraphStyle('SqueezedCell', parent=styles['Normal'], fontSize=9, leading=11)
+        head = ParagraphStyle('SqueezedHeader', parent=body, fontName='Helvetica-Bold', fontSize=10,
+                              leading=12, alignment=1)
+        for j, name in enumerate(header):
+            if include_trend and j == len(header) - 1:
+                # The trend column has no text of its own, only a header to wrap.
+                if stringWidth(str(name), *_HEADER_FONT) + padding > colWidths[j]:
+                    data[0][j] = Paragraph(str(name), head)
+                continue
+            if colWidths[j] is None or name in FLEX_COLUMNS or name == IMPACT_COLUMN:
+                continue
+            if colWidths[j] >= _natural_width(name, df_display[name]) - _CELL_PADDING + padding:
+                continue
+            style = ParagraphStyle(f'SqueezedCell{j}', parent=body, alignment=1) if j == 0 and group_runs else body
+            data[0][j] = Paragraph(str(name), head)
+            for row in data[1:]:
+                if not isinstance(row[j], Paragraph):
+                    # A wrapped cell keeps the lines its text was given (one run of hours a line).
+                    row[j] = Paragraph(str(row[j]).replace(chr(10), '<br/>'), style)
     if colWidths is None:
         # No sentence column to lay out around, so leave the sizing to reportlab.
         colWidths = [None] * len(header)
@@ -604,7 +661,10 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
         ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
     ])
-    
+    if compact:
+        table_style.add('LEFTPADDING', (0, 0), (-1, -1), _COMPACT_PADDING / 2)
+        table_style.add('RIGHTPADDING', (0, 0), (-1, -1), _COMPACT_PADDING / 2)
+
     if group_runs is not None:
         # The merges themselves are added after the table has been measured, so
         # that none of them ends up taller than a page.
@@ -631,8 +691,10 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
             
             # Only create sparkline if we have data points
             if data_points and len(data_points) >= 2:
-                # Use consistent color for all sparklines
-                sparkline = create_sparkline(data_points, width=1.0, height=0.25, color='#1f77b4')
+                # Use consistent color for all sparklines, sized to stay inside the cell.
+                room = (colWidths[-1] - padding) if colWidths[-1] is not None else SPARKLINE_WIDTH
+                sparkline = create_sparkline(data_points, width=min(room, SPARKLINE_WIDTH) / inch, height=0.25,
+                                             color='#1f77b4', expected=expected_data[i] if expected_data is not None else None)
                 
                 # Replace the content of the last column with the sparkline image
                 table._cellvalues[row_index][-1] = sparkline
@@ -643,9 +705,27 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
         # on the row heights, so a merge placed here is certain to fit its page.
         table.wrap(TABLE_AVAILABLE_WIDTH, TABLE_AVAILABLE_HEIGHT)
         row_heights = list(table._rowHeights or [])
+        story_name = next((name for name in header if name in STORY_COLUMNS), None)
+        if story_name is not None:
+            # Blocks are measured as they will read, with what is said once left out, so a signal is not split for text it will not show.
+            quiet = [list(row) for row in table._cellvalues]
+            quiet_spans = TableStyle([])
+            for start, length in group_runs:
+                _merge_repeats(quiet, quiet_spans, df_display, header, story_name, story_style, start + 1, length,
+                               len(header) - 1 if include_trend else None)
+            measured = Table(quiet, colWidths=colWidths)
+            measured.setStyle(table_style)
+            measured.wrap(TABLE_AVAILABLE_WIDTH, TABLE_AVAILABLE_HEIGHT)
+            row_heights = list(measured._rowHeights or row_heights)
         header_height = row_heights[0] if row_heights else 0.0
         span_budget = TABLE_AVAILABLE_HEIGHT - header_height
+        if IMPACT_COLUMN in df_display.columns:
+            span_budget = min(span_budget, MAX_MERGED_HEIGHT)
+        # What must fit under a heading for the table to start on this page, for a caller who wants to keep them together.
+        first_rows = _blocks_that_fit(1, group_runs[0][1], row_heights, span_budget)[0][1]
+        table.start_height = header_height + sum(row_heights[1:1 + first_rows])
         span_style = TableStyle([])
+        cells = [list(row) for row in table._cellvalues]
         for start, length in group_runs:
             for block_start, block_length in _blocks_that_fit(
                 start + 1, length, row_heights, span_budget
@@ -658,8 +738,18 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
                 # covered by it. A group split across pages repeats its label,
                 # which is what the reader needs anyway.
                 for offset in range(1, block_length):
-                    table._cellvalues[block_start + offset][0] = ""
+                    cells[block_start + offset][0] = ""
+                if story_name is not None:
+                    # A table only breaks between blocks, so each one opens with its first detector's whole story.
+                    _merge_repeats(cells, span_style, df_display, header, story_name, story_style, block_start, block_length,
+                                   len(header) - 1 if include_trend else None)
+        # Fresh, since a measured table keeps the heights of what it held.
+        start_height = table.start_height
+        table = Table(cells, colWidths=colWidths)
+        table.setStyle(table_style)
         table.setStyle(span_style)
+        table.start_height = start_height
+        table.wrap(TABLE_AVAILABLE_WIDTH, TABLE_AVAILABLE_HEIGHT)
 
     result_elements = [
         Paragraph(table_notice, styles['Normal']),
@@ -669,20 +759,71 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
     
     return result_elements
 
-def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_rows=10):
+# Missing hours told by time in a table cell; the rest are counted.
+MISSING_SPANS_SHOWN = 3
+MISSING_HOURLY_HEADER = 'Missing by Hour (7d)'
+# An hour a system outage was out: its regions averaged this share missing or more, the daily check's limit.
+OUTAGE_HOUR_SHARE = 0.3
+
+
+def _hour_spans(hours):
+    """[(start, end)] of runs of consecutive hours (the hours' start times)."""
+    spans = []
+    for hour in sorted(pd.to_datetime(pd.Series(list(hours))).dt.floor('h').unique()):
+        hour = pd.Timestamp(hour)
+        if spans and hour <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], hour + pd.Timedelta(hours=1)))
+        else:
+            spans.append((hour, hour + pd.Timedelta(hours=1)))
+    return spans
+
+
+def _format_hour_span(start, end):
+    """'Sun 11/8 02:00-06:00', or with both days when it crosses midnight: 'Sat 11/7 22:00 to Sun 11/8 06:00'."""
+    last = end - pd.Timedelta(seconds=1)
+    if last.normalize() == start.normalize():
+        until = '24:00' if end == end.normalize() else f"{end:%H:%M}"
+        return f"{start:%a} {start.month}/{start.day} {start:%H:%M}-{until}"
+    return f"{start:%a} {start.month}/{start.day} {start:%H:%M} to {end:%a} {end.month}/{end.day} {end:%H:%M}"
+
+
+def hours_text(hours, shown=MISSING_SPANS_SHOWN):
+    """The hours as their runs, newest first, the newest `shown` by time and the others counted: one a line."""
+    spans = _hour_spans(hours)[::-1]
+    lines = [_format_hour_span(start, end) for start, end in spans[:shown]]
+    if len(spans) > shown:
+        rest = len(spans) - shown
+        lines.append(f"and {rest} more {'time' if rest == 1 else 'times'}")
+    return '\n'.join(lines)
+
+
+def _format_hours(value):
+    """Hours of missing data, to the quarter hour a 15-minute record is."""
+    return f"{round(float(value) * 4) / 4:g}"
+
+
+def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_rows=10, hourly=None):
     """
     Prepare a sorted table of missing data alerts with signal name and date
-    
+
+    With hourly (DeviceId, TimeStamp = the hour, MissingData; data_processing.missing_data_by_hour) the table places the
+    loss in time instead of naming the worst day: When Missing gives the runs of hours with any record missing, newest
+    first, Hours Missing the hours of records lost, and the sparkline the share missing hour by hour. Which signals are
+    listed does not change: the alert is still decided by day.
+
     Args:
         filtered_df_missing_data: DataFrame containing missing data alerts
         signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
         max_rows: Maximum number of rows to include in the table
-        
+        hourly: Optional share of missing records per device and hour over the days shown
+
     Returns:
         Tuple of (Sorted DataFrame with Signal Name, Date and Alert columns, total_alerts_count)
     """
     if filtered_df_missing_data.empty:
         return pd.DataFrame(), 0
+    if hourly is not None and not hourly.empty:
+        return _missing_data_hourly_table(filtered_df_missing_data, signals_df, max_rows, hourly)
         
     # Use all data for sparklines, not just alerts
     missing_data_df = filtered_df_missing_data.copy()
@@ -756,145 +897,121 @@ def prepare_missing_data_alerts_table(filtered_df_missing_data, signals_df, max_
     
     # Limit the number of rows
     if max_rows > 0 and len(result) > max_rows:
-        result = result.head(max_rows)
+        result = head_by_signal(result, max_rows)
     
     return result, unique_devices_with_alerts
 
-def prepare_ped_alerts_table(filtered_df_ped, ped_hourly_df, signals_df, max_rows=10):
-    """
-    Prepare a sorted table of pedestrian alerts with signal name, phase, and hourly ped services
-    
-    Args:
-        filtered_df_ped: DataFrame containing pedestrian alerts (with DeviceId, Phase, Date)
-        ped_hourly_df: DataFrame containing hourly pedestrian data (with DeviceId, Phase, TimeStamp, PedServices)
-        signals_df: DataFrame containing signal metadata (DeviceId, Name, Region)
-        max_rows: Maximum number of rows to include in the table
-        
-    Returns:
-        Tuple of (Sorted DataFrame with Signal Name, Phase, Alert Dates and Sparkline columns, total_alerts_count)
-    """
-    if filtered_df_ped.empty:
+def _missing_data_hourly_table(alerts, signals_df, max_rows, hourly):
+    """The missing data table by hour: see prepare_missing_data_alerts_table."""
+    alerts = alerts.assign(DeviceId=alerts['DeviceId'].astype(str))
+    alerted = alerts[alerts['Alert'] == 1]
+    rows = alerted.groupby('DeviceId', as_index=False).agg(**_ongoing_aggregation(alerted.columns), _last=('Date', 'max'))
+    names = signals_df[['DeviceId', 'Name']].assign(DeviceId=signals_df['DeviceId'].astype(str)).drop_duplicates('DeviceId')
+    rows = rows.merge(names, on='DeviceId', how='inner')
+    if rows.empty:
         return pd.DataFrame(), 0
-    
-    # Ensure DeviceId is string type to avoid merge issues
-    signals_df = signals_df.copy()
-    signals_df['DeviceId'] = signals_df['DeviceId'].astype(str)
-    filtered_df_ped = filtered_df_ped.copy()
-    filtered_df_ped['DeviceId'] = filtered_df_ped['DeviceId'].astype(str)
-    ped_hourly_df = ped_hourly_df.copy()
-    ped_hourly_df['DeviceId'] = ped_hourly_df['DeviceId'].astype(str)
-      # Group all dates for each DeviceId/Phase combination
-    dates_grouped = filtered_df_ped.groupby(['DeviceId', 'Phase'], as_index=False).agg(
-        Date=('Date', list),
-        **_ongoing_aggregation(filtered_df_ped.columns)
-    )
-    
-    # Join with signals data to get signal names
-    result = pd.merge(
-        dates_grouped,
-        signals_df[['DeviceId', 'Name', 'Region']], # Added Region for consistency
-        on='DeviceId',
-        how='left'
-    )
-    
-    # Filter out rows where Signal is NaN
-    result = result.dropna(subset=['Name'])
-    
-    if result.empty:
-        return pd.DataFrame(), 0
-    
-    # Get the total count of unique ped detectors with alerts after region filtering (distinct DeviceId/Phase combinations)
-    total_alerts_count = result[['DeviceId', 'Phase']].drop_duplicates().shape[0]
-    
-    # Format dates as strings and join with newlines for stacked appearance
-    result['Date'] = result['Date'].apply(
-        lambda dates: '\n'.join(d.strftime('%Y-%m-%d') for d in sorted(dates))
-    )
-    
-    # Rename columns
-    result = result.rename(columns={
-        'Name': 'Signal',
-        'Date': 'Alert Dates'
-    })
-    
-    # Add sparkline column using ped_hourly_df data
-    sparkline_data = {}
-    
-    # Get all DeviceId and Phase pairs
-    device_phase_pairs = result[['DeviceId', 'Phase']].drop_duplicates().values.tolist()
-    
-    # For each device/phase pair, collect hourly ped services data for sparklines
-    for device_id, phase in device_phase_pairs:
-        # Get hourly data for this device/phase pair
-        hourly_data = ped_hourly_df[
-            (ped_hourly_df['DeviceId'] == device_id) & 
-            (ped_hourly_df['Phase'] == phase)
-        ]
-        
-        if not hourly_data.empty:
-            # Sort by timestamp to ensure correct time series
-            hourly_data = hourly_data.sort_values('TimeStamp')
-            # A week of hourly points is far more detail than a one-inch sparkline
-            # can show, so roll them up into wider buckets before drawing.
-            bucketed = hourly_data.groupby(
-                hourly_data['TimeStamp'].dt.floor(f'{PED_SPARKLINE_BUCKET_HOURS}h')
-            )['PedServices'].sum()
-            sparkline_data[(device_id, phase)] = bucketed.tolist()
-    
-    # Add the sparkline data to the result dataframe
-    result['Services (7d)'] = result.apply(
-        lambda row: sparkline_data.get((row['DeviceId'], row['Phase']), []), 
-        axis=1
-    )
-    
-    # Select and order columns
-    result, output_columns = _add_ongoing_column(
-        result, ['Signal', 'Phase', 'Alert Dates', 'Services (7d)']
-    )
+    hourly = hourly.assign(DeviceId=hourly['DeviceId'].astype(str)).sort_values('TimeStamp')
+    by_device = dict(tuple(hourly[hourly['DeviceId'].isin(rows['DeviceId'])].groupby('DeviceId')))
+    empty = hourly.head(0)
+
+    def device_hours(device):
+        return by_device.get(device, empty)
+
+    rows['When Missing'] = rows['DeviceId'].map(
+        lambda device: hours_text(device_hours(device).loc[lambda t: t['MissingData'] > 0, 'TimeStamp']))
+    rows['_hours'] = rows['DeviceId'].map(lambda device: float(device_hours(device)['MissingData'].sum()))
+    rows['Hours Missing'] = rows['_hours'].map(_format_hours)
+    rows['Sparkline_Data'] = rows['DeviceId'].map(lambda device: device_hours(device)['MissingData'].tolist())
+    rows = rows.rename(columns={'Name': 'Signal'}).sort_values(['_hours', 'Signal'], ascending=[False, True])
+    total = rows['DeviceId'].nunique()
+    result, output_columns = _add_ongoing_column(rows, ['Signal', 'When Missing', 'Hours Missing', 'Sparkline_Data'])
     result = result[output_columns]
+    if max_rows > 0 and len(result) > max_rows:
+        result = head_by_signal(result, max_rows)
+    return result, total
 
-    # Sort by Signal and Phase
-    result = result.sort_values(by=['Signal', 'Phase'])
-    
-    # Limit the number of rows if needed
-    if len(result) > max_rows:
-        result = result.head(max_rows)
-    
-    return result, total_alerts_count
 
-def prepare_system_outages_table(system_outages_df, max_rows=10):
+def _format_region_list(regions, all_regions=None):
+    """'All 5 regions' when every region is out, else the regions by name."""
+    regions = sorted(set(regions))
+    if all_regions and set(regions) >= set(all_regions) and len(regions) > 1:
+        return f"All {len(regions)} regions"
+    return ', '.join(regions)
+
+
+def _format_date_span(first, last):
+    text = f"{first.month}/{first.day}/{first:%y}"
+    return text if first == last else f"{text} - {last.month}/{last.day}/{last:%y}"
+
+
+def prepare_system_outages_table(system_outages_df, max_rows=10, all_regions=None, hourly=None):
     """
-    Prepare a sorted table of system outages showing dates and regions with >30% missing data
-    
+    Prepare a table of system outages, one row per real outage.
+
+    The input holds one row per region and day at 30% missing data or more. Days in a
+    row are one outage, a day that recovered ends it, and regions out on the same days
+    are one outage too. Missing Data % is the outage's worst day, the average over its
+    regions. Ongoing says the day it began and how many days it has lasted while it is
+    still out on the latest day of data (LatestDataDay), else the day it ended; rows
+    without LatestDataDay have no Ongoing column.
+
+    With hourly (Region, TimeStamp = the hour, MissingData; data_processing.region_missing_by_hour) the outage is placed in
+    time instead: When gives the runs of hours its regions averaged OUTAGE_HOUR_SHARE missing or more, and Hours Out how
+    many hours that was, in place of Days and its worst day's Missing Data %. Which days are an outage does not change.
+
     Args:
-        system_outages_df: DataFrame containing system outages (Date, Region, MissingData)
+        system_outages_df: DataFrame of Date, Region, MissingData and optionally LatestDataDay
         max_rows: Maximum number of rows to include in the table
-        
+        all_regions: Every region of the report, to say 'All 5 regions'
+        hourly: Optional share of missing records per region and hour
+
     Returns:
-        Tuple of (Sorted DataFrame with Date, Region, Missing Data % columns, total_outages_count)
+        Tuple of (DataFrame, newest outage first, total_outages_count)
     """
     if system_outages_df.empty:
         return pd.DataFrame(), 0
-    
-    # Make a copy to avoid modifying the original
-    result = system_outages_df.copy()
-    
-    # Get the total count before limiting rows
+
+    days = system_outages_df.copy()
+    days['Date'] = pd.to_datetime(days['Date']).dt.normalize()
+    by_day = days.groupby('Date').agg(
+        Regions=('Region', list), Worst=('MissingData', 'mean')
+    ).reset_index().sort_values('Date')
+    by_day['Outage'] = (by_day['Date'].diff() != pd.Timedelta(days=1)).cumsum()
+    latest = pd.to_datetime(days['LatestDataDay']).max() if 'LatestDataDay' in days.columns else None
+
+    by_hour = hourly is not None and not hourly.empty
+    if by_hour:
+        hourly = hourly.assign(_day=pd.to_datetime(hourly['TimeStamp']).dt.normalize())
+    rows = []
+    for _, outage in by_day.groupby('Outage'):
+        first, last = outage['Date'].iloc[0], outage['Date'].iloc[-1]
+        regions = [r for regions in outage['Regions'] for r in regions]
+        row = {
+            'Dates': _format_date_span(first, last),
+            'Regions': _format_region_list(regions, all_regions),
+        }
+        if by_hour:
+            # Each hour of its days, averaged over the regions out on that day.
+            out = days[days['Date'].between(first, last)][['Date', 'Region']].rename(columns={'Date': '_day'})
+            shares = hourly.merge(out, on=['_day', 'Region']).groupby('TimeStamp')['MissingData'].mean()
+            out_hours = shares[shares >= OUTAGE_HOUR_SHARE].index
+            row['When'] = hours_text(out_hours)
+            row['Hours Out'] = len(out_hours)
+        else:
+            row['Days'] = len(outage)
+            row['Missing Data %'] = outage['Worst'].max()
+        row['_last'] = last
+        if latest is not None:
+            row[ONGOING_DISPLAY_COLUMN] = (
+                f"{first.month}/{first.day}/{first:%y} ({len(outage)}d)" if last >= latest
+                else f"Ended {last.month}/{last.day}/{last:%y}"
+            )
+        rows.append(row)
+
+    result = pd.DataFrame(rows).sort_values('_last', ascending=False).drop(columns='_last')
     total_outages_count = len(result)
-    
-    # Convert MissingData to percentage and rename columns
-    result['Missing Data %'] = result['MissingData']
-    result, output_columns = _add_ongoing_column(result, ['Date', 'Region', 'Missing Data %'])
-    result = result[output_columns]
-
-
-    # Sort by Date descending (most recent first), then by Region
-    result = result.sort_values(by=['Date', 'Region'], ascending=[False, True])
-    
-    # Limit the number of rows if needed
     if max_rows > 0 and len(result) > max_rows:
         result = result.head(max_rows)
-    
     return result, total_outages_count
 
 
@@ -940,18 +1057,9 @@ def prepare_clearance_interval_alerts_table(clearance_alerts_df, signals_df, reg
     result['MaxAbsDelta'] = pd.to_numeric(result['MaxAbsDelta'], errors='coerce').fillna(0)
 
     if max_rows > 0 and len(result) > max_rows:
-        phase_rows = result[result['MovementTypeSort'] == 0].sort_values('MaxAbsDelta', ascending=False)
-        overlap_rows = result[result['MovementTypeSort'] == 1].sort_values('MaxAbsDelta', ascending=False)
-
-        selected_parts = []
-        if not phase_rows.empty:
-            selected_parts.append(phase_rows.head(max_rows))
-        selected_count = sum(len(part) for part in selected_parts)
-        remaining_rows = max_rows - selected_count
-        if remaining_rows > 0 and not overlap_rows.empty:
-            selected_parts.append(overlap_rows.head(remaining_rows))
-
-        result = pd.concat(selected_parts, ignore_index=True) if selected_parts else result.head(0)
+        # phases before overlaps, largest delta first; every row of a signal kept together
+        ranked = result.sort_values(['MovementTypeSort', 'MaxAbsDelta'], ascending=[True, False])
+        result = head_by_signal(ranked, max_rows)
 
     result = result.sort_values(
         by=['Signal', 'MovementTypeSort', 'MovementNumberSort', 'MovementStateSort'],
@@ -978,7 +1086,6 @@ def _format_clearance_details(row):
     details = [f"Of {sample_count} samples"]
 
     short_count = int(row.get('ShortCount', 0) or 0)
-    irregular_count = int(row.get('IrregularCount', 0) or 0)
     long_count = int(row.get('LongCount', 0) or 0)
     clauses = []
     if short_count > 0:
@@ -986,17 +1093,6 @@ def _format_clearance_details(row):
             f"{short_count} {_were(short_count)} short "
             f"({_format_seconds(row.get('RepresentativeShortDuration'))} at "
             f"{_format_timestamp(row.get('RepresentativeShortTime'))})"
-        )
-    if irregular_count > 0:
-        irregular_duration = _format_seconds(
-            row.get('RepresentativeIrregularDuration')
-        )
-        irregular_time = _format_timestamp(
-            row.get('RepresentativeIrregularTime')
-        )
-        clauses.append(
-            f'{irregular_count} {_were(irregular_count)} irregular '
-            f'({irregular_duration} at {irregular_time})'
         )
     if long_count > 0:
         clauses.append(
@@ -1079,7 +1175,7 @@ def prepare_signal_conflicts_table(
         ascending=True,
     )
     if max_rows > 0:
-        summary = summary.head(max_rows)
+        summary = head_by_signal(summary, max_rows, key='Name')
 
     summary['Signal'] = summary['Name']
     summary['Pair'] = summary.apply(
@@ -1143,7 +1239,7 @@ def prepare_overlap_dual_indications_table(
     total_alerts_count = len(result)
     result = result.sort_values('ConflictStart', ascending=False)
     if max_rows > 0:
-        result = result.head(max_rows)
+        result = head_by_signal(result, max_rows, key='Name')
 
     result['Signal'] = result['Name']
     result['Phase'] = pd.to_numeric(result['Phase'], errors='coerce').astype('Int64')
@@ -1202,17 +1298,18 @@ def prepare_alarms_table(
     total_alerts_count = len(result)
     result = result.sort_values(['Name', 'AlarmType'])
     if max_rows > 0:
-        result = result.head(max_rows)
+        result = head_by_signal(result, max_rows, key='Name')
 
     result['Signal'] = result['Name']
     result['Alarm'] = result['AlarmType']
     result['6-Week Total'] = result['TotalCount'].astype(int)
     result['Most Recent'] = result['LatestAlarm'].apply(_format_timestamp)
+    columns = ['Signal', 'Alarm', '6-Week Total', 'Most Recent']
+    if 'DailyCounts' in result.columns:
+        result['Sparkline_Data'] = result['DailyCounts']
+        columns.append('Sparkline_Data')
 
-    return (
-        result[['Signal', 'Alarm', '6-Week Total', 'Most Recent']],
-        total_alerts_count,
-    )
+    return result[columns], total_alerts_count
 
 
 def prepare_preempt_alerts_table(
@@ -1223,9 +1320,10 @@ def prepare_preempt_alerts_table(
 ):
     '''Prepare preempt frequency alert rows for a report.
 
-    One row per signal and preempt number, sorted by CUSUM score so the
-    largest shifts come first. Sparkline_Data carries the pair's daily call
-    counts over the retained history.
+    One row per signal, preempt number and kind of alert (frequency change,
+    stuck on, chatter, cascade break), sorted by score. Note holds the cascade
+    or duration evidence when present. Sparkline_Data carries the pair's daily
+    call counts over the retained history.
     '''
     if preempt_alerts_df is None or preempt_alerts_df.empty:
         return pd.DataFrame(), 0
@@ -1249,16 +1347,133 @@ def prepare_preempt_alerts_table(
     total_alerts_count = len(result)
     result = result.sort_values(['Score', 'Name', 'Preempt'], ascending=[False, True, True])
     if max_rows > 0:
-        result = result.head(max_rows)
+        result = head_by_signal(result, max_rows, key='Name')
 
     result['Signal'] = result['Name']
     result['Preempt'] = pd.to_numeric(result['Preempt'], errors='coerce').astype('Int64')
-    result['Change'] = result['Direction']
-    result['Baseline/Day'] = result['BaselinePerDay'].apply(lambda value: f'{float(value):.1f}')
-    result['Recent/Day'] = result['RecentPerDay'].apply(lambda value: f'{float(value):.1f}')
+    result['Type'] = result['Direction']
+    result['Base/Day'] = result['BaselinePerDay'].apply(lambda value: f'{float(value):.1f}')
+    result['Last 7d/Day'] = result['RecentPerDay'].apply(lambda value: f'{float(value):.1f}')
     result['Sparkline_Data'] = result['DailyCounts']
+    columns = ['Signal', 'Preempt', 'Type', 'Base/Day', 'Last 7d/Day']
+    if 'Note' in result.columns and result['Note'].fillna('').astype(str).str.len().gt(0).any():
+        result['Details'] = result['Note'].fillna('').astype(str)
+        if {'RanAsPreempt', 'BusCalls'} <= set(result.columns):
+            # Bus calls on a preempt input: the counts alone.
+            bus = result['RanAsPreempt'].notna() & result['BusCalls'].notna()
+            result.loc[bus, 'Details'] = [
+                bus_calls_text(direction, ran, total)
+                for direction, ran, total in zip(result.loc[bus, 'Direction'], result.loc[bus, 'RanAsPreempt'], result.loc[bus, 'BusCalls'])
+            ]
+        columns.append('Details')
 
-    result, output_columns = _add_ongoing_column(
-        result, ['Signal', 'Preempt', 'Change', 'Baseline/Day', 'Recent/Day', 'Sparkline_Data']
-    )
+    result, output_columns = _add_ongoing_column(result, columns + ['Sparkline_Data'])
+    return result[output_columns], total_alerts_count
+
+
+def prepare_atspm_detector_health_table(
+    alerts_df,
+    signals_df,
+    statuses,
+    region=None,
+    max_rows=10,
+    story_header='What Is Wrong',
+    detector_type=VEHICLE,
+    hourly_counts=None,
+    ped_hourly_counts=None,
+    expected_counts=None,
+    impact=None,
+):
+    '''Prepare atspm-detector health rows for a report.
+
+    statuses picks the rows: the fault status (bad) for the alert table, or an
+    information one (lane closure, timing plan, set-up issue) for the tables below it. Sorted by health_table_order. The story column says in one short narrative what is wrong, how bad
+    and when (see health_story). detector_type picks vehicle detectors (column Det,
+    'Det 22, Ph8 Count, 1 lane'), ped buttons (column Button, 'Button 4, Ph8') or, with None, both in one priority order
+    (column Det). hourly_counts, {(DeviceId, Detector): counts per hour}, adds a sparkline for each row, and
+    ped_hourly_counts the same for the ped buttons of a table with both. expected_counts, in the same form, adds a vehicle detector's
+    usual counts behind its sparkline. Rows carrying the detector triage (see
+    detector_triage) come in its order, service lost first, then harm to other phases, and get an Impact column. A signal's
+    rows judged as one group, or signal-wide, tell one effect, so they read as one row.
+    impact splits the faults in two tables: True keeps the faults measured to affect operations, with their Impact column;
+    False keeps the others, which are data only, and has no Impact column. None keeps them all in one table.
+    '''
+    if alerts_df is None or alerts_df.empty:
+        return pd.DataFrame(), 0
+
+    wanted = alerts_df['Status'].isin(statuses)
+    if detector_type is not None:
+        wanted &= alerts_df['DetectorType'] == detector_type
+    alerts = alerts_df[wanted].copy()
+    if impact is not None:
+        harm = affects_operations(alerts)
+        alerts = alerts[harm if impact else ~harm]
+    if alerts.empty:
+        return pd.DataFrame(), 0
+    alerts['DeviceId'] = alerts['DeviceId'].astype(str)
+
+    signals = signals_df.copy()
+    signals['DeviceId'] = signals['DeviceId'].astype(str)
+    result = alerts.merge(
+        signals[['DeviceId', 'Name', 'Region']],
+        on='DeviceId',
+        how='left',
+    ).dropna(subset=['Name'])
+
+    if region and region != 'All Regions':
+        result = result[result['Region'] == region]
+    if result.empty:
+        return pd.DataFrame(), 0
+
+    result = health_table_order(result)
+    joined_numbers = signal_wide_rows(result)
+    result = result.loc[joined_numbers.index]
+    total_alerts_count = len(result)
+    if max_rows > 0:
+        result = head_by_signal(result, max_rows, key='Name')
+
+    result['Signal'] = result['Name']
+    number_header = 'Button' if detector_type == PED else 'Det'
+    phases = result['TriagePhase'] if 'TriagePhase' in result.columns else [None] * len(result)
+    labels = []
+    for number, reason, kind, phase, others in zip(result['Detector'].astype(int), result['Reason'], result['DetectorType'], phases,
+                                                   joined_numbers.reindex(result.index)):
+        if kind == PED and others:
+            labels.append(f"Button {', '.join(str(n) for n in sorted([number, *others]))}")
+        elif kind == PED:
+            label = detector_label(number, reason, 'Button')
+            labels.append(f"{label}, Ph{int(phase)}" if pd.notna(phase) and 'Ph' not in label else label)
+        elif others:
+            labels.append(f"Det {', '.join(str(n) for n in sorted([number, *others]))}")
+        else:
+            labels.append(detector_label(number, reason, 'Det'))
+    result[number_header] = labels
+    evidence = result['Evidence'] if 'Evidence' in result.columns else [None] * len(result)
+    result[story_header] = [
+        health_story(reason, periods, proof, name_detector=False)
+        for reason, periods, proof in zip(result['Reason'], result['Periods'], evidence)
+    ]
+    for index, others in joined_numbers.reindex(result.index).items():
+        if others:
+            count = len(others)
+            item = 'Button' if result.loc[index, 'DetectorType'] == PED else 'Det'
+            result.loc[index, story_header] += f" {item} {int(result.loc[index, 'Detector'])} shown; {count} more at fault with it."
+    columns = ['Signal', number_header, story_header]
+    if impact is not False and 'ImpactLabel' in result.columns and result['ImpactLabel'].notna().any():
+        result[IMPACT_COLUMN] = result['ImpactLabel'].fillna('Not measured')
+        columns.insert(2, IMPACT_COLUMN)
+
+    result, output_columns = _add_ongoing_column(result, columns)
+    if hourly_counts or ped_hourly_counts:
+        result['Sparkline_Data'] = [
+            (ped_hourly_counts if kind == PED and detector_type is None else hourly_counts or {}).get((device, int(number)), [])
+            for device, number, kind in zip(result['DeviceId'], result['Detector'], result['DetectorType'])
+        ]
+        output_columns = output_columns + ['Sparkline_Data']
+        if expected_counts:
+            result['Sparkline_Expected'] = [
+                expected_counts.get((device, int(number)), []) if kind != PED else []
+                for device, number, kind in zip(result['DeviceId'], result['Detector'], result['DetectorType'])
+            ]
+            output_columns = output_columns + ['Sparkline_Expected']
     return result[output_columns], total_alerts_count

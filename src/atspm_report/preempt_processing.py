@@ -21,6 +21,15 @@ runs in a history file, exactly like controller alarms. The history also
 records which devices reported data each day (rows with ``Preempt == 0``) so
 that a day with no calls counts as zero rather than as a gap, and so a preempt
 number that first appears at a signal is compared against a baseline of zeros.
+
+Calls are counted per class (emergency vehicle, TSP, bus calls that ran as
+preempts, rail, unclassified; see preempt_cascade.classify_preempt_calls) in the
+history's Class column, and each report section tests its own calls: emergency
+vehicle preempt on the emergency vehicle and unclassified calls of non-rail
+inputs, rail on the rail inputs. TSP counts are not tested for frequency. History
+rows stored before classes existed have no Class; until they are rebuilt from the
+stored calls (rebuild_history_classes) or age out, they count as they did, as
+emergency vehicle or rail by their input.
 """
 
 import math
@@ -29,11 +38,12 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .utils import log_message
+from .preempt_cascade import SECTION_EV, SECTION_RAIL, _clean_calls, call_section
+from .utils import log_message, text_equals
 
 
 PREEMPT_HISTORY_COLUMNS = [
-    'DeviceId', 'Preempt', 'Date', 'Count', 'ValidCount', 'TotalDuration', 'MaxDuration',
+    'DeviceId', 'Preempt', 'Date', 'Count', 'ValidCount', 'TotalDuration', 'MaxDuration', 'Class',
 ]
 PREEMPT_ALERT_COLUMNS = [
     'DeviceId', 'Preempt', 'Date', 'Direction', 'BaselinePerDay', 'RecentPerDay',
@@ -44,10 +54,11 @@ PREEMPT_ALERT_COLUMNS = [
 # day" without any calls being implied.
 PRESENCE_PREEMPT = 0
 
-# A day of timeline data has to span at least this many hours before it counts
-# as a reported day. Partial outages otherwise read as a drop in preempt calls,
-# which the missing data section already covers.
-PREEMPT_MIN_COVERAGE_HOURS = 12
+# A day needs timeline data in at least this many hours' worth of 15-minute
+# bins before it counts as a reported day. Partial outages otherwise read as a
+# drop in preempt calls, which the missing data section already covers. Bins
+# are counted rather than the first-to-last span, which a midday outage passes.
+PREEMPT_MIN_COVERAGE_HOURS = 20
 
 # Six weeks, inclusive of the report day.
 PREEMPT_HISTORY_DAYS = 42
@@ -106,6 +117,7 @@ def _clean_history(history: pd.DataFrame) -> pd.DataFrame:
         hist[col] = pd.to_numeric(hist[col], errors='coerce').fillna(0).astype(int)
     for col in ('TotalDuration', 'MaxDuration'):
         hist[col] = pd.to_numeric(hist[col], errors='coerce')
+    hist['Class'] = hist['Class'].astype(object).where(hist['Class'].notna(), None)
     return hist
 
 
@@ -121,14 +133,13 @@ def summarize_daily_preempts(
     calls whose 102/104 pair closed cleanly, since an unmatched call's
     duration is just the gap to the next call. A ``Preempt == 0`` row is added
     for every device/day the device reported data: the rows of ``device_days``
-    (columns DeviceId, Date) when given, otherwise every device whose timeline
-    data spans at least ``min_coverage_hours`` that day.
+    (columns DeviceId, Date) when given, otherwise every device with timeline
+    data in at least ``min_coverage_hours`` worth of 15-minute bins that day.
     """
     if timeline is None or timeline.empty or 'EventClass' not in timeline.columns:
         return _empty_history()
 
     starts = pd.to_datetime(timeline['StartTime'], errors='coerce')
-    device_ids = timeline['DeviceId'].astype(str)
 
     if device_days is not None and not device_days.empty:
         presence = pd.DataFrame({
@@ -138,24 +149,24 @@ def summarize_daily_preempts(
         presence['Date'] = presence['Date'].dt.normalize()
         presence = presence.drop_duplicates().reset_index(drop=True)
     else:
-        coverage = (
-            pd.DataFrame({'DeviceId': device_ids, 'StartTime': starts})
+        bins = (
+            pd.DataFrame({'DeviceId': timeline['DeviceId'].astype(str), 'StartTime': starts})
             .dropna(subset=['StartTime'])
-            .assign(Date=lambda df: df['StartTime'].dt.normalize())
-            .groupby(['DeviceId', 'Date'])['StartTime']
-            .agg(['min', 'max'])
+            .assign(Date=lambda df: df['StartTime'].dt.normalize(),
+                    Bin=lambda df: df['StartTime'].dt.floor('15min'))
+            .groupby(['DeviceId', 'Date'])['Bin']
+            .nunique()
         )
-        coverage_hours = (coverage['max'] - coverage['min']).dt.total_seconds() / 3600
-        presence = coverage[coverage_hours >= min_coverage_hours].reset_index()[['DeviceId', 'Date']]
+        presence = bins[bins / 4 >= min_coverage_hours].reset_index()[['DeviceId', 'Date']]
     presence['Preempt'] = PRESENCE_PREEMPT
     presence['Count'] = 0
     presence['ValidCount'] = 0
     presence['TotalDuration'] = 0.0
     presence['MaxDuration'] = np.nan
 
-    is_preempt = timeline['EventClass'].astype(str) == 'Preempt'
+    is_preempt = text_equals(timeline['EventClass'], 'Preempt')
     calls = pd.DataFrame({
-        'DeviceId': device_ids[is_preempt],
+        'DeviceId': timeline.loc[is_preempt, 'DeviceId'].astype(str),
         'StartTime': starts[is_preempt],
         'Preempt': pd.to_numeric(timeline.loc[is_preempt, 'EventValue'], errors='coerce'),
         'Duration': pd.to_numeric(timeline.loc[is_preempt, 'Duration'], errors='coerce'),
@@ -301,6 +312,8 @@ def build_preempt_alerts(
     calls = hist[(hist['Preempt'] != PRESENCE_PREEMPT) & hist['DeviceId'].isin(devices_on_report_date)]
     if calls.empty:
         return _empty_alerts()
+    # One row per pair and day, whatever classes the day's calls had.
+    calls = calls.groupby(['DeviceId', 'Preempt', 'Date'], as_index=False)['Count'].sum()
     pairs = calls[['DeviceId', 'Preempt']].drop_duplicates()
 
     # Every reported day for every pair, zero where the preempt did not fire.
@@ -389,3 +402,66 @@ def build_preempt_alerts(
         [PREEMPT_ALERT_COLUMNS]
         .reset_index(drop=True)
     )
+
+
+def rebuild_history_classes(history: pd.DataFrame, calls: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Recount the history's calls per class from the stored calls.
+
+    For every signal and day the calls (preempt_cascade's call record, with
+    Class) cover, that day's call rows are replaced by one row per preempt and
+    class counted from the calls; days the calls do not cover keep their rows,
+    with or without a class. Presence rows (Preempt 0) are kept as they are.
+    """
+    hist = _clean_history(history)
+    calls = _clean_calls(calls)
+    calls = calls[calls['Class'].notna()]
+    if calls.empty:
+        return hist
+    calls = calls.assign(Date=calls['StartTime'].dt.normalize(),
+                         ValidDuration=calls['Duration'].where(calls['IsValid']))
+    counted = (
+        calls.groupby(['DeviceId', 'Preempt', 'Date', 'Class'], as_index=False)
+        .agg(Count=('StartTime', 'size'), ValidCount=('ValidDuration', 'count'),
+             TotalDuration=('ValidDuration', 'sum'), MaxDuration=('ValidDuration', 'max'))
+    )
+    covered = counted[['DeviceId', 'Date']].drop_duplicates().assign(_covered=True)
+    if not hist.empty:
+        marked = hist.merge(covered, on=['DeviceId', 'Date'], how='left')
+        replaced = marked['_covered'].fillna(False).astype(bool).to_numpy() & (hist['Preempt'] != PRESENCE_PREEMPT).to_numpy()
+        hist = hist[~replaced]
+    combined = pd.concat([df for df in (hist, counted) if not df.empty], ignore_index=True)
+    return _clean_history(combined).sort_values(['Date', 'DeviceId', 'Preempt']).reset_index(drop=True)
+
+
+def build_section_preempt_alerts(
+    history: pd.DataFrame,
+    report_date=None,
+    rail_preempts=None,
+    **thresholds,
+) -> pd.DataFrame:
+    """Frequency alerts per report section, with Class = the section.
+
+    Emergency vehicle preempt: the emergency vehicle and unclassified calls (and
+    rows without a class) of inputs that are not rail. Rail: every call of the
+    rail inputs. TSP calls are not tested. Each section's counts go through
+    build_preempt_alerts on their own, so a busy TSP input never reads as an
+    emergency vehicle increase and its pulses never fill an emergency vehicle
+    baseline.
+    """
+    hist = _clean_history(history)
+    if hist.empty:
+        return _empty_alerts().assign(Class=pd.Series(dtype=object))
+    presence = hist[hist['Preempt'] == PRESENCE_PREEMPT]
+    calls = hist[hist['Preempt'] != PRESENCE_PREEMPT]
+    sections = pd.Series(call_section(calls['Class'], calls['Preempt'], rail_preempts), index=calls.index)
+    frames = []
+    for section in (SECTION_EV, SECTION_RAIL):
+        mine = calls[sections == section]
+        if mine.empty:
+            continue
+        alerts = build_preempt_alerts(pd.concat([presence, mine], ignore_index=True), report_date, **thresholds)
+        if not alerts.empty:
+            frames.append(alerts.assign(Class=section))
+    if not frames:
+        return _empty_alerts().assign(Class=pd.Series(dtype=object))
+    return pd.concat(frames, ignore_index=True).sort_values('Score', ascending=False).reset_index(drop=True)

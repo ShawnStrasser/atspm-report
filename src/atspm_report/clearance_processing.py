@@ -6,7 +6,8 @@ from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
-import ibis.expr.types as ir
+
+from .duckdb_utils import is_relation
 
 from .alarm_processing import FLASH_EVENT_CLASSES
 
@@ -35,8 +36,22 @@ DEFAULT_VALIDITY_EVENT_CLASSES = [
 ]
 FLOAT_EPSILON = 1e-9
 DEFAULT_INVALID_EVENT_CUSHION_SECONDS = 30
+# How close an overlap yellow must land to the yellow median plus the red median
+# before it is read as a missing Overlap Red begin rather than a long yellow.
+DEFAULT_OVERLAP_MISSING_RED_TOLERANCE_SECONDS = 0.2
+# Share of overlap yellows that must have a matching Overlap Red before the red
+# median is trusted. Many overlaps - every FYA one, and a few traditional ones -
+# run yellow straight to green and emit almost no red at all, which leaves a
+# "median" drawn from one or two samples. Measured over a day, overlaps above this
+# mark absorb reds at 0.008% of samples against a 0.013% invalid rate on the phase
+# yellows at the same signals, so what the filter removes there is the same event
+# loss the phase check already sees. Below it the rate is thirty times higher and
+# tracks nothing.
+DEFAULT_OVERLAP_RED_COVERAGE_MIN = 0.95
 INVALID_NEIGHBOR_MIN_DURATION_SECONDS = 6.0
 MIDNIGHT_EXCLUSION_SECONDS = 60
+# datetime64 units, coarsest to finest.
+_TIME_UNITS = ["s", "ms", "us", "ns"]
 
 CLEARANCE_ALERT_COLUMNS = [
     "DeviceId",
@@ -47,13 +62,10 @@ CLEARANCE_ALERT_COLUMNS = [
     "SampleCount",
     "MaxAbsDelta",
     "ShortCount",
-    "IrregularCount",
     "LongCount",
     "AvgSignedDeviation",
     "RepresentativeShortDuration",
     "RepresentativeShortTime",
-    "RepresentativeIrregularDuration",
-    "RepresentativeIrregularTime",
     "RepresentativeLongDuration",
     "RepresentativeLongTime",
 ]
@@ -63,18 +75,18 @@ def _empty_alerts() -> pd.DataFrame:
     return pd.DataFrame(columns=CLEARANCE_ALERT_COLUMNS)
 
 
-def _to_pandas(data: Union[pd.DataFrame, "ir.Table", None]) -> Optional[pd.DataFrame]:
+def _to_pandas(data: Union[pd.DataFrame, "duckdb.DuckDBPyRelation", None]) -> Optional[pd.DataFrame]:
     if data is None:
         return None
     if isinstance(data, pd.DataFrame):
         return data
-    if ir is not None and isinstance(data, ir.Table):
-        return data.execute()
+    if is_relation(data):
+        return data.df()
     return None
 
 
 def process_clearance_intervals(
-    timeline: Union[pd.DataFrame, "ir.Table", None],
+    timeline: Union[pd.DataFrame, "duckdb.DuckDBPyRelation", None],
     config: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
@@ -100,7 +112,34 @@ def process_clearance_intervals(
     if missing_cols:
         raise ValueError(f"Missing required timeline column(s): {', '.join(missing_cols)}")
 
-    df = df.copy()
+    filter_stoptime = bool(config.get("filter_stoptime", True))
+    stop_classes = config.get("clearance_stop_event_classes", DEFAULT_STOP_TIME_EVENT_CLASSES)
+    flash_classes = config.get("clearance_flash_event_classes", DEFAULT_FLASH_EVENT_CLASSES)
+    validity_classes = config.get(
+        "clearance_validity_event_classes", DEFAULT_VALIDITY_EVENT_CLASSES
+    )
+
+    if not all(pd.api.types.is_datetime64_dtype(df[col])
+               for col in ("StartTime", "EndTime") if col in df.columns):
+        # Text times are parsed on the whole column, which their format is read from.
+        df = df.copy()
+        df["StartTime"] = pd.to_datetime(df["StartTime"], errors="coerce")
+        if "EndTime" in df.columns:
+            df["EndTime"] = pd.to_datetime(df["EndTime"], errors="coerce")
+    # Only the clearance intervals, Overlap Green, the stop-time and flash
+    # intervals and the invalid indications (which mark data untrustworthy) are
+    # read below. A full timeline is mostly other rows (valid greens, phase calls,
+    # detector and pedestrian intervals), so they are dropped before any work is
+    # done on them.
+    read_classes = (
+        CLEARANCE_EVENT_CLASSES + ["Overlap Green"]
+        + _matching_event_classes(df["EventClass"], (stop_classes if filter_stoptime else []))
+        + _matching_event_classes(df["EventClass"], flash_classes)
+    )
+    is_read = df["EventClass"].isin(read_classes) | (
+        df["EventClass"].isin(validity_classes) & (df["IsValid"] == False)
+    ).fillna(False)
+    df = df[is_read].copy()
     df["DeviceId"] = df["DeviceId"].astype(str)
     df["StartTime"] = pd.to_datetime(df["StartTime"], errors="coerce")
     df["Duration"] = pd.to_numeric(df["Duration"], errors="coerce")
@@ -108,25 +147,30 @@ def process_clearance_intervals(
         df["EndTime"] = pd.to_datetime(df["EndTime"], errors="coerce")
     else:
         df["EndTime"] = pd.NaT
-    df["EndTime"] = df["EndTime"].fillna(
-        df["StartTime"] + pd.to_timedelta(df["Duration"], unit="s")
-    )
+    missing_end = df["EndTime"].isna()
+    if missing_end.any():
+        df["EndTime"] = _fill_times(
+            df["EndTime"],
+            df.loc[missing_end, "StartTime"] + pd.to_timedelta(df.loc[missing_end, "Duration"], unit="s"),
+        )
+    # pandas 3 keeps the resolution each column was built with (a parsed
+    # timestamp is microseconds, float seconds make nanoseconds), and the
+    # merge_asof calls below need start and end times of one resolution.
+    if df["StartTime"].dtype != df["EndTime"].dtype:
+        finest = max((df["StartTime"].dtype, df["EndTime"].dtype),
+                     key=lambda dtype: _TIME_UNITS.index(np.datetime_data(dtype)[0]))
+        df["StartTime"] = df["StartTime"].astype(finest)
+        df["EndTime"] = df["EndTime"].astype(finest)
     df["EventValue"] = pd.to_numeric(df["EventValue"], errors="coerce").astype("Int64")
     stop_events = (
-        _extract_stop_time_events(
-            df,
-            config.get("clearance_stop_event_classes", DEFAULT_STOP_TIME_EVENT_CLASSES),
-        )
-        if bool(config.get("filter_stoptime", True))
+        _extract_stop_time_events(df, stop_classes)
+        if filter_stoptime
         else pd.DataFrame(columns=["DeviceId", "StopStartTime", "StopEndTime"])
     )
     flash_intervals = _extract_flash_intervals(
         df,
-        config.get("clearance_flash_event_classes", DEFAULT_FLASH_EVENT_CLASSES),
+        flash_classes,
         float(config.get("clearance_flash_cushion_seconds", DEFAULT_FLASH_CUSHION_SECONDS)),
-    )
-    validity_classes = config.get(
-        "clearance_validity_event_classes", DEFAULT_VALIDITY_EVENT_CLASSES
     )
     is_state_row = df['EventClass'].isin(validity_classes)
 
@@ -190,6 +234,20 @@ def process_clearance_intervals(
     if df.empty:
         return _empty_alerts()
 
+    df = _drop_overlap_yellows_absorbing_red(
+        df,
+        float(config.get(
+            "overlap_missing_red_tolerance_seconds",
+            DEFAULT_OVERLAP_MISSING_RED_TOLERANCE_SECONDS,
+        )),
+        float(config.get(
+            "overlap_red_coverage_min",
+            DEFAULT_OVERLAP_RED_COVERAGE_MIN,
+        )),
+    )
+    if df.empty:
+        return _empty_alerts()
+
     invalid_event_cushion_seconds = float(
         config.get("clearance_invalid_event_cushion_seconds", DEFAULT_INVALID_EVENT_CUSHION_SECONDS)
     )
@@ -206,8 +264,18 @@ def process_clearance_intervals(
     overlap_fixed_within = float(config.get("overlap_fixed_within_seconds", 2.0))
     overlap_fixed_ratio = float(config.get("overlap_fixed_within_ratio", 0.95))
 
-    alert_rows = []
     group_cols = ["DeviceId", "EventClass", "EventValue"]
+    df = _movements_that_can_alert(df, group_cols, yellow_min, red_min, tolerance)
+    if df.empty:
+        return _empty_alerts()
+    # Whether each interval overlaps a stop-time interval depends on that
+    # interval alone, so it is worked out for all of them in one pass.
+    if not stop_events.empty:
+        df = df.assign(_StopOverlap=_stop_time_overlap_mask(
+            df[['DeviceId', 'StartTime', 'EndTime']].reset_index(drop=True), stop_events
+        ).to_numpy())
+
+    alert_rows = []
     for (device_id, event_class, event_value), group in df.groupby(group_cols, sort=False):
         group = group.sort_values("StartTime").copy()
         durations = group["Duration"].astype(float)
@@ -222,50 +290,46 @@ def process_clearance_intervals(
         if is_red:
             # Red clearance may vary. Only values below the configured global
             # minimum are alertable; tolerance does not lower this threshold.
-            short_mask = durations < (red_min - FLOAT_EPSILON)
-            irregular_only_mask = pd.Series(False, index=group.index)
+            below_min_mask = durations < (red_min - FLOAT_EPSILON)
+            below_median_mask = pd.Series(False, index=group.index)
             long_mask = pd.Series(False, index=group.index)
         else:
             short_threshold = yellow_min - tolerance
-            short_mask = durations < (short_threshold - FLOAT_EPSILON)
-            irregular_only_mask = (
-                (durations - median_duration < -(tolerance + FLOAT_EPSILON)) & ~short_mask
+            below_min_mask = durations < (short_threshold - FLOAT_EPSILON)
+            below_median_mask = (
+                (durations - median_duration < -(tolerance + FLOAT_EPSILON)) & ~below_min_mask
             )
             long_mask = (
-                (durations - median_duration > (tolerance + FLOAT_EPSILON)) & ~short_mask
+                (durations - median_duration > (tolerance + FLOAT_EPSILON)) & ~below_min_mask
             )
 
         deltas = durations - median_duration
         abs_deltas = deltas.abs()
 
-        non_short_deviation_mask = irregular_only_mask | long_mask
-        if bool(non_short_deviation_mask.any()) and not stop_events.empty:
-            overlaps = _stop_time_overlap_mask(
-                group.loc[
-                    non_short_deviation_mask,
-                    ['DeviceId', 'StartTime', 'EndTime'],
-                ],
-                stop_events,
-            )
+        median_deviation_mask = below_median_mask | long_mask
+        if bool(median_deviation_mask.any()) and not stop_events.empty:
+            overlaps = group.loc[median_deviation_mask, '_StopOverlap']
             if bool(overlaps.any()):
-                irregular_only_mask = irregular_only_mask.copy()
+                below_median_mask = below_median_mask.copy()
                 long_mask = long_mask.copy()
-                irregular_only_mask.loc[overlaps[overlaps].index] = False
+                below_median_mask.loc[overlaps[overlaps].index] = False
                 long_mask.loc[overlaps[overlaps].index] = False
 
-        anomaly_mask = irregular_only_mask | long_mask
+        # An interval under the minimum and one merely under the median are both
+        # just short to a reader; they are tracked apart only because stop-time
+        # filtering applies to the second and not the first.
+        short_mask = below_min_mask | below_median_mask
+        flagged_mask = short_mask | long_mask
 
         short_count = int(short_mask.sum())
         long_count = int(long_mask.sum())
-        irregular_count = int(irregular_only_mask.sum())
-        if short_count == 0 and irregular_count == 0 and long_count == 0:
+        if short_count == 0 and long_count == 0:
             continue
 
-        bad_times = group.loc[short_mask | anomaly_mask, "StartTime"]
+        bad_times = group.loc[flagged_mask, "StartTime"]
         alert_date = pd.to_datetime(bad_times.max()).normalize()
 
         short_row = _representative_row(group, abs_deltas, short_mask)
-        irregular_row = _representative_row(group, abs_deltas, irregular_only_mask)
         long_row = _representative_row(group, abs_deltas, long_mask)
 
         alert_rows.append({
@@ -275,15 +339,12 @@ def process_clearance_intervals(
             "Date": alert_date,
             "MedianDuration": median_duration,
             "SampleCount": int(len(group)),
-            "MaxAbsDelta": float(abs_deltas[short_mask | anomaly_mask].max()),
+            "MaxAbsDelta": float(abs_deltas[flagged_mask].max()),
             "ShortCount": short_count,
-            "IrregularCount": irregular_count,
             "LongCount": long_count,
             "AvgSignedDeviation": float(deltas.mean()) if len(deltas) else np.nan,
             "RepresentativeShortDuration": _row_value(short_row, "Duration"),
             "RepresentativeShortTime": _row_value(short_row, "StartTime"),
-            "RepresentativeIrregularDuration": _row_value(irregular_row, "Duration"),
-            "RepresentativeIrregularTime": _row_value(irregular_row, "StartTime"),
             "RepresentativeLongDuration": _row_value(long_row, "Duration"),
             "RepresentativeLongTime": _row_value(long_row, "StartTime"),
         })
@@ -292,6 +353,38 @@ def process_clearance_intervals(
         return _empty_alerts()
 
     return pd.DataFrame(alert_rows).reindex(columns=CLEARANCE_ALERT_COLUMNS)
+
+
+def _movements_that_can_alert(
+    clearance_rows: pd.DataFrame,
+    group_cols: list,
+    yellow_min: float,
+    red_min: float,
+    tolerance: float,
+) -> pd.DataFrame:
+    """Keep the movements with an interval the alert loop could flag.
+
+    A movement alerts only on an interval under the minimum or, for yellow, off
+    its median by more than the tolerance. Nearly all movements have neither, so
+    they are found at once and dropped rather than run through the loop. The
+    bounds are a hair looser than the loop's, so a borderline movement is kept
+    and the loop has the final say.
+    """
+    slack = 1e-6
+    durations = clearance_rows["Duration"].astype(float)
+    medians = durations.groupby([clearance_rows[col] for col in group_cols], sort=False).transform("median")
+    classes = clearance_rows["EventClass"]
+    red_classes = [value for value in classes.unique() if "Red" in str(value)]
+    is_red = classes.isin(red_classes)
+    candidate = (
+        (is_red & (durations < red_min - FLOAT_EPSILON + slack))
+        | (~is_red & (
+            (durations < yellow_min - tolerance - FLOAT_EPSILON + slack)
+            | ((durations - medians).abs() > tolerance + FLOAT_EPSILON - slack)
+        ))
+    )
+    keep = candidate.groupby([clearance_rows[col] for col in group_cols], sort=False).transform("any")
+    return clearance_rows[keep.astype(bool)]
 
 
 def _extract_flash_intervals(
@@ -308,14 +401,8 @@ def _extract_flash_intervals(
     if not flash_keys or cushion_seconds < 0:
         return pd.DataFrame(columns=["DeviceId", "StartTime", "EndTime"])
 
-    event_class_key = (
-        timeline["EventClass"]
-        .astype(str)
-        .str.replace(r"[\s_-]+", "", regex=True)
-        .str.lower()
-    )
     flash_rows = timeline.loc[
-        event_class_key.isin(flash_keys) &
+        timeline["EventClass"].isin(_matching_event_classes(timeline["EventClass"], event_classes)) &
         timeline["StartTime"].notna(),
         ["DeviceId", "StartTime", "EndTime"],
     ].copy()
@@ -344,14 +431,8 @@ def _extract_stop_time_events(timeline: pd.DataFrame, event_classes) -> pd.DataF
     if not stop_event_keys:
         return pd.DataFrame(columns=["DeviceId", "StopStartTime", "StopEndTime"])
 
-    event_class_key = (
-        timeline["EventClass"]
-        .astype(str)
-        .str.replace(r"[\s_-]+", "", regex=True)
-        .str.lower()
-    )
     stop_events = timeline.loc[
-        event_class_key.isin(stop_event_keys) &
+        timeline["EventClass"].isin(_matching_event_classes(timeline["EventClass"], event_classes)) &
         timeline["StartTime"].notna() &
         timeline["EndTime"].notna(),
         ["DeviceId", "StartTime", "EndTime"],
@@ -370,6 +451,33 @@ def _extract_stop_time_events(timeline: pd.DataFrame, event_classes) -> pd.DataF
     return stop_events[["DeviceId", "StopStartTime", "StopEndTime"]]
 
 
+def _fill_times(times: pd.Series, fill: pd.Series) -> pd.Series:
+    """times.fillna(fill) when the two are of different resolutions.
+
+    As pandas 2 does it: the fill takes the resolution of times when it fits
+    exactly, otherwise times move to the fill's finer one. pandas 3 deprecates
+    filling with times of another resolution, so the cast is done here.
+    """
+    if fill.dtype != times.dtype:
+        fitted = fill.astype(times.dtype)
+        if fitted.astype(fill.dtype).equals(fill):
+            fill = fitted
+        else:
+            times = times.astype(fill.dtype)
+    return times.fillna(fill)
+
+
+def _matching_event_classes(event_class: pd.Series, event_classes) -> list:
+    """The EventClass values present that name one of event_classes, ignoring case,
+    spaces, underscores and hyphens. Matched on the distinct values, not every row."""
+    keys = _normalized_event_class_keys(event_classes)
+    if not keys:
+        return []
+    present = pd.Series(event_class.unique(), dtype=object)
+    normalized = present.astype(str).str.replace(r"[\s_-]+", "", regex=True).str.lower()
+    return present[normalized.isin(keys)].tolist()
+
+
 def _normalized_event_class_keys(event_classes) -> set[str]:
     if isinstance(event_classes, str):
         event_classes = [event_classes]
@@ -380,6 +488,9 @@ def _normalized_event_class_keys(event_classes) -> set[str]:
     }
 
 
+# The merge_asof helpers below sort the clearance rows by time alone: merge_asof
+# needs no more, and each row's match depends only on that row (the by= key
+# keeps it to its own signal), so the order among equal times does not matter.
 def _stop_time_overlap_mask(clearance_rows: pd.DataFrame, stop_events: pd.DataFrame) -> pd.Series:
     if clearance_rows.empty or stop_events.empty:
         return pd.Series(False, index=clearance_rows.index)
@@ -388,7 +499,7 @@ def _stop_time_overlap_mask(clearance_rows: pd.DataFrame, stop_events: pd.DataFr
         clearance_rows
         .reset_index()
         .rename(columns={"index": "_original_index"})
-        .sort_values(["EndTime", "DeviceId"])
+        .sort_values("EndTime")
     )
     stop_sorted = (
         stop_events
@@ -416,6 +527,66 @@ def _stop_time_overlap_mask(clearance_rows: pd.DataFrame, stop_events: pd.DataFr
         overlaps.to_numpy(),
         index=prior_stop["_original_index"],
     ).reindex(clearance_rows.index, fill_value=False)
+
+
+def _drop_overlap_yellows_absorbing_red(
+    clearance_rows: pd.DataFrame,
+    tolerance_seconds: float,
+    red_coverage_min: float,
+) -> pd.DataFrame:
+    """Drop overlap yellows that ran as long as the yellow plus the red.
+
+    When the Overlap Red begin event goes missing, the log reads as a single
+    yellow running from where the yellow started to where the red should have
+    ended, so the interval lands on the yellow median plus the red median. That
+    is a hole in the record rather than a long yellow, and it accounted for the
+    long-overlap alerts being reported, so the sample is thrown out instead.
+
+    Only a sample already reading long is eligible, which keeps a signal whose
+    red is shorter than the tolerance from losing its ordinary yellows. The
+    overlap must also emit a red for red_coverage_min of its yellows: one that
+    runs yellow to green instead has no meaningful red median, and its longer
+    yellows are how it operates rather than a hole in the record.
+    """
+    yellows = clearance_rows["EventClass"] == "Overlap Yellow"
+    reds = clearance_rows["EventClass"] == "Overlap Red"
+    if not yellows.any() or not reds.any():
+        return clearance_rows
+
+    key = ["DeviceId", "EventValue"]
+    yellow_stats = clearance_rows.loc[yellows].groupby(key)["Duration"].agg(
+        YellowMedian="median", YellowCount="size"
+    )
+    red_stats = clearance_rows.loc[reds].groupby(key)["Duration"].agg(
+        RedMedian="median", RedCount="size"
+    )
+    medians = yellow_stats.join(red_stats, how="inner").reset_index()
+    medians = medians[
+        medians["RedCount"] >= medians["YellowCount"] * red_coverage_min
+    ]
+    if medians.empty:
+        return clearance_rows
+
+    candidates = (
+        clearance_rows.loc[yellows, key + ["Duration"]]
+        .reset_index()
+        .merge(medians, on=key, how="inner")
+    )
+    if candidates.empty:
+        return clearance_rows
+
+    limit = tolerance_seconds + FLOAT_EPSILON
+    absorbed = (
+        (candidates["Duration"] - candidates["YellowMedian"] > limit)
+        & (
+            (candidates["Duration"] - (candidates["YellowMedian"] + candidates["RedMedian"]))
+            .abs() <= limit
+        )
+    )
+    drop_index = candidates.loc[absorbed, "index"]
+    if drop_index.empty:
+        return clearance_rows
+    return clearance_rows.drop(index=drop_index)
 
 
 def _drop_overlap_yellows_without_preceding_green(
@@ -475,10 +646,10 @@ def _drop_rows_overlapping_invalid_intervals(
         return clearance_rows.copy()
 
     clearance_sorted = (
-        clearance_rows
+        clearance_rows[['DeviceId', 'StartTime', 'EndTime']]
         .reset_index()
         .rename(columns={'index': '_original_index'})
-        .sort_values(['EndTime', 'DeviceId'])
+        .sort_values('EndTime')
     )
     invalid_sorted = (
         invalid_intervals
@@ -527,10 +698,10 @@ def _drop_long_rows_near_invalid_events(
         return clearance_rows.copy()
 
     clearance_sorted = (
-        long_rows
+        long_rows[["DeviceId", "StartTime"]]
         .reset_index()
         .rename(columns={"index": "_original_index"})
-        .sort_values(["StartTime", "DeviceId"])
+        .sort_values("StartTime")
     )
     invalid_sorted = (
         invalid_starts

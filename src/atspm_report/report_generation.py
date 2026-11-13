@@ -1,24 +1,24 @@
 import pandas as pd
 import importlib.resources
+import weakref
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, FrameBreak, KeepTogether
+from reportlab.platypus import CondPageBreak, SimpleDocTemplate, Paragraph, Spacer, Image, KeepTogether, Table, TableStyle
 from reportlab.platypus.flowables import Flowable
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 from io import BytesIO
+from xml.sax.saxutils import escape
 import matplotlib.pyplot as plt
 from datetime import datetime, date
 import os
-import calendar
 from pathlib import Path
-from typing import List, Tuple, Union, Dict, Any, Optional
+from typing import List, Dict, Optional
 from .table_generation import (
     prepare_phase_termination_alerts_table,
     prepare_phase_skip_alerts_table,
-    prepare_detector_health_alerts_table,
-    prepare_ped_alerts_table,
     prepare_missing_data_alerts_table,
     prepare_system_outages_table,
     prepare_clearance_interval_alerts_table,
@@ -26,19 +26,85 @@ from .table_generation import (
     prepare_alarms_table,
     prepare_preempt_alerts_table,
     prepare_signal_conflicts_table,
+    prepare_atspm_detector_health_table,
     create_reportlab_table,
     ONGOING_SINCE_COLUMN,
+    MISSING_HOURLY_HEADER,
 )
+from .atspm_detector_health import ALERT_TYPE as ATSPM_DETECTOR_HEALTH, FAULT_STATUSES, PED, VEHICLE
+from .preempt_cascade import SECTION_EV, SECTION_RAIL, SECTION_TSP
+from .signal_focus import SECTION_TITLE as SIGNAL_FOCUS_TITLE
 from .utils import log_message
 
 # Repeat alerts are normally held back so they do not crowd out new ones. When the
-# caller passes them in, each check gets a second "Ongoing ..." section - its own
-# table and charts - directly after the "New ..." section for that same check.
-ONGOING_SECTION_EXPLANATION = (
-    'These issues were reported previously and are still occurring, so they are held '
-    'out of the new alerts above to keep genuinely new problems visible. Ongoing gives '
-    'the date the current run of repeat alerts started, and how many days ago that was.'
-)
+# caller passes them in, they go in one "Ongoing Issues" section at the end of the
+# report, after every new alert: one subsection per check - its own table and
+# charts - in the same order as the checks above it.
+ONGOING_TITLE = 'Ongoing Issues'
+
+
+# Stacked two-panel preempt charts take their height from the image, which is
+# drawn at close to print width so the text keeps its size.
+PREEMPT_CHART_HEIGHT = None
+HEADING_ROOM = 2.0*inch
+
+
+def _preempt_rows(alerts: Optional[pd.DataFrame], signals_df, region, max_rows, section=None):
+    """The table rows of one preempt section (alerts whose Class is section; alerts without a Class are emergency vehicle)."""
+    if alerts is None or alerts.empty or signals_df is None:
+        return pd.DataFrame(), 0
+    if section is not None:
+        classes = alerts['Class'] if 'Class' in alerts.columns else pd.Series(None, index=alerts.index, dtype=object)
+        alerts = alerts[classes.fillna(SECTION_EV) == section]
+        if alerts.empty:
+            return pd.DataFrame(), 0
+    return prepare_preempt_alerts_table(alerts, signals_df, region=region, max_rows=max_rows)
+
+
+def _section_figures(figures, section, region) -> list:
+    """The charts of one preempt section in one report: figures is {section: [(figure, region)]}, or a plain list (old
+    callers), which goes with the emergency vehicle section."""
+    if isinstance(figures, dict):
+        figures = figures.get(section) or []
+    elif section != SECTION_EV:
+        figures = []
+    return [fig for fig, reg in (figures or []) if reg == region]
+
+
+# The preempt sections, in report order: (Class, heading, ongoing title, sparkline header).
+PREEMPT_SECTION_TEXT = [
+    (SECTION_EV, 'Emergency Vehicle Preempt', 'Emergency Vehicle Preempt Alerts',
+     'Calls/Day (6wk)'),
+    (SECTION_TSP, 'Transit Signal Priority', 'Transit Signal Priority Alerts',
+     'Bus Calls/Day (6wk)'),
+    (SECTION_RAIL, 'Rail', 'Rail Preempt Alerts',
+     'Calls/Day (6wk)'),
+]
+
+
+ATSPM_DETECTOR_HEALTH_TITLE = 'Detector Health'
+ATSPM_HOURLY_HEADER = 'Hourly Actuations'
+ATSPM_HOURLY_PRESSES_HEADER = 'Hourly Presses'
+
+
+ATSPM_PED_HEALTH_TITLE = 'Pedestrian Button Health'
+
+
+# With the urgency tiers the faults are two tables: those measured to cost a phase its service or to delay other phases, the
+# most costly first, with their charts; then those with no measured effect, which still need fixing for the data.
+ATSPM_HARM_TABLE = 'Affecting Operations'
+ATSPM_DATA_TABLE = 'Data Only'
+
+
+def _atspm_detector_health_rows(alerts, signals_df, statuses, region, max_rows, story_header, detector_type=VEHICLE,
+                                hourly_counts=None, ped_hourly_counts=None, expected_counts=None, impact=None):
+    if alerts is None or alerts.empty or signals_df is None:
+        return pd.DataFrame(), 0
+    return prepare_atspm_detector_health_table(
+        alerts, signals_df, statuses, region=region, max_rows=max_rows,
+        story_header=story_header, detector_type=detector_type, hourly_counts=hourly_counts,
+        ped_hourly_counts=ped_hourly_counts, expected_counts=expected_counts, impact=impact,
+    )
 
 
 def _has_rows(df: Optional[pd.DataFrame]) -> bool:
@@ -46,13 +112,12 @@ def _has_rows(df: Optional[pd.DataFrame]) -> bool:
     return df is not None and not df.empty
 
 
-def _chart_flowables(figures: list) -> list:
+def _chart_flowables(figures: list, height: float = 2.8*inch, width: float = 6.5*inch) -> list:
     """Lay out alert charts one per row, each kept whole on a single page."""
     elements = []
     for figure in figures:
-        elements.append(KeepTogether([MatplotlibFigure(figure, width=6.5*inch, height=2.8*inch)]))
+        elements.append(KeepTogether([MatplotlibFigure(figure, width=width, height=height)]))
         elements.append(Spacer(1, 0.15*inch))
-        plt.close(figure)
     return elements
 
 
@@ -65,18 +130,15 @@ def _ongoing_section(
         figures: Optional[list] = None,
         include_trend: bool = False,
         trend_header: str = 'Trend',
+        chart_height: float = 2.8*inch,
+        chart_width: float = 6.5*inch,
+        keep_start: bool = False,
 ) -> list:
-    """Build the 'Ongoing <title>' section, or nothing when there is nothing ongoing."""
+    """Build one check's subsection of the Ongoing Issues section, or nothing when there is nothing ongoing."""
     if not _has_rows(rows_df):
         return []
 
-    elements = [
-        Paragraph(f'Ongoing {title}', styles['SectionHeading']),
-        Spacer(1, 0.1*inch),
-        Paragraph(ONGOING_SECTION_EXPLANATION, styles['Normal']),
-        Spacer(1, 0.2*inch),
-    ]
-    elements.extend(create_reportlab_table(
+    table = create_reportlab_table(
         rows_df,
         f'Ongoing {title}',
         styles,
@@ -84,10 +146,77 @@ def _ongoing_section(
         max_rows=max_rows,
         include_trend=include_trend,
         trend_header=trend_header,
-    ))
+    )
+    elements = [Paragraph(title, styles['SubsectionHeading'])]
+    elements.append(Spacer(1, 0.1*inch))
+    if keep_start:
+        elements.insert(0, _keep_with_table_start(table, 1.2*inch))
+    elements.extend(table)
     elements.append(Spacer(1, 0.3*inch))
-    elements.extend(_chart_flowables(figures or []))
+    elements.extend(_chart_flowables(figures or [], chart_height, chart_width))
     return elements
+
+
+def _ongoing_issues(subsections: list, styles) -> list:
+    """The Ongoing Issues section: its heading over the checks' subsections, or nothing without any."""
+    if not subsections:
+        return []
+    return [
+        # The heading goes to the next page unless the first subsection's heading room fits under it too.
+        CondPageBreak(HEADING_ROOM + 1.0*inch),
+        Paragraph(ONGOING_TITLE, styles['SectionHeading']),
+        Spacer(1, 0.2*inch),
+        *subsections,
+    ]
+
+
+def _keep_with_table_start(table: list, heading_height: float = 0.7*inch) -> CondPageBreak:
+    """Goes to the next page unless this heading and the table's first signal fit on this one, so a heading and a table header
+    are not left alone at the foot of a page."""
+    return CondPageBreak(heading_height + getattr(table[-1], 'start_height', 0.0))
+
+
+def _focus_table(told: list, drawn: set, styles) -> Table:
+    """A signal's problems: problem type, then its problems one to a line. A line whose kind of chart is not among those drawn
+    says so; a row with no chart at all says it once, under its type. A line whose chart is not drawn gives its numbers (detail)."""
+    body = ParagraphStyle('FocusCell', parent=styles['Normal'], fontSize=9, leading=11.5)
+    head = ParagraphStyle('FocusHead', parent=body, fontName='Helvetica-Bold', textColor=colors.white)
+    table = [[Paragraph('Problem type', head), Paragraph('Problems', head)]]
+    for row in told:
+        charted = [] if row.get('no_chart') else [line for line in row['lines'] if line['chart'] in drawn]
+        kind = f"<b>{escape(row['type'])}</b>" + ('' if charted else '<br/><i>No chart</i>')
+        lines = [escape(line['text'] if line['chart'] in drawn else line.get('detail', line['text']))
+                 + (' <i>(no chart)</i>' if charted and line['chart'] not in drawn else '') for line in row['lines']]
+        table.append([Paragraph(kind, body), Paragraph('<br/>'.join(lines), body)])
+    flowable = Table(table, colWidths=[1.5*inch, 6.0*inch], repeatRows=1)
+    flowable.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.navy),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+    return flowable
+
+
+def _signal_focus_section(rows: pd.DataFrame, figures: Optional[dict], styles) -> list:
+    """The Signal Focus section: one signal at a time, a subtitle with its name, its problems in a table, its charts in the table's order."""
+    elements = [
+        Paragraph(SIGNAL_FOCUS_TITLE, styles['SectionHeading']),
+        Spacer(1, 0.15*inch),
+    ]
+    for _, row in rows.iterrows():
+        charts = (figures or {}).get(row['DeviceId'], [])
+        elements.append(KeepTogether([
+            Paragraph(f"{row['Rank']}. {escape(str(row['Signal']))}", styles['SubsectionHeading']),
+            _focus_table(row['Rows'], {one for _, _, _, kind in charts for one in ((kind,) if isinstance(kind, str) else kind)}, styles),
+        ]))
+        elements.append(Spacer(1, 0.15*inch))
+        for figure, width, height, _ in charts:
+            elements.append(KeepTogether([MatplotlibFigure(figure, width=width, height=height)]))
+            elements.append(Spacer(1, 0.15*inch))
+    return elements
+
 
 # Load jokes from package data
 def _load_jokes() -> list[str]:
@@ -259,25 +388,38 @@ class HeaderFooter:
         pass
 
 
+# Each figure's PNG, kept while the figure lives. A chart can appear in its
+# region's report and in All Regions; it is rendered once for both.
+_FIGURE_PNGS = weakref.WeakKeyDictionary()
+
+
+def figure_png(figure: plt.Figure) -> bytes:
+    """The figure as the PNG the report embeds."""
+    png = _FIGURE_PNGS.get(figure)
+    if png is None:
+        buf = BytesIO()
+        figure.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        png = _FIGURE_PNGS[figure] = buf.getvalue()
+    return png
+
+
 class MatplotlibFigure(Flowable):
     """A Flowable wrapper for matplotlib figures"""
-    def __init__(self, figure: plt.Figure, width: float = 6.5*inch, height: float = 3*inch):
+    def __init__(self, figure: plt.Figure, width: float = 6.5*inch, height: Optional[float] = 3*inch):
         Flowable.__init__(self)
         self.figure = figure
         self.width = width
         self.height = height
+        if height is None:
+            # Keep the saved image's own proportions rather than stretching it.
+            pixel_width, pixel_height = ImageReader(BytesIO(figure_png(figure))).getSize()
+            self.height = width * pixel_height / pixel_width
 
     def draw(self):
         try:
-            # Create a BytesIO buffer and save the figure to it
-            buf = BytesIO()
-            self.figure.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-            buf.seek(0)
-
             # Use ReportLab's canvas to draw the image
-            img = Image(buf, width=self.width, height=self.height)
+            img = Image(BytesIO(figure_png(self.figure)), width=self.width, height=self.height)
             img.drawOn(self.canv, 0, 0)
-            buf.close()
         except Exception as e:
             # If there's an error, print a message in the PDF
             self.canv.setFont('Helvetica', 12)
@@ -320,19 +462,12 @@ def draw_page_footer(canvas, page_num, num_pages, region=None):
 
 
 def generate_pdf_report(
-        filtered_df_maxouts: pd.DataFrame, 
-        filtered_df_actuations: pd.DataFrame,
-        filtered_df_ped: pd.DataFrame,
-        ped_hourly_df: pd.DataFrame,
+        filtered_df_maxouts: pd.DataFrame,
         filtered_df_missing_data: pd.DataFrame,
         system_outages_df: pd.DataFrame,
         phase_figures: List[tuple[plt.Figure, str]],
-        detector_figures: List[tuple[plt.Figure, str]],
-        ped_figures: List[tuple[plt.Figure, str]],
         missing_data_figures: List[tuple[plt.Figure, str]],
         signals_df: pd.DataFrame = None,
-        detector_hourly_df: pd.DataFrame = None,
-        save_to_disk: bool = False,
         max_table_rows: int = 10,
         verbosity: int = 1,
         phase_skip_rows: pd.DataFrame = None,
@@ -346,34 +481,37 @@ def generate_pdf_report(
         same_movement_color_conflicts_df: Optional[pd.DataFrame] = None,
         alarms_df: Optional[pd.DataFrame] = None,
         preempt_alerts_df: Optional[pd.DataFrame] = None,
-        clearance_yellow_min_seconds: float = 3.5,
-        clearance_red_min_seconds: float = 0.5,
+        atspm_detector_health_df: Optional[pd.DataFrame] = None,
+        atspm_detector_hourly: Optional[Dict[tuple, list]] = None,
+        atspm_detector_expected: Optional[Dict[tuple, list]] = None,
+        atspm_ped_hourly: Optional[Dict[tuple, list]] = None,
+        table_row_limits: Optional[Dict[str, int]] = None,
         joke_index: int = None,
         custom_logo_path: str = None,
         ongoing_alerts: Optional[Dict[str, pd.DataFrame]] = None,
         ongoing_phase_figures: Optional[List[tuple[plt.Figure, str]]] = None,
-        ongoing_detector_figures: Optional[List[tuple[plt.Figure, str]]] = None,
-        ongoing_ped_figures: Optional[List[tuple[plt.Figure, str]]] = None,
         ongoing_missing_data_figures: Optional[List[tuple[plt.Figure, str]]] = None,
-        ongoing_phase_skip_figures: Optional[List[tuple[plt.Figure, str]]] = None
+        ongoing_phase_skip_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        preempt_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        ongoing_preempt_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        atspm_detector_health_figures: Optional[Dict[str, List[tuple[plt.Figure, str]]]] = None,
+        ongoing_atspm_detector_health_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        ongoing_atspm_ped_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        signal_focus: Optional[Dict[str, pd.DataFrame]] = None,
+        signal_focus_figures: Optional[Dict[str, list]] = None,
+        data_stopped_at=None,
+        missing_data_hourly: Optional[pd.DataFrame] = None,
+        system_outages_hourly: Optional[pd.DataFrame] = None,
 ) -> Dict[str, BytesIO]:
     """Generate PDF reports for each region with the plots.
     
     Args:
         filtered_df_maxouts: DataFrame with phase termination alerts
-        filtered_df_actuations: DataFrame with detector health alerts
-        filtered_df_ped: DataFrame with pedestrian alerts
-        ped_hourly_df: DataFrame with pedestrian hourly data
-        detector_hourly_df: DataFrame with hourly detector actuation counts, used for
-            the detector health sparklines
         filtered_df_missing_data: DataFrame with missing data alerts
         system_outages_df: DataFrame with system-wide outages (Date, Region, MissingData)
         phase_figures: List of (figure, region) tuples for phase termination
-        detector_figures: List of (figure, region) tuples for detector health
-        ped_figures: List of (figure, region) tuples for pedestrian alerts
         missing_data_figures: List of (figure, region) tuples for missing data
         signals_df: DataFrame with signal information
-        save_to_disk: Must be False (legacy parameter, kept for compatibility)
         max_table_rows: Maximum number of rows to show in each alert table
         verbosity: Verbosity level (0=silent, 1=info, 2=debug)
         phase_skip_rows: DataFrame containing combined Phase Skip alert rows (for tables)
@@ -387,18 +525,35 @@ def generate_pdf_report(
         same_movement_color_conflicts_df: Same phase/overlap multi-color conflicts after suppression
         alarms_df: Controller alarms listed this run (never suppressed)
         preempt_alerts_df: Preempt frequency shift alerts after suppression
-        clearance_yellow_min_seconds: Yellow clearance threshold used in report text
-        clearance_red_min_seconds: Red clearance threshold used in report text
+        atspm_detector_hourly: {(DeviceId, Detector): actuations per hour} for the sparkline of
+            the detector health tables
+        atspm_detector_expected: {(DeviceId, Detector): usual actuations per hour}, a thin line behind the sparkline
+        atspm_ped_hourly: {(DeviceId, input): presses per hour}, the same for ped buttons
+        table_row_limits: Table -> its own row limit instead of max_table_rows. Keys: 'detector_faults',
+            'lane_closure', 'timing_plan', 'ped_faults', 'ped_setup', and 'ongoing' for every Ongoing table
+        atspm_detector_health_df: Detector health alerts from atspm-detector after
+            suppression (faults and information rows)
         joke_index: Specific joke index to use (0-based), None for date-based cycling
         custom_logo_path: Path to custom logo file, None for default ODOT logo
         ongoing_alerts: Alert type -> repeat alerts held back by suppression, carrying an
             OngoingSince column. Each type present adds an 'Ongoing ...' section after the
             matching 'New ...' one; pass None or empty frames for new alerts only
         ongoing_phase_figures: Charts for the ongoing phase termination section
-        ongoing_detector_figures: Charts for the ongoing detector health section
-        ongoing_ped_figures: Charts for the ongoing pedestrian detector section
         ongoing_missing_data_figures: Charts for the ongoing missing data section
         ongoing_phase_skip_figures: Charts for the ongoing phase skip section
+        preempt_figures: {section: (figure, region) charts} for new preempt alerts, one entry per preempt section
+            (Emergency Vehicle, TSP, Rail); a plain list goes with the emergency vehicle section
+        ongoing_preempt_figures: The same for ongoing preempt alerts
+        atspm_detector_health_figures: 'fault', 'closure' and 'plan' -> (figure, region) charts of the
+            detector health faults, lane closures and timing plans
+        ongoing_atspm_detector_health_figures: The same for ongoing detector health faults
+        signal_focus: Report -> its rows from build_signal_focus. Each report's rows lead it, and its other tables
+            leave those signals out
+        signal_focus_figures: DeviceId -> (figure, width, height, chart kind) charts of the section's signals
+        data_stopped_at: When the data stopped for the whole network, which the report says first, if it did
+        missing_data_hourly: Share of missing records per device and hour (DeviceId, TimeStamp, MissingData), which puts
+            the missing data tables by hour; without it they name each signal's worst day
+        system_outages_hourly: The same per region (Region, TimeStamp, MissingData), for the system outage tables
 
     Returns:
         Dict mapping region name to BytesIO containing PDF bytes
@@ -406,8 +561,6 @@ def generate_pdf_report(
     # Get unique regions from figure collections and Phase Skip tables
     figure_collections = [
         phase_figures or [],
-        detector_figures or [],
-        ped_figures or [],
         missing_data_figures or [],
         phase_skip_figures or []
     ]
@@ -452,6 +605,7 @@ def generate_pdf_report(
         overlap_conflicts_df,
         same_movement_color_conflicts_df,
         preempt_alerts_df,
+        atspm_detector_health_df,
     ]:
         if conflict_df is not None and not conflict_df.empty and signals_df is not None:
             conflict_region_lookup = (
@@ -501,6 +655,11 @@ def generate_pdf_report(
         )
 
     buffer_objects = []
+    signal_focus = signal_focus or {}
+    table_row_limits = table_row_limits or {}
+    # Each report's tables read their signal names from here, and a table leaves out a signal it has no name for, so
+    # a signal in that report's Signal Focus goes from all of them.
+    all_signals_df = signals_df
 
     # Get joke for this report
     joke_text = get_joke(joke_index)
@@ -511,18 +670,31 @@ def generate_pdf_report(
         log_message(f"Generating report for {region}...", 1, verbosity)
         # Filter figures for this region
         region_phase_figures = [fig for fig, reg in phase_figures if reg == region]
-        region_detector_figures = [fig for fig, reg in detector_figures if reg == region]
-        region_ped_figures = [fig for fig, reg in ped_figures if reg == region]
+        region_atspm_health_figures = {
+            key: [fig for fig, reg in figs if reg == region]
+            for key, figs in (atspm_detector_health_figures or {}).items()
+        }
+        region_ongoing_atspm_health_figures = [
+            fig for fig, reg in (ongoing_atspm_detector_health_figures or []) if reg == region
+        ]
+        region_ongoing_atspm_ped_figures = [
+            fig for fig, reg in (ongoing_atspm_ped_figures or []) if reg == region
+        ]
         region_missing_data_figures = [fig for fig, reg in missing_data_figures if reg == region]
         region_ongoing_phase_figures = [fig for fig, reg in (ongoing_phase_figures or []) if reg == region]
-        region_ongoing_detector_figures = [fig for fig, reg in (ongoing_detector_figures or []) if reg == region]
-        region_ongoing_ped_figures = [fig for fig, reg in (ongoing_ped_figures or []) if reg == region]
         region_ongoing_missing_data_figures = [
             fig for fig, reg in (ongoing_missing_data_figures or []) if reg == region
         ]
         region_ongoing_phase_skip_figures = [
             fig for fig, reg in (ongoing_phase_skip_figures or []) if reg == region
         ]
+
+        region_focus_rows = signal_focus.get(region, pd.DataFrame())
+        ongoing_limit = table_row_limits.get('ongoing', max_table_rows)
+        if not region_focus_rows.empty:
+            signals_df = all_signals_df[~all_signals_df['DeviceId'].astype(str).isin(region_focus_rows['DeviceId'])]
+        else:
+            signals_df = all_signals_df
 
         # Filter signals
         if region == "All Regions":
@@ -561,6 +733,8 @@ def generate_pdf_report(
 
         # Content building
         content = []
+        # The checks' ongoing subsections, which go together at the end of the report.
+        ongoing_content = []
 
         # Add report title and date
         styles = getSampleStyleSheet()
@@ -591,24 +765,18 @@ def generate_pdf_report(
         content.append(Paragraph(f"{region}", styles['Title']))
         content.append(Spacer(1, 0.2*inch))
 
-        # Introduction text
-        any_ongoing = any(_has_rows(df) for df in ongoing_alerts.values())
-        recurring_note = (
-            """Each section lists new alerts first, followed by an Ongoing Issues table of
-            problems that were reported before and are still occurring."""
-            if any_ongoing else
-            """These are new alerts only, recurring issues are not shown but will be added in a future update."""
-        )
-        intro_text = f"""This report for {region} includes alerts for phase skips, increased percent maxout, vehicle & pedestrian detector performance, and data completeness.
-        {recurring_note}
-        """
-        content.append(Paragraph(intro_text, styles['Normal']))
+        # Introduction text: what it says of recurring issues depends on what ends up in this report.
+        intro_position = len(content)
         content.append(Spacer(1, 0.2*inch))
 
         # Joke section comes first in the report body.
         content.append(Paragraph(joke_title, styles['SectionHeading']))
         content.append(Paragraph(joke_text, styles['Normal']))
         content.append(Spacer(1, 0.3*inch))
+
+        # Signal Focus: the worst signals across the checks, told once, before the checks themselves.
+        if not region_focus_rows.empty:
+            content.extend(_signal_focus_section(region_focus_rows, signal_focus_figures, styles))
 
         # Section: Controller Alarms
         if alarms_df is not None and not alarms_df.empty and signals_df is not None:
@@ -625,82 +793,16 @@ def generate_pdf_report(
         if not region_alarm_rows.empty:
             content.append(Paragraph('Controller Alarms', styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-            explanation = (
-                'Controller alarm events reported by the cabinet. A signal and alarm type '
-                'is listed only when it alarmed again on the most recent day, so a pair '
-                'drops off once the underlying problem is resolved. The count covers the '
-                'trailing six weeks, which shows how long a recurring problem has persisted.'
-            )
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
             content.extend(create_reportlab_table(
                 region_alarm_rows,
                 'Controller Alarms',
                 styles,
                 total_count=total_alarm_alerts,
                 max_rows=max_table_rows,
-                include_trend=False,
+                include_trend='Sparkline_Data' in region_alarm_rows.columns,
+                trend_header='Daily (6wk)',
             ))
             content.append(Spacer(1, 0.3*inch))
-
-        # Section: Preempt Monitoring
-        if preempt_alerts_df is not None and not preempt_alerts_df.empty and signals_df is not None:
-            region_preempt_rows, total_preempt_alerts = prepare_preempt_alerts_table(
-                preempt_alerts_df,
-                signals_df,
-                region=region,
-                max_rows=max_table_rows,
-            )
-        else:
-            region_preempt_rows = pd.DataFrame()
-            total_preempt_alerts = 0
-
-        if _has_rows(ongoing_alerts.get('preempts')) and signals_df is not None:
-            region_preempt_ongoing_rows, total_preempt_ongoing = prepare_preempt_alerts_table(
-                ongoing_alerts['preempts'],
-                signals_df,
-                region=region,
-                max_rows=max_table_rows,
-            )
-        else:
-            region_preempt_ongoing_rows = pd.DataFrame()
-            total_preempt_ongoing = 0
-
-        if not region_preempt_rows.empty:
-            content.append(Paragraph('New Preempt Monitoring Alerts', styles['SectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
-            explanation = (
-                'Preempt call frequency is tracked for each signal and preempt number. '
-                'Baseline/Day is the average number of calls per day over the trailing '
-                'six weeks, excluding the most recent seven days of data, which are '
-                'compared against it as Recent/Day. The check looks for broken detection, '
-                'not changes in real preemption: a pair is listed when its recent calls at '
-                'least tripled (rising by five or more a day), or all but stopped (a tenth '
-                'or less of a baseline of at least one a day), and the change is well '
-                'outside its own day-to-day variation. Each signal and preempt is '
-                'reported once per shift; the trend shows daily calls over the history.'
-            )
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
-            content.extend(create_reportlab_table(
-                region_preempt_rows,
-                'Preempt Monitoring',
-                styles,
-                total_count=total_preempt_alerts,
-                max_rows=max_table_rows,
-                trend_header='Calls/Day (6wk)',
-            ))
-            content.append(Spacer(1, 0.3*inch))
-
-        content.extend(_ongoing_section(
-            'Preempt Monitoring Alerts',
-            region_preempt_ongoing_rows,
-            total_preempt_ongoing,
-            styles,
-            max_table_rows,
-            include_trend=True,
-            trend_header='Calls/Day (6wk)',
-        ))
 
         if clearance_alerts_df is not None and not clearance_alerts_df.empty and signals_df is not None:
             region_clearance_rows, total_clearance_alerts = prepare_clearance_interval_alerts_table(
@@ -719,7 +821,7 @@ def generate_pdf_report(
                     ongoing_alerts['clearance_intervals'],
                     signals_df,
                     region=region,
-                    max_rows=max_table_rows,
+                    max_rows=ongoing_limit,
                 )
             )
         else:
@@ -746,12 +848,6 @@ def generate_pdf_report(
         if not region_overlap_dual_rows.empty:
             content.append(Paragraph('Overlap Dual Indications', styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-            explanation = (
-                'These conflicts occur when a phase is green while the same-numbered '
-                'overlap is yellow or red. Invalid timeline intervals are excluded.'
-            )
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
             content.extend(create_reportlab_table(
                 region_overlap_dual_rows,
                 'Overlap Dual Indications',
@@ -785,7 +881,7 @@ def generate_pdf_report(
                     ongoing_alerts['general_phase_conflicts'],
                     signals_df,
                     region=region,
-                    max_rows=max_table_rows,
+                    max_rows=ongoing_limit,
                 )
             )
         else:
@@ -795,15 +891,6 @@ def generate_pdf_report(
         if not region_general_phase_rows.empty:
             content.append(Paragraph('New General Phase Conflicts', styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-            explanation = (
-                'These conflicts identify overlapping green, yellow, or red-clearance '
-                'intervals for phase pairs prohibited by the standard dual-ring sequence. '
-                'Intervals that only touch at a shared end/start timestamp are allowed. '
-                'This check assumes default sequence operation and can raise false alarms '
-                'for signals using non-standard phasing; configure those signals as excluded.'
-            )
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
             content.extend(create_reportlab_table(
                 region_general_phase_rows,
                 'General Phase Conflicts',
@@ -814,7 +901,7 @@ def generate_pdf_report(
             ))
             content.append(Spacer(1, 0.3*inch))
 
-        content.extend(_ongoing_section(
+        ongoing_content.extend(_ongoing_section(
             'General Phase Conflicts',
             region_general_phase_ongoing_rows,
             total_general_phase_ongoing,
@@ -845,7 +932,7 @@ def generate_pdf_report(
                     ongoing_alerts['overlap_conflicts'],
                     signals_df,
                     region=region,
-                    max_rows=max_table_rows,
+                    max_rows=ongoing_limit,
                 )
             )
         else:
@@ -855,15 +942,6 @@ def generate_pdf_report(
         if not region_overlap_conflict_rows.empty:
             content.append(Paragraph('New Overlap Conflicts', styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-            explanation = (
-                'These conflicts identify configured overlap green or yellow intervals '
-                'running with a prohibited phase or overlap green/yellow interval. '
-                'Red indications are not included in this check. This check assumes default '
-                'sequence and overlap compatibility groups and can raise false alarms for '
-                'signals using non-standard phasing; configure those signals as excluded.'
-            )
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
             content.extend(create_reportlab_table(
                 region_overlap_conflict_rows,
                 'Overlap Conflicts',
@@ -874,7 +952,7 @@ def generate_pdf_report(
             ))
             content.append(Spacer(1, 0.3*inch))
 
-        content.extend(_ongoing_section(
+        ongoing_content.extend(_ongoing_section(
             'Overlap Conflicts',
             region_overlap_conflict_ongoing_rows,
             total_overlap_conflict_ongoing,
@@ -885,14 +963,6 @@ def generate_pdf_report(
         if _has_rows(region_clearance_rows):
             content.append(Paragraph('New Clearance Interval Alerts', styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-            explanation = (
-                'Clearance interval alerts identify short, irregular, or long yellow '
-                'intervals and red intervals below the configured global minimum. Each '
-                'movement is judged against a single day of data - the most recent day '
-                'available - so the median shown is that day\'s median for that movement.'
-            )
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
             content.extend(create_reportlab_table(
                 region_clearance_rows,
                 'Clearance Interval Alerts',
@@ -903,7 +973,7 @@ def generate_pdf_report(
             ))
             content.append(Spacer(1, 0.3*inch))
 
-        content.extend(_ongoing_section(
+        ongoing_content.extend(_ongoing_section(
             'Clearance Interval Alerts',
             region_clearance_ongoing_rows,
             total_clearance_ongoing,
@@ -916,7 +986,7 @@ def generate_pdf_report(
             region_maxout_ongoing_rows, total_maxout_ongoing = prepare_phase_termination_alerts_table(
                 ongoing_alerts['maxout'],
                 region_signals_df,
-                max_rows=max_table_rows,
+                max_rows=ongoing_limit,
             )
         else:
             region_maxout_ongoing_rows = pd.DataFrame()
@@ -925,12 +995,6 @@ def generate_pdf_report(
         if len(filtered_df_maxouts) > 0 and region_phase_figures:
             content.append(Paragraph("New Phase Termination Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-
-            explanation = """The following tables and charts display phase termination patterns that have been flagged as anomalous.
-            Points marked with dots in the charts indicate periods where the system detected unusual max-out or force-off behavior.
-            A phase is listed when it was flagged within the last 7 days, measured against a 21-day baseline for that phase."""
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
             
             if region_signals_df is not None:
                 # Create phase termination table with row limit
@@ -954,7 +1018,7 @@ def generate_pdf_report(
             # Charts for the new alerts belong directly under their own table
             content.extend(_chart_flowables(region_phase_figures))
 
-        content.extend(_ongoing_section(
+        ongoing_content.extend(_ongoing_section(
             'Phase Termination Alerts',
             region_maxout_ongoing_rows,
             total_maxout_ongoing,
@@ -990,7 +1054,7 @@ def generate_pdf_report(
                 region=region,
                 allowed_pairs=ongoing_phase_skip_pairs,
                 min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0,
-                max_rows=max_table_rows,
+                max_rows=ongoing_limit,
             )
         else:
             region_phase_skip_ongoing_rows = pd.DataFrame()
@@ -1002,11 +1066,6 @@ def generate_pdf_report(
         ):
             content.append(Paragraph("New Phase Skip Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-
-            explanation = """Phase Skip alerts highlight phases where wait times exceeded 1.5x the cycle length without an active preempt window.
-            Each table row represents a device/phase/day combination that met these conditions within the last two weeks."""
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
 
             if region_phase_skip_rows is not None and not region_phase_skip_rows.empty:
                 table_content = create_reportlab_table(
@@ -1022,7 +1081,7 @@ def generate_pdf_report(
 
             content.extend(_chart_flowables(region_phase_skip_figures))
 
-        content.extend(_ongoing_section(
+        ongoing_content.extend(_ongoing_section(
             'Phase Skip Alerts',
             region_phase_skip_ongoing_rows,
             total_phase_skip_ongoing,
@@ -1031,123 +1090,221 @@ def generate_pdf_report(
             figures=region_ongoing_phase_skip_figures,
         ))
 
-        # Section: Detector Health - Changed to a single header
-        if _has_rows(ongoing_alerts.get('actuations')) and region_signals_df is not None:
-            region_detector_ongoing_rows, total_detector_ongoing = prepare_detector_health_alerts_table(
-                ongoing_alerts['actuations'],
-                region_signals_df,
-                max_rows=max_table_rows,
-                detector_hourly_df=detector_hourly_df,
-            )
-        else:
-            region_detector_ongoing_rows = pd.DataFrame()
-            total_detector_ongoing = 0
+        # Section: Detector Health, from atspm-detector. Faults first, then the
+        # lane closures and timing plan changes as information.
+        ongoing_atspm_health = ongoing_alerts.get(ATSPM_DETECTOR_HEALTH)
+        fault_limit = table_row_limits.get('detector_faults', max_table_rows)
+        closure_limit = table_row_limits.get('lane_closure', max_table_rows)
+        plan_limit = table_row_limits.get('timing_plan', max_table_rows)
+        # With the urgency tiers, ped buttons are in one priority order with the vehicle detectors.
+        ranked_together = _has_rows(atspm_detector_health_df) and 'TriageRank' in atspm_detector_health_df.columns
+        fault_type = None if ranked_together else VEHICLE
+        region_atspm_fault_rows, total_atspm_faults = _atspm_detector_health_rows(
+            atspm_detector_health_df, signals_df, FAULT_STATUSES, region, fault_limit, 'What Is Wrong', fault_type,
+            hourly_counts=atspm_detector_hourly, expected_counts=atspm_detector_expected, ped_hourly_counts=atspm_ped_hourly,
+        )
+        region_atspm_closure_rows, total_atspm_closures = _atspm_detector_health_rows(
+            atspm_detector_health_df, signals_df, ('lane_closure',), region, closure_limit, 'What Happened',
+            hourly_counts=atspm_detector_hourly, expected_counts=atspm_detector_expected,
+        )
+        region_atspm_plan_rows, total_atspm_plans = _atspm_detector_health_rows(
+            atspm_detector_health_df, signals_df, ('timing_plan',), region, plan_limit, 'What Happened',
+            hourly_counts=atspm_detector_hourly, expected_counts=atspm_detector_expected,
+        )
+        ongoing_ranked_together = _has_rows(ongoing_atspm_health) and 'TriageRank' in ongoing_atspm_health.columns
+        region_atspm_fault_ongoing_rows, total_atspm_faults_ongoing = _atspm_detector_health_rows(
+            ongoing_atspm_health, signals_df, FAULT_STATUSES, region, min(fault_limit, ongoing_limit), 'What Is Wrong',
+            None if ongoing_ranked_together else VEHICLE,
+            hourly_counts=atspm_detector_hourly, expected_counts=atspm_detector_expected, ped_hourly_counts=atspm_ped_hourly,
+        )
 
-        if len(filtered_df_actuations) > 0 and region_detector_figures:
-            content.append(Paragraph("New Detector Health Alerts", styles['SectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
+        def fault_parts(alerts, limit):
+            """The faults in two tables, [(title, rows, total)], those affecting operations first."""
+            parts = []
+            for title, impact in ((ATSPM_HARM_TABLE, True), (ATSPM_DATA_TABLE, False)):
+                rows, total = _atspm_detector_health_rows(
+                    alerts, signals_df, FAULT_STATUSES, region, limit, 'What Is Wrong', None, hourly_counts=atspm_detector_hourly,
+                    expected_counts=atspm_detector_expected, ped_hourly_counts=atspm_ped_hourly, impact=impact)
+                parts.append((title, rows, total))
+            return parts
 
-            explanation = """The following tables and charts display detector health metrics that have been flagged as anomalous.
-            Points marked with dots in the charts indicate periods where the system detected unusual detector behavior.
-            A detector is listed when it was flagged within the last 7 days, measured against a 21-day baseline for that detector."""
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
-
-            if region_signals_df is not None:
-                # Create detector health table with row limit
-                detector_alerts_df, total_detector_alerts = prepare_detector_health_alerts_table(
-                    filtered_df_actuations,
-                    region_signals_df,
-                    max_rows=max_table_rows,
-                    detector_hourly_df=detector_hourly_df,
-                )
-
-                table_content = create_reportlab_table(
-                    detector_alerts_df,
-                    "Detector Health Alerts",
+        atspm_chart = dict(height=None, width=7.5*inch)
+        if not (region_atspm_fault_rows.empty and region_atspm_closure_rows.empty and region_atspm_plan_rows.empty):
+            fault_table = []
+            if not region_atspm_fault_rows.empty:
+                fault_table = create_reportlab_table(
+                    region_atspm_fault_rows,
+                    ATSPM_DETECTOR_HEALTH_TITLE,
                     styles,
-                    total_count=total_detector_alerts,
-                    max_rows=max_table_rows,
-                    trend_header='Count (7d)'
+                    total_count=total_atspm_faults,
+                    max_rows=fault_limit,
+                    include_trend='Sparkline_Data' in region_atspm_fault_rows.columns,
+                    trend_header=ATSPM_HOURLY_HEADER,
                 )
-                content.extend(table_content)
+                content.append(_keep_with_table_start(fault_table, 1.2*inch if ranked_together else 0.7*inch))
+            content.append(Paragraph(ATSPM_DETECTOR_HEALTH_TITLE, styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            if fault_table and ranked_together:
+                # Two tables: the faults that affect operations, with their charts, then the ones that are data only.
+                shown = 0
+                for position, (title, rows, total) in enumerate(fault_parts(atspm_detector_health_df, fault_limit)):
+                    if rows.empty:
+                        continue
+                    part = create_reportlab_table(rows, title, styles, total_count=total, max_rows=fault_limit,
+                                                  include_trend='Sparkline_Data' in rows.columns, trend_header=ATSPM_HOURLY_HEADER)
+                    if shown:    # the first part's start was kept with the section heading above
+                        content.append(_keep_with_table_start(part, 0.9*inch))
+                    shown += 1
+                    content.append(Paragraph(title, styles['SubsectionHeading']))
+                    content.append(Spacer(1, 0.1*inch))
+                    content.extend(part)
+                    content.append(Spacer(1, 0.3*inch))
+                    if position == 0:
+                        content.extend(_chart_flowables(region_atspm_health_figures.get('fault', []), **atspm_chart))
+            elif fault_table:
+                content.extend(fault_table)
+                content.append(Spacer(1, 0.3*inch))
+                content.extend(_chart_flowables(region_atspm_health_figures.get('fault', []), **atspm_chart))
+            for rows, total, title, key, limit in (
+                    (region_atspm_closure_rows, total_atspm_closures, 'Lane Closures', 'closure', closure_limit),
+                    (region_atspm_plan_rows, total_atspm_plans, 'Timing Plan Changes', 'plan', plan_limit)):
+                if rows.empty:
+                    continue
+                content.append(Paragraph(title, styles['SubsectionHeading']))
+                content.append(Spacer(1, 0.2*inch))
+                content.extend(create_reportlab_table(
+                    rows, title, styles, total_count=total, max_rows=limit,
+                    include_trend='Sparkline_Data' in rows.columns, trend_header=ATSPM_HOURLY_HEADER,
+                ))
+                content.append(Spacer(1, 0.3*inch))
+                content.extend(_chart_flowables(region_atspm_health_figures.get(key, []), **atspm_chart))
+
+        # Only faults carry on into an Ongoing section: a lane closure or plan
+        # change that repeats is not something anyone needs reminding of.
+        if ongoing_ranked_together:
+            for position, (title, rows, total) in enumerate(fault_parts(ongoing_atspm_health, min(fault_limit, ongoing_limit))):
+                ongoing_content.extend(_ongoing_section(
+                    f"{ATSPM_DETECTOR_HEALTH_TITLE}: {title}", rows, total, styles, fault_limit,
+                    figures=region_ongoing_atspm_health_figures if position == 0 else None,
+                    include_trend='Sparkline_Data' in rows.columns, trend_header=ATSPM_HOURLY_HEADER,
+                    chart_height=None, chart_width=7.5*inch, keep_start=True,
+                ))
+        else:
+            ongoing_content.extend(_ongoing_section(
+                ATSPM_DETECTOR_HEALTH_TITLE,
+                region_atspm_fault_ongoing_rows,
+                total_atspm_faults_ongoing,
+                styles,
+                fault_limit,
+                figures=region_ongoing_atspm_health_figures,
+                include_trend='Sparkline_Data' in region_atspm_fault_ongoing_rows.columns,
+                trend_header=ATSPM_HOURLY_HEADER,
+                chart_height=None,
+                chart_width=7.5*inch,
+                keep_start=True,
+            ))
+
+        # Section: Pedestrian Button Health, from atspm-detector, laid out like the
+        # Detector Health section: faults first, then set-up issues as information.
+        ped_fault_limit = table_row_limits.get('ped_faults', max_table_rows)
+        ped_setup_limit = table_row_limits.get('ped_setup', max_table_rows)
+        region_ped_fault_rows, total_ped_faults = (pd.DataFrame(), 0) if ranked_together else _atspm_detector_health_rows(
+            atspm_detector_health_df, signals_df, FAULT_STATUSES, region, ped_fault_limit, 'What Is Wrong', PED,
+            hourly_counts=atspm_ped_hourly,
+        )
+        region_ped_setup_rows, total_ped_setup = _atspm_detector_health_rows(
+            atspm_detector_health_df, signals_df, ('config_issue',), region, ped_setup_limit, 'What Happened', PED,
+            hourly_counts=atspm_ped_hourly,
+        )
+        region_ped_fault_ongoing_rows, total_ped_faults_ongoing = (pd.DataFrame(), 0) if ongoing_ranked_together else _atspm_detector_health_rows(
+            ongoing_atspm_health, signals_df, FAULT_STATUSES, region, min(ped_fault_limit, ongoing_limit), 'What Is Wrong', PED,
+            hourly_counts=atspm_ped_hourly,
+        )
+        region_ped_charts = region_atspm_health_figures.get('ped_fault', [])
+        if not (region_ped_fault_rows.empty and region_ped_setup_rows.empty and not region_ped_charts):
+            content.append(Paragraph(ATSPM_PED_HEALTH_TITLE, styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            if not region_ped_fault_rows.empty:
+                content.extend(create_reportlab_table(
+                    region_ped_fault_rows,
+                    ATSPM_PED_HEALTH_TITLE,
+                    styles,
+                    total_count=total_ped_faults,
+                    max_rows=ped_fault_limit,
+                    include_trend='Sparkline_Data' in region_ped_fault_rows.columns,
+                    trend_header=ATSPM_HOURLY_PRESSES_HEADER,
+                ))
+                content.append(Spacer(1, 0.3*inch))
+            content.extend(_chart_flowables(region_ped_charts, **atspm_chart))
+            if not region_ped_setup_rows.empty:
+                content.append(Paragraph('Button Set-Up Issues', styles['SubsectionHeading']))
+                content.append(Spacer(1, 0.2*inch))
+                content.extend(create_reportlab_table(
+                    region_ped_setup_rows, 'Button Set-Up Issues', styles, total_count=total_ped_setup,
+                    max_rows=ped_setup_limit, include_trend='Sparkline_Data' in region_ped_setup_rows.columns,
+                    trend_header=ATSPM_HOURLY_PRESSES_HEADER,
+                ))
                 content.append(Spacer(1, 0.3*inch))
 
-            # Add detector health charts without additional header
-            content.extend(_chart_flowables(region_detector_figures))
-
-        content.extend(_ongoing_section(
-            'Detector Health Alerts',
-            region_detector_ongoing_rows,
-            total_detector_ongoing,
+        ongoing_content.extend(_ongoing_section(
+            ATSPM_PED_HEALTH_TITLE,
+            region_ped_fault_ongoing_rows,
+            total_ped_faults_ongoing,
             styles,
-            max_table_rows,
-            figures=region_ongoing_detector_figures,
-            include_trend=True,
-            trend_header='Count (7d)',
+            ped_fault_limit,
+            figures=region_ongoing_atspm_ped_figures,
+            include_trend='Sparkline_Data' in region_ped_fault_ongoing_rows.columns,
+            trend_header=ATSPM_HOURLY_PRESSES_HEADER,
+            chart_height=None,
+            chart_width=7.5*inch,
         ))
+        if ongoing_ranked_together and region_ongoing_atspm_ped_figures:
+            ongoing_content.append(Paragraph(ATSPM_PED_HEALTH_TITLE, styles['SubsectionHeading']))
+            ongoing_content.append(Spacer(1, 0.1*inch))
+            ongoing_content.extend(_chart_flowables(region_ongoing_atspm_ped_figures, **atspm_chart))
 
-
-        # Section: Ped Detector Health
-        if _has_rows(ongoing_alerts.get('pedestrian')) and region_signals_df is not None:
-            region_ped_ongoing_rows, total_ped_ongoing = prepare_ped_alerts_table(
-                ongoing_alerts['pedestrian'],
-                ped_hourly_df,
-                region_signals_df,
-                max_rows=max_table_rows,
-            )
-        else:
-            region_ped_ongoing_rows = pd.DataFrame()
-            total_ped_ongoing = 0
-
-        if len(filtered_df_ped) > 0 and region_ped_figures:
-            content.append(Paragraph("New Pedestrian Detector Alerts", styles['SectionHeading']))
-            content.append(Spacer(1, 0.1*inch))
-
-            explanation = """Pedestrian detector alerts are are generated when an anomaly in ped services and/or actuations is detected."""
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
-
-            if region_signals_df is not None:
-                # Create detector health table with row limit
-                detector_alerts_df, total_detector_alerts = prepare_ped_alerts_table(
-                    filtered_df_ped,
-                    ped_hourly_df,
-                    region_signals_df,
-                    max_rows=max_table_rows
-                )
-
-                table_content = create_reportlab_table(
-                    detector_alerts_df,
-                    "Ped Detector Alerts",
+        # Sections: Emergency Vehicle Preempt, TSP and Rail, toward the end of the report, before the data loss sections.
+        region_preempt_any = False
+        region_preempt_ongoing_any = False
+        for section, heading, ongoing_title, trend_header in PREEMPT_SECTION_TEXT:
+            rows, total = _preempt_rows(preempt_alerts_df, signals_df, region, max_table_rows, section)
+            ongoing_rows, total_ongoing = _preempt_rows(
+                ongoing_alerts.get('preempts'), signals_df, region, ongoing_limit, section)
+            region_preempt_any = region_preempt_any or not rows.empty
+            region_preempt_ongoing_any = region_preempt_ongoing_any or not ongoing_rows.empty
+            if not rows.empty:
+                content.append(Paragraph(heading, styles['SectionHeading']))
+                content.append(Spacer(1, 0.1*inch))
+                content.extend(create_reportlab_table(
+                    rows,
+                    heading,
                     styles,
-                    total_count=total_detector_alerts,
+                    total_count=total,
                     max_rows=max_table_rows,
-                    trend_header='Svc (7d)'
-                )
-                content.extend(table_content)
+                    trend_header=trend_header,
+                ))
                 content.append(Spacer(1, 0.3*inch))
-
-            # Add ped detector charts without additional header
-            content.extend(_chart_flowables(region_ped_figures))
-
-        content.extend(_ongoing_section(
-            'Pedestrian Detector Alerts',
-            region_ped_ongoing_rows,
-            total_ped_ongoing,
-            styles,
-            max_table_rows,
-            figures=region_ongoing_ped_figures,
-            include_trend=True,
-            trend_header='Svc (7d)',
-        ))
+                content.extend(_chart_flowables(_section_figures(preempt_figures, section, region), PREEMPT_CHART_HEIGHT))
+            ongoing_content.extend(_ongoing_section(
+                ongoing_title,
+                ongoing_rows,
+                total_ongoing,
+                styles,
+                max_table_rows,
+                figures=_section_figures(ongoing_preempt_figures, section, region),
+                include_trend=True,
+                trend_header=trend_header,
+                chart_height=PREEMPT_CHART_HEIGHT,
+            ))
 
         # Section: Missing Data - Changed to a single header
+        missing_trend_header = MISSING_HOURLY_HEADER if _has_rows(missing_data_hourly) else 'Missing (7d)'
         if _has_rows(ongoing_alerts.get('missing_data')) and region_signals_df is not None:
             region_missing_data_ongoing_rows, total_missing_data_ongoing = prepare_missing_data_alerts_table(
                 ongoing_alerts['missing_data'],
                 region_signals_df,
-                max_rows=max_table_rows,
+                max_rows=ongoing_limit,
+                hourly=missing_data_hourly,
             )
         else:
             region_missing_data_ongoing_rows = pd.DataFrame()
@@ -1157,19 +1314,13 @@ def generate_pdf_report(
             content.append(Paragraph("New Missing Data Alerts", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
 
-            explanation = """The following tables and charts display missing data patterns that have been flagged as anomalous.
-            Higher values indicate a greater percentage of missing data. Points marked with dots in the charts indicate periods
-            where the system detected significant data loss which may affect signal operation analysis.
-            A signal is listed when it was flagged within the last 7 days, measured against a 21-day baseline for that signal."""
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
-
             if region_signals_df is not None:
                 # Create missing data table with row limit - each signal appears only once with its worst day
                 missing_data_alerts_df, total_missing_data_alerts = prepare_missing_data_alerts_table(
                     filtered_df_missing_data,
                     region_signals_df,
-                    max_rows=max_table_rows
+                    max_rows=max_table_rows,
+                    hourly=missing_data_hourly,
                 )
 
                 table_content = create_reportlab_table(
@@ -1178,7 +1329,7 @@ def generate_pdf_report(
                     styles,
                     total_count=total_missing_data_alerts,
                     max_rows=max_table_rows,
-                    trend_header='Missing (7d)'
+                    trend_header=missing_trend_header,
                 )
                 content.extend(table_content)
                 content.append(Spacer(1, 0.3*inch))
@@ -1186,7 +1337,7 @@ def generate_pdf_report(
             # Add missing data charts without additional header
             content.extend(_chart_flowables(region_missing_data_figures))
 
-        content.extend(_ongoing_section(
+        ongoing_content.extend(_ongoing_section(
             'Missing Data Alerts',
             region_missing_data_ongoing_rows,
             total_missing_data_ongoing,
@@ -1194,7 +1345,7 @@ def generate_pdf_report(
             max_table_rows,
             figures=region_ongoing_missing_data_figures,
             include_trend=True,
-            trend_header='Missing (7d)',
+            trend_header=missing_trend_header,
         ))
 
         # Section: System Outages
@@ -1204,6 +1355,7 @@ def generate_pdf_report(
         else:
             region_system_outages = system_outages_df[system_outages_df['Region'] == region] if not system_outages_df.empty else pd.DataFrame()
 
+        region_names = all_signals_df['Region'].dropna().unique().tolist() if all_signals_df is not None else None
         ongoing_system_outages = ongoing_alerts.get('system_outages')
         if _has_rows(ongoing_system_outages) and region != "All Regions":
             ongoing_system_outages = ongoing_system_outages[ongoing_system_outages['Region'] == region]
@@ -1211,6 +1363,8 @@ def generate_pdf_report(
             region_system_outages_ongoing_rows, total_system_outages_ongoing = prepare_system_outages_table(
                 ongoing_system_outages,
                 max_rows=max_table_rows,
+                all_regions=region_names,
+                hourly=system_outages_hourly,
             )
         else:
             region_system_outages_ongoing_rows = pd.DataFrame()
@@ -1218,9 +1372,8 @@ def generate_pdf_report(
 
         # A region earns a report when it has anything to say, new or ongoing.
         region_has_alerts = any([
+            not region_focus_rows.empty,
             region_phase_figures,
-            region_detector_figures,
-            region_ped_figures,
             region_missing_data_figures,
             region_phase_skip_figures,
             not region_phase_skip_rows.empty,
@@ -1228,33 +1381,38 @@ def generate_pdf_report(
             not region_overlap_dual_rows.empty,
             not region_general_phase_rows.empty,
             not region_overlap_conflict_rows.empty,
-            not region_preempt_rows.empty,
+            region_preempt_any,
+            # Lane closures, plan changes and ped set-up issues ride along but are no reason to send a report.
+            not region_atspm_fault_rows.empty,
+            not region_ped_fault_rows.empty,
             not region_system_outages.empty,
             not region_maxout_ongoing_rows.empty,
-            not region_detector_ongoing_rows.empty,
-            not region_ped_ongoing_rows.empty,
             not region_missing_data_ongoing_rows.empty,
             not region_phase_skip_ongoing_rows.empty,
             not region_clearance_ongoing_rows.empty,
             not region_general_phase_ongoing_rows.empty,
             not region_overlap_conflict_ongoing_rows.empty,
-            not region_preempt_ongoing_rows.empty,
+            region_preempt_ongoing_any,
+            not region_atspm_fault_ongoing_rows.empty,
+            not region_ped_fault_ongoing_rows.empty,
             not region_system_outages_ongoing_rows.empty,
         ])
+
+        if data_stopped_at is not None:
+            stopped = pd.Timestamp(data_stopped_at)
+            content.insert(intro_position, Spacer(1, 0.1*inch))
+            content.insert(intro_position, Paragraph(
+                f"<b>Data stopped updating at {stopped:%a} {stopped.month}/{stopped.day}/{stopped:%Y %H:%M}.</b>", styles['Normal']))
 
         if not region_system_outages.empty:
             content.append(Paragraph("New System-Wide Outages", styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-
-            explanation = """The following table shows dates when more than 30% of devices in this region experienced missing data, 
-            indicating a system-wide outage. During these periods, individual device missing data alerts are suppressed as they 
-            likely represent infrastructure or date pipeline issues, not device-specific problems."""
-            content.append(Paragraph(explanation, styles['Normal']))
-            content.append(Spacer(1, 0.2*inch))
               # Create system outages table
             system_outages_table_df, total_system_outages = prepare_system_outages_table(
                 region_system_outages,
-                max_rows=max_table_rows
+                max_rows=max_table_rows,
+                all_regions=region_names,
+                hourly=system_outages_hourly,
             )
 
             table_content = create_reportlab_table(
@@ -1268,7 +1426,7 @@ def generate_pdf_report(
             content.extend(table_content)
             content.append(Spacer(1, 0.3*inch))
 
-        content.extend(_ongoing_section(
+        ongoing_content.extend(_ongoing_section(
             'System-Wide Outages',
             region_system_outages_ongoing_rows,
             total_system_outages_ongoing,
@@ -1276,13 +1434,22 @@ def generate_pdf_report(
             max_table_rows,
         ))
 
-        # Build the PDF with custom canvas for proper page numbering
-        doc.build(content,
-                 onFirstPage=header_footer.firstPage,
-                 onLaterPages=header_footer.laterPages,
-                 canvasmaker=make_canvas)
-        
+        # Every check's ongoing issues, together after all the new alerts.
+        content.extend(_ongoing_issues(ongoing_content, styles))
+
+        # A heading goes to the next page unless the start of its table fits under it.
+        for position in range(len(content) - 1, 0, -1):
+            item = content[position]
+            if isinstance(item, Paragraph) and item.style.name in ('SectionHeading', 'SubsectionHeading'):
+                content.insert(position, CondPageBreak(HEADING_ROOM))
+
+        # Build the PDF with custom canvas for proper page numbering; a region
+        # with nothing to report gets no PDF, so it is not laid out either.
         if region_has_alerts:
+            doc.build(content,
+                     onFirstPage=header_footer.firstPage,
+                     onLaterPages=header_footer.laterPages,
+                     canvasmaker=make_canvas)
             buffer_objects.append((region, buffer))
             log_message(f"Report for {region} generated in memory.", 1, verbosity)
 

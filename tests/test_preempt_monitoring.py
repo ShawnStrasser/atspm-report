@@ -33,6 +33,12 @@ def _timeline_row(device, start, duration, event_class='Preempt', value=3, is_va
     }
 
 
+def _greens(device, hours, start=DAY):
+    """A Green row every 15 minutes over ``hours`` (offsets from ``start``), so the device reports."""
+    return [_timeline_row(device, start + timedelta(minutes=15 * i), 10, event_class='Green', value=2)
+            for h in hours for i in range(4 * h, 4 * h + 4)]
+
+
 def _history(device, counts, preempt=3, start=DAY, present=None):
     """Build a history frame: one presence row per day plus call rows where count > 0.
 
@@ -59,10 +65,8 @@ def _history(device, counts, preempt=3, start=DAY, present=None):
 
 def test_summarize_counts_calls_and_valid_durations_only():
     base = DAY + pd.Timedelta(hours=1)
-    timeline = pd.DataFrame([
-        # Non-preempt rows spanning the day so the device counts as present.
-        _timeline_row('sig-1', base, 10, event_class='Green', value=2),
-        _timeline_row('sig-1', base + timedelta(hours=14), 10, event_class='Green', value=2),
+    # Non-preempt rows through the day so the device counts as present.
+    timeline = pd.DataFrame(_greens('sig-1', range(24)) + [
         _timeline_row('sig-1', base + timedelta(hours=2), 30, value=3, is_valid=True),
         _timeline_row('sig-1', base + timedelta(hours=3), 50, value=3, is_valid=True),
         # Unmatched call: counted, but its duration is ignored.
@@ -100,6 +104,19 @@ def test_summarize_skips_presence_for_short_coverage():
     daily = summarize_daily_preempts(timeline)
 
     # Calls still recorded, but the device-day is not treated as fully reported.
+    assert (daily['Preempt'] == PRESENCE_PREEMPT).sum() == 0
+    assert daily[daily['Preempt'] == 3].iloc[0]['Count'] == 1
+
+
+def test_summarize_skips_presence_for_midday_outage():
+    # Data from first to last hour, but a six-hour hole in the middle.
+    hours = [h for h in range(24) if not 10 <= h < 16]
+    timeline = pd.DataFrame(_greens('sig-1', hours) + [
+        _timeline_row('sig-1', DAY + timedelta(hours=8), 30, value=3),
+    ])
+
+    daily = summarize_daily_preempts(timeline)
+
     assert (daily['Preempt'] == PRESENCE_PREEMPT).sum() == 0
     assert daily[daily['Preempt'] == 3].iloc[0]['Count'] == 1
 
@@ -248,13 +265,13 @@ def test_prepare_preempt_alerts_table_filters_region_and_formats():
     table, total = prepare_preempt_alerts_table(alerts, signals, region='Region 1')
 
     assert total == 1
-    assert list(table.columns) == ['Signal', 'Preempt', 'Change', 'Baseline/Day', 'Recent/Day', 'Sparkline_Data']
+    assert list(table.columns) == ['Signal', 'Preempt', 'Type', 'Base/Day', 'Last 7d/Day', 'Sparkline_Data']
     row = table.iloc[0]
     assert row['Signal'] == 'Main & 1st'
     assert row['Preempt'] == 3
-    assert row['Change'] == DIRECTION_INCREASE
-    assert row['Baseline/Day'] == '2.0'
-    assert row['Recent/Day'] == '30.0'
+    assert row['Type'] == DIRECTION_INCREASE
+    assert row['Base/Day'] == '2.0'
+    assert row['Last 7d/Day'] == '30.0'
     assert row['Sparkline_Data'] == [2] * 14 + [30] * 7
 
     all_table, all_total = prepare_preempt_alerts_table(alerts, signals, region='All Regions')

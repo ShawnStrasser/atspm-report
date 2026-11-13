@@ -1,24 +1,42 @@
 """Main ReportGenerator class for ATSPM anomaly detection."""
 
-from typing import Optional, Dict, Union
+from typing import Optional, Dict
+import numpy as np
 import pandas as pd
-from io import BytesIO
+from reportlab.lib.units import inch
 
 from datetime import datetime, timedelta
-from pathlib import Path
-import ibis
-import ibis.expr.types as ir
 
 from .data_processing import (
     process_maxout_data,
-    process_actuations_data,
     process_missing_data,
-    process_ped
+    missing_data_by_hour,
+    region_missing_by_hour,
+    detect_feed_stop,
+    mark_open_periods,
+    trim_findings_to_stop,
 )
 from .statistical_analysis import (
-    cusum, alert, MAXOUT_ALERT_DEFAULTS, DEFAULT_ALERT_RECENCY_DAYS,
+    cusum, alert, drain_maxout_alerts, MAXOUT_ALERT_DEFAULTS, MAXOUT_DRAIN_DEFAULTS, DEFAULT_ALERT_RECENCY_DAYS,
 )
-from .visualization import create_device_plots, create_phase_skip_plots
+from .visualization import create_atspm_detector_health_plots, create_device_plots, create_phase_skip_plots, create_preempt_plots
+from .focus_overview import (
+    BASELINE_DAYS as OVERVIEW_BASELINE_DAYS,
+    GREEN as OVERVIEW_GREEN,
+    MAX_OUT as OVERVIEW_MAX_OUT,
+    NO_WAIT as OVERVIEW_NO_WAIT,
+    PANEL_TITLES as OVERVIEW_TITLES,
+    WAIT as OVERVIEW_WAIT,
+    create_focus_overview,
+    fault_rows,
+    hourly_cycles,
+    hourly_terminations,
+    measure as overview_measure,
+    no_data_hours,
+    normal_range,
+    phase_words as overview_phase_words,
+    signal_phases,
+)
 from .report_generation import generate_pdf_report
 from .table_generation import ONGOING_SINCE_COLUMN
 from .phase_skip_processing import process_phase_wait_data
@@ -29,45 +47,95 @@ from .alarm_processing import (
     update_alarm_history,
     build_alarm_alerts,
 )
+from .preempt_cascade import (
+    CLASS_BUS_PREEMPT,
+    CLASS_TSP,
+    BUS_DIRECTIONS,
+    PREEMPT_SECTIONS,
+    PULSE_MAX_SECONDS,
+    SECTION_EV,
+    SECTION_TSP,
+    TSP_CLASSES,
+    USUAL_LENGTH_QUANTILES,
+    build_bus_preempt_alerts,
+    call_section,
+    classify_preempt_calls,
+    preempt_calls_from_timeline,
+    preempt_episode_days,
+    update_preempt_calls,
+    evaluate_preempt_cascades,
+)
 from .preempt_processing import (
+    PRESENCE_PREEMPT,
     summarize_daily_preempts,
     update_preempt_history,
-    build_preempt_alerts,
+    build_section_preempt_alerts,
+    rebuild_history_classes,
 )
-from .overlap_dual_indication_processing import process_overlap_dual_indications
+from .overlap_dual_indication_processing import dual_indications_frame, overlap_dual_indication_sql
+from .atspm_detector_health import (
+    ALERT_TYPE as ATSPM_DETECTOR_HEALTH,
+    FAULT_STATUSES as ATSPM_FAULT_STATUSES,
+    PED as ATSPM_PED,
+    VEHICLE as ATSPM_VEHICLE,
+    build_atspm_detector_health_alerts,
+    detector_info as atspm_detector_info,
+    findings_frame as atspm_findings_frame,
+    limit_to_window as atspm_limit_to_window,
+    listed_alerts as atspm_listed_alerts,
+    affects_operations as atspm_affects_operations,
+    report_window as atspm_report_window,
+)
 from .phase_conflict_processing import (
-    process_general_phase_conflicts,
-    process_overlap_conflicts,
-    process_same_movement_color_conflicts,
+    conflicts_frame,
+    general_phase_conflict_sql,
+    overlap_conflict_sql,
+    run_conflict_queries,
+    same_movement_color_conflict_sql,
+    validate_timeline,
+)
+from .detector_triage import attach_triage, rank_detectors, silent_ped_phases, usual_detector_counts
+from .signal_focus import (
+    active_detectors,
+    detectors_down_together,
+    known_detectors,
+    CHART_DETECTOR as FOCUS_CHART_DETECTOR,
+    OTHER_DETECTORS_ROW as FOCUS_OTHER_DETECTORS_ROW,
+    CHART_GREEN as FOCUS_CHART_GREEN,
+    CHART_MAX_OUT as FOCUS_CHART_MAX_OUT,
+    CHART_MISSING as FOCUS_CHART_MISSING,
+    CHART_PED as FOCUS_CHART_PED,
+    CHART_PREEMPT as FOCUS_CHART_PREEMPT,
+    CHART_SKIPS as FOCUS_CHART_SKIPS,
+    CHART_WAIT as FOCUS_CHART_WAIT,
+    HARM_TIERS as FOCUS_HARM_TIERS,
+    PREEMPT as FOCUS_PREEMPT,
+    SKIPS as FOCUS_SKIPS,
+    build_signal_focus,
+    collect_problems,
+    hidden_signals,
 )
 from .utils import log_message
+from . import duckdb_utils
+from .duckdb_utils import TableLike, run_sql
 
 
-def _is_empty(data: Union[pd.DataFrame, ir.Table, None]) -> bool:
-    """Check if data is None or empty, works for both pandas and Ibis."""
-    if data is None:
-        return True
-    if isinstance(data, pd.DataFrame):
-        return data.empty
-    if isinstance(data, ir.Table):
-        # For Ibis tables, check if there are any rows
-        return data.count().execute() == 0
-    return True
+def _is_empty(data: Optional[TableLike]) -> bool:
+    """Check if data is None or empty, for a pandas DataFrame or DuckDB relation."""
+    return duckdb_utils.is_empty(data)
 
 
-def _to_pandas(data: Union[pd.DataFrame, ir.Table]) -> pd.DataFrame:
-    """Convert Ibis table to pandas DataFrame if needed."""
-    if isinstance(data, ir.Table):
-        return data.execute()
-    return data
+def _to_pandas(data: Optional[TableLike]) -> pd.DataFrame:
+    """Read a DuckDB relation into a pandas DataFrame; DataFrames pass through."""
+    return duckdb_utils.to_pandas(data)
 
 
-def _get_shape_str(data: Union[pd.DataFrame, ir.Table]) -> str:
-    """Get a shape string for logging, works for both pandas and Ibis."""
+def _get_shape_str(data: Optional[TableLike]) -> str:
+    """Get a shape string for logging, for a pandas DataFrame or DuckDB relation."""
     if isinstance(data, pd.DataFrame):
         return str(data.shape)
-    if isinstance(data, ir.Table):
-        return f"({data.count().execute()}, {len(data.columns)})"
+    if duckdb_utils.is_relation(data):
+        return f"({duckdb_utils.row_count(data)}, {len(data.columns)})"
     return "unknown"
 
 
@@ -87,24 +155,157 @@ def _split_timeline_days(timeline: pd.DataFrame):
     return timeline, timeline[starts >= report_day], report_day
 
 
-def _normalize_deviceid(data: Union[pd.DataFrame, ir.Table, None]) -> Union[pd.DataFrame, ir.Table, None]:
-    """Convert DeviceId column to string type if present, works for both pandas and Ibis."""
+def _history_sections(history: pd.DataFrame, rail_preempts=None) -> np.ndarray:
+    """The report section of each daily-count row (rows from before the classes count by their input)."""
+    if history is None or history.empty:
+        return np.array([], dtype=object)
+    classes = history['Class'] if 'Class' in history.columns else [None] * len(history)
+    return call_section(classes, history['Preempt'], rail_preempts)
+
+
+def _attach_daily_counts(alerts: pd.DataFrame, history: pd.DataFrame, report_day, rail_preempts=None) -> pd.DataFrame:
+    """Fill DailyCounts (the trend sparkline) for preempt alerts that lack it, from the calls of the alert's section (Class)."""
+    alerts = alerts.copy()
+    if 'DailyCounts' not in alerts.columns:
+        alerts['DailyCounts'] = None
+    missing = alerts['DailyCounts'].isna()
+    if not missing.any() or history is None or history.empty:
+        return alerts
+    hist = history.copy()
+    hist['DeviceId'] = hist['DeviceId'].astype(str)
+    hist['Date'] = pd.to_datetime(hist['Date'])
+    hist['Section'] = _history_sections(hist, rail_preempts)
+    hist = hist[hist['Date'] <= pd.Timestamp(report_day)]
+    for idx in alerts.index[missing]:
+        device, preempt = str(alerts.at[idx, 'DeviceId']), int(alerts.at[idx, 'Preempt'])
+        section = alerts.at[idx, 'Class'] if 'Class' in alerts.columns else None
+        days = hist.loc[hist['DeviceId'] == device, 'Date'].drop_duplicates().sort_values()
+        mine = hist[(hist['DeviceId'] == device) & (hist['Preempt'] == preempt)]
+        if isinstance(section, str):
+            mine = mine[mine['Section'] == section]
+        rows = mine.groupby('Date')['Count'].sum()
+        alerts.at[idx, 'DailyCounts'] = [int(rows.get(d, 0)) for d in days]
+    return alerts
+
+
+def _preempt_alert_classes(alerts: pd.DataFrame, rail_preempts=None) -> pd.DataFrame:
+    """Preempt alerts with Class (the report section) filled in where it is missing, as in history from before the split.
+
+    Old rows were all emergency vehicle or rail alerts: rail by their input, else emergency vehicle. So an old 'Chatter' on an
+    input whose bus calls now raise a TSP alert does not hold that new alert back.
+    """
+    if alerts is None or alerts.empty or not {'Preempt', 'Direction'} <= set(alerts.columns):
+        return alerts
+    alerts = alerts.copy()
+    guess = pd.Series(call_section([None] * len(alerts), alerts['Preempt'], rail_preempts), index=alerts.index)
+    guess[alerts['Direction'].isin(BUS_DIRECTIONS)] = SECTION_TSP
+    alerts['Class'] = alerts['Class'].where(alerts['Class'].notna(), guess) if 'Class' in alerts.columns else guess
+    return alerts
+
+
+# The dtype astype(str) gives: object on pandas 2, the str dtype on pandas 3.
+_TEXT_DTYPE = pd.Series(['']).astype(str).dtype
+
+
+def _normalize_deviceid(data: Optional[TableLike]) -> Optional[TableLike]:
+    """Convert DeviceId column to string type if present, for a DataFrame or DuckDB relation."""
     if data is None:
         return None
     
     if isinstance(data, pd.DataFrame):
-        if 'DeviceId' in data.columns:
+        # Ids already held as astype(str) would leave them are not converted:
+        # copying a timeline of tens of millions of rows costs seconds and gigabytes.
+        if 'DeviceId' in data.columns and not (
+            data['DeviceId'].dtype == _TEXT_DTYPE
+            and pd.api.types.infer_dtype(data['DeviceId'], skipna=False) == 'string'
+        ):
             data = data.copy()
             data['DeviceId'] = data['DeviceId'].astype(str)
         return data
     
-    if isinstance(data, ir.Table):
+    if duckdb_utils.is_relation(data):
         if 'DeviceId' in data.columns:
-            # For Ibis, cast the DeviceId column to string
-            data = data.mutate(DeviceId=data.DeviceId.cast('string'))
+            data = data.project('* REPLACE (CAST(DeviceId AS VARCHAR) AS DeviceId)')
         return data
     
     return data
+
+
+def _reported_days(has_data: Optional[TableLike]) -> Optional[pd.DataFrame]:
+    """The days each signal reported data (DeviceId, Date), or None without has_data."""
+    if _is_empty(has_data):
+        return None
+    return run_sql("SELECT DISTINCT DeviceId, CAST(TimeStamp AS DATE) AS Date FROM t", t=has_data)
+
+
+def _no_calls_note(number, times, history, start) -> str:
+    """What a preempt's row of the overview says when it has no calls in its days: the day of its last call before them, from the
+    stored calls (times) or the daily counts (history: Preempt, Date, Count), when known."""
+    before = [stamp for stamp in pd.to_datetime(pd.Series(times, dtype=object)) if pd.notna(stamp) and stamp < start]
+    if history is not None and not history.empty and {'Preempt', 'Date', 'Count'} <= set(history.columns):
+        days = history[(pd.to_numeric(history['Preempt'], errors='coerce') == number) & (pd.to_numeric(history['Count'], errors='coerce') > 0)]
+        before += [day for day in pd.to_datetime(days['Date']) if pd.notna(day) and day < start]
+    if not before:
+        return 'no calls in these days'
+    last = max(before)
+    return f"no calls in these days (last call {last:%a} {last.month}/{last.day})"
+
+
+def _window_counts(counts: TableLike, devices: list, start, end) -> pd.DataFrame:
+    """The detector counts of these devices in [start, end) (DeviceId already text)."""
+    if duckdb_utils.is_relation(counts):
+        ids = ', '.join("'" + d.replace("'", "''") + "'" for d in devices)
+        return counts.filter(
+            f"DeviceId IN ({ids}) AND TimeStamp >= TIMESTAMP '{pd.Timestamp(start)}' "
+            f"AND TimeStamp < TIMESTAMP '{pd.Timestamp(end)}'"
+        ).project('TimeStamp, DeviceId, Detector, Total').df()
+    stamps = pd.to_datetime(counts['TimeStamp'])
+    in_window = counts[(stamps >= start) & (stamps < end)]
+    return in_window[in_window['DeviceId'].isin(devices)]
+
+
+def _window_services(pedestrian: TableLike, devices: list, start, end) -> pd.DataFrame:
+    """The walks of these devices in [start, end) (TimeStamp, DeviceId, Phase, PedServices)."""
+    frame = _to_pandas(pedestrian)
+    stamps = pd.to_datetime(frame['TimeStamp'])
+    return frame.loc[(stamps >= start) & (stamps < end) & frame['DeviceId'].isin(devices), ['TimeStamp', 'DeviceId', 'Phase', 'PedServices']]
+
+
+def _hourly_actuations(counts: Optional[pd.DataFrame], start, end, fill=None) -> dict:
+    """{(DeviceId, Detector): actuations per hour from start to end}; an hour without data stays empty (NaN), or takes fill:
+    a button has no row for an hour nobody pressed it."""
+    if counts is None or counts.empty:
+        return {}
+    hours = pd.date_range(start, end, freq='h', inclusive='left')
+    by_hour = counts.assign(Hour=pd.to_datetime(counts['TimeStamp']).dt.floor('h')).pivot_table(
+        index=['DeviceId', 'Detector'], columns='Hour', values='Total', aggfunc='sum').reindex(columns=hours)
+    if fill is not None:
+        by_hour = by_hour.fillna(fill)
+    return {(str(device), int(detector)): values.tolist() for (device, detector), values in by_hour.iterrows()}
+
+
+def _usual_by_hour(usual: Optional[pd.DataFrame], devices: list, start, end, stop=None) -> dict:
+    """{(DeviceId, Detector): what the detector usually counts in each hour from start to end}, from detector_usual_counts, for the
+    health sparklines. Left out for a detector with under USUAL_MIN_SAMPLES samples of a typical quarter hour; empty past the data's end."""
+    if usual is None or usual.empty or not devices:
+        return {}
+    rows = usual[usual['DeviceId'].astype(str).isin(devices)].copy()
+    if rows.empty:
+        return {}
+    rows['DeviceId'] = rows['DeviceId'].astype(str)
+    rows['Hour'] = [getattr(clock, 'hour', 0) for clock in rows['clock']]
+    if 'Samples' in rows:
+        enough = rows.groupby(['DeviceId', 'Detector'])['Samples'].transform('median') >= USUAL_MIN_SAMPLES
+        rows = rows[enough]
+    by_hour = rows.groupby(['DeviceId', 'Detector', 'weekend', 'Hour'])['Total'].sum()
+    hours = pd.date_range(start, end, freq='h', inclusive='left')
+    expected = {}
+    for (device, detector), one in by_hour.groupby(level=['DeviceId', 'Detector']):
+        table = one.droplevel(['DeviceId', 'Detector']).to_dict()
+        expected[(device, int(detector))] = [
+            float('nan') if stop is not None and hour >= stop else table.get((hour.dayofweek >= 5, hour.hour), float('nan'))
+            for hour in hours]
+    return expected
 
 
 def _signal_match_key(value) -> str:
@@ -165,9 +366,7 @@ def _config_with_signal_exclusions(
 # Alert configuration
 ALERT_CONFIG = {
     'maxout': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'maxout_alerts'},
-    'actuations': {'id_cols': ['DeviceId', 'Detector'], 'file_suffix': 'actuations_alerts'},
     'missing_data': {'id_cols': ['DeviceId'], 'file_suffix': 'missing_data_alerts'},
-    'pedestrian': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'pedestrian_alerts'},
     'phase_skips': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'phase_skips_alerts'},
     'clearance_intervals': {'id_cols': ['DeviceId', 'EventClass', 'EventValue'], 'file_suffix': 'clearance_interval_alerts'},
     'overlap_dual_indications': {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'overlap_dual_indication_alerts'},
@@ -192,11 +391,50 @@ ALERT_CONFIG = {
     'system_outages': {'id_cols': ['Region'], 'file_suffix': 'system_outages_alerts'},
     # Direction is part of the key so a preempt that drops after an earlier
     # increase (or vice versa) is a new alert rather than a suppressed repeat.
-    'preempts': {'id_cols': ['DeviceId', 'Preempt', 'Direction'], 'file_suffix': 'preempt_alerts'},
+    # Class is the report section (Emergency Vehicle, TSP, Rail); history from
+    # before the split gets it filled in on load (_preempt_alert_classes).
+    'preempts': {'id_cols': ['DeviceId', 'Preempt', 'Class', 'Direction'], 'file_suffix': 'preempt_alerts'},
+    # Detector and ped button health from atspm-detector. Issue is 'fault' for
+    # bad and suspect alike (a broken detector wobbles between the two), or the
+    # information status itself. Vehicle and ped numbers overlap.
+    ATSPM_DETECTOR_HEALTH: {
+        'id_cols': ['DeviceId', 'DetectorType', 'Detector', 'Issue'],
+        'file_suffix': 'atspm_detector_health_alerts',
+    },
 }
+
+# A detector's usual count needs this many samples of a typical quarter hour before a sparkline shows it.
+USUAL_MIN_SAMPLES = 5
 
 # Safety-critical signal conflicts must be reported every time they are observed.
 UNSUPPRESSED_ALERT_TYPES = {'overlap_dual_indications'}
+
+
+def _split_system_outages(outages: pd.DataFrame, recent: pd.DataFrame, past: pd.DataFrame) -> tuple:
+    """(new, ongoing) rows of the recent outage days, one row per region and day as the alert history keeps them.
+
+    Days in a row in a region are one outage; a day that recovered ends it, so the next one is a new outage however
+    soon it comes. An outage none of whose days was reported before is new. One that was reported is ongoing while it
+    is still out on the latest day of data, with OngoingSince the day it began. Once over, it is not shown again.
+    """
+    columns = ['Region', 'Date']
+    runs = outages[columns].assign(Date=pd.to_datetime(outages['Date']).dt.normalize()).drop_duplicates().sort_values(columns)
+    runs['Run'] = (runs.groupby('Region')['Date'].diff() != pd.Timedelta(days=1)).cumsum()
+    runs = runs.join(runs.groupby('Run')['Date'].agg(RunStart='min', RunEnd='max'), on='Run')
+
+    reported = pd.DataFrame(columns=columns)
+    if past is not None and not past.empty:
+        reported = past[columns].assign(Date=pd.to_datetime(past['Date']).dt.tz_localize(None).dt.normalize())
+    seen_runs = runs.merge(reported.drop_duplicates(), on=columns)['Run'].unique()
+
+    days = recent.assign(_date=pd.to_datetime(recent['Date']).dt.normalize()).merge(
+        runs.rename(columns={'Date': '_date'}), on=['Region', '_date'], how='left').drop(columns='_date')
+    latest = pd.to_datetime(days['LatestDataDay']).max()
+    seen = days['Run'].isin(seen_runs)
+    new = days[~seen].drop(columns=['Run', 'RunStart', 'RunEnd'])
+    ongoing = days[seen & (days['RunEnd'] >= latest)]
+    ongoing = ongoing.assign(**{ONGOING_SINCE_COLUMN: ongoing['RunStart']}).drop(columns=['Run', 'RunStart', 'RunEnd'])
+    return new.reset_index(drop=True), ongoing.reset_index(drop=True)
 
 
 class ReportGenerator:
@@ -220,12 +458,17 @@ class ReportGenerator:
             - alert_flagging_days (int): Max age for new alerts. Default: 7
             - suppress_repeated_alerts (bool): Enable alert suppression. Default: True
             - alert_suppression_days (int): Days to suppress repeat alerts. Default: 21
-            - include_ongoing_issues (bool): Add an 'Ongoing Issues' subsection under each
-              section listing the repeat alerts suppression removed. Default: False
+            - include_ongoing_issues (bool): Add an 'Ongoing Issues' section at the end of the
+              report listing the repeat alerts suppression removed, one subsection per check in
+              the checks' order. Default: False
             - maxout_cusum_threshold / maxout_zscore_threshold / maxout_percent_threshold /
               maxout_min_services: phase termination alerting thresholds. A day is flagged
               only when all four are exceeded, so raising any one reduces sensitivity.
               Defaults: 0.25, 4.0, 0.2, 30
+            - maxout_drain_enabled (bool): A flagged max-out day must also still be high at the day's end: an hourly
+              running total of max outs above that hour's usual share, less maxout_drain_per_hour each hour, must end
+              above maxout_drain_threshold, so a spike that went back to normal is not reported. Default: True
+            - maxout_drain_per_hour / maxout_drain_threshold: Defaults: 0.1, 1.0
             - alert_retention_weeks (int): Weeks to retain alert history. Default: 104
             - figures_per_device (int): Plots per device in report. Default: 3
             - verbosity (int): 0=silent, 1=info, 2=debug. Default: 1
@@ -236,10 +479,13 @@ class ReportGenerator:
             - clearance_red_min_seconds (float): Minimum red clearance time. Default: 0.5
             - clearance_tolerance_seconds (float): Clearance timing tolerance. Default: 0.1
             - clearance_invalid_event_cushion_seconds (float): Seconds around invalid timeline events to exclude. Default: 30
-            - filter_stoptime (bool): Filter irregular clearance intervals overlapping stop-time events. Default: True
+            - filter_stoptime (bool): Filter deviating clearance intervals overlapping stop-time events. Default: True
             - clearance_stop_event_classes (list[str]): Timeline event classes used by filter_stoptime. Default: Stop Time Input, Preempt
             - clearance_flash_event_classes (list[str]): Flash classes whose surroundings are excluded. Default: every flash class (see alarm_processing.FLASH_EVENT_CLASSES)
             - clearance_flash_cushion_seconds (float): Seconds either side of a flash alarm to exclude. Default: 600
+            - overlap_missing_red_tolerance_seconds (float): How close an overlap yellow must land to
+              the yellow median plus the red median before it is discarded as a missing Overlap Red
+              begin event rather than reported as long. Default: 0.2
             - overlap_dual_indications_enabled (bool): Enable overlap dual indication detection. Default: False
             - overlap_dual_indication_phases (list[int]): Same-numbered phases/overlaps to analyze. Default: []
             - general_phase_conflicts_enabled (bool): Enable standard phase conflict checks. Default: False
@@ -250,6 +496,15 @@ class ReportGenerator:
             - overlap_conflict_excluded_signals (list[str]): Signal names/codes to skip for non-standard phasing. Default: []
             - overlap_conflict_excluded_device_ids (list[str]): DeviceIds to skip for non-standard phasing. Default: []
             - same_movement_color_conflicts_enabled (bool): Enable same phase/overlap multi-color checks. Default: False
+            - signal_focus_signals (int): At most this many signals in each report's Signal Focus section, which then leave
+              its other tables and charts; 0 leaves the section out. Default: 3
+            - signal_focus_charts_per_signal (int): At most this many charts each, in the order of the signal's table; a row whose chart falls past the limit says No chart. Default: 10
+            - table_row_limits (dict): Table -> its own row limit instead of max_table_rows. Keys: 'detector_faults',
+              'lane_closure', 'timing_plan', 'ped_faults', 'ped_setup', and 'ongoing' for every Ongoing table. Default: {}
+            - detector_triage_enabled (bool): Rank detectors and ped buttons together by urgency (service lost, then harm to
+              other phases) and add the Impact column; needs atspm_detector_config, terminations, phase_wait and has_data,
+              and for all its measures pedestrian, atspm_ped_inputs, detector_usual_counts and coordination_agg. It never
+              changes which detectors alert. Default: False
             - joke_index (int): Specific joke index. Default: None (auto-cycle by date)
             - custom_logo_path (str): Path to custom logo. Default: None (use ODOT logo)
         """
@@ -264,6 +519,7 @@ class ReportGenerator:
             'alert_suppression_days': 21,
             'include_ongoing_issues': False,
             **MAXOUT_ALERT_DEFAULTS,
+            **MAXOUT_DRAIN_DEFAULTS,
             'alert_retention_weeks': 104,
             'figures_per_device': 3,
             'verbosity': 1,
@@ -282,6 +538,7 @@ class ReportGenerator:
             'clearance_stop_event_classes': ['Stop Time Input', 'Preempt'],
             'clearance_flash_event_classes': list(FLASH_EVENT_CLASSES),
             'clearance_flash_cushion_seconds': 600,
+            'overlap_missing_red_tolerance_seconds': 0.2,
             'overlap_dual_indications_enabled': False,
             'overlap_dual_indication_phases': [],
             'general_phase_conflicts_enabled': False,
@@ -295,40 +552,74 @@ class ReportGenerator:
             'overlap_fixed_median_max_seconds': 6.0,
             'overlap_fixed_within_seconds': 2.0,
             'overlap_fixed_within_ratio': 0.95,
+            'signal_focus_signals': 3,
+            'signal_focus_charts_per_signal': 10,
+            'table_row_limits': {},
+            # Ranks the health tables by urgency. Off until approved.
+            'detector_triage_enabled': False,
             'joke_index': None,
             'custom_logo_path': None,
+            # Preempt numbers that are railroad preempts. Rail calls get the
+            # longer stuck-on limit; None holds every preempt to the rail limit.
+            'preempt_rail_numbers': None,
+            # Cascade review of preempt alerts needs Latitude/Longitude on the
+            # signals table; without them it is skipped.
+            'preempt_cascade_enabled': True,
+            'preempt_cascade_max_miles': 2.0,
+            'preempt_cascade_min_mph': 20.0,
+            'preempt_cascade_max_mph': 45.0,
+            # False Calls: an input with most of its calls at the shortest call length, not seen at nearby
+            # signals. Also drops an Increase whose calls nearby signals saw (real traffic) and marks the usual
+            # call lengths on the charts. Needs the cascade review.
+            'preempt_false_calls_enabled': True,
+            # Preempt alert charts per region (alerts and information each).
+            'preempt_figures': 6,
         }
         return {**defaults, **config}
     
     def generate(
         self,
-        signals: Union[pd.DataFrame, ir.Table],  # REQUIRED
-        terminations: Optional[Union[pd.DataFrame, ir.Table]] = None,
-        detector_health: Optional[Union[pd.DataFrame, ir.Table]] = None,
-        has_data: Optional[Union[pd.DataFrame, ir.Table]] = None,
-        pedestrian: Optional[Union[pd.DataFrame, ir.Table]] = None,
-        phase_wait: Optional[Union[pd.DataFrame, ir.Table]] = None,
-        coordination_agg: Optional[Union[pd.DataFrame, ir.Table]] = None,
-        timeline: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        signals: TableLike,  # REQUIRED
+        terminations: Optional[TableLike] = None,
+        detector_counts: Optional[TableLike] = None,
+        has_data: Optional[TableLike] = None,
+        pedestrian: Optional[TableLike] = None,
+        phase_wait: Optional[TableLike] = None,
+        coordination_agg: Optional[TableLike] = None,
+        timeline: Optional[TableLike] = None,
         past_alerts: Optional[Dict[str, pd.DataFrame]] = None,
         alarm_history: Optional[pd.DataFrame] = None,
         preempt_history: Optional[pd.DataFrame] = None,
-        device_days: Optional[Union[pd.DataFrame, ir.Table]] = None,
+        device_days: Optional[TableLike] = None,
+        preempt_calls: Optional[pd.DataFrame] = None,
+        preempt_events: Optional[TableLike] = None,
+        atspm_detector_findings: Optional[TableLike] = None,
+        atspm_detector_minutes: Optional[pd.DataFrame] = None,
+        atspm_detector_config: Optional[pd.DataFrame] = None,
+        ped_press_counts: Optional[TableLike] = None,
+        atspm_ped_inputs: Optional[pd.DataFrame] = None,
+        detector_usual_counts: Optional[TableLike] = None,
+        expected_data_end=None,
     ) -> dict:
         """
-        Generate reports from provided DataFrames or Ibis tables.
+        Generate reports from provided pandas DataFrames or DuckDB relations.
         
         Args:
             signals: REQUIRED. Signal metadata with columns: DeviceId, Name, Region.
-                Can be pandas DataFrame or Ibis table.
+                Can be a pandas DataFrame or DuckDB relation.
             terminations: Phase termination data with columns:
                 TimeStamp, DeviceId, Phase, Total, PerformanceMeasure
-            detector_health: Detector actuation data with columns:
-                TimeStamp, DeviceId, Detector, Total, anomaly, prediction
+            detector_counts: 15-minute detector actuation counts with columns
+                TimeStamp, DeviceId, Detector, Total, covering at least the
+                atspm-detector health window. Only used to draw the Detector
+                Health charts.
             has_data: Data availability records with columns:
-                TimeStamp, DeviceId
+                TimeStamp, DeviceId (one row per 15-minute bin a signal reported in).
+                Also keeps the preempt cascade and duration checks from reading an
+                outage as missed or stuck calls, so it should span the preempt calls.
             pedestrian: Pedestrian phase data with columns:
-                TimeStamp, DeviceId, Phase, PedServices, PedActuation
+                TimeStamp, DeviceId, Phase, PedServices, PedActuation. Read by the detector
+                triage and the ped button charts (walks); it raises no alerts of its own.
             phase_wait: Phase wait data with columns:
                 TimeStamp, DeviceId, Phase, AvgPhaseWait, MaxPhaseWait, TotalSkips
             coordination_agg: Coordination aggregation data with columns:
@@ -353,29 +644,85 @@ class ReportGenerator:
                 Only needed with a multi-day timeline whose older days were trimmed:
                 the preempt check treats a reported day with no calls as zero, and
                 without this it infers reported days from each day's timeline span.
+            preempt_calls: Stored preempt calls with columns DeviceId, Preempt,
+                StartTime, Duration, IsValid, carried across runs like
+                preempt_history (returned as 'updated_preempt_calls'). Used to
+                learn preempt cascades between neighbouring signals and to check
+                call durations. Signals need Latitude/Longitude for the cascades.
+                Each call gets a Class (emergency vehicle, TSP, bus call that ran as
+                a preempt, rail, unclassified), which the returned record carries.
+            preempt_events: Raw preempt events (DeviceId, TimeStamp, EventId,
+                Parameter = the preempt number) over the days of the stored calls:
+                at least 105 (preempt entry), and 112 (TSP check-in) where logged.
+                They tell a bus call that ran as a full preempt (an entry) from a
+                TSP request. Without them a burst of short pulses is taken as TSP.
+            atspm_detector_findings: atspm-detector's findings table for vehicle
+                detectors and ped buttons together, one row per finding (no row =
+                no finding): DeviceId, DetectorType (Vehicle or Ped), Detector,
+                Start, End, Label, Confidence, Detail. A detector or button is
+                reported when its bad minutes (Confidence 0.8 or more) or, more
+                slowly, its suspect minutes (0.5 to under 0.8) add up (running
+                totals over atspm_detector_minutes and this window), or at once
+                for a finding with no time of its own at Confidence 0.8 or more.
+                Lane closures of an hour or more and timing plan changes are
+                listed as information, closures every run, and so are ped set-up
+                issues. Vehicle rows go in the Detector Health section, ped rows
+                in the Pedestrian Button Health section. The report day (latest
+                timeline day, else the last finding's day) is the alert date. An
+                empty table is a run that found nothing: clean days lower the
+                running totals. None is a run without a health check.
+            atspm_detector_minutes: Stored daily minutes per detector (DeviceId,
+                DetectorType, Detector, Date, BadMinutes, SuspectMinutes), carried
+                across runs like alarm_history (returned as
+                'updated_atspm_detector_minutes').
+            atspm_detector_config: The detector table the health run read
+                (DeviceId, Detector, phase, function, lanes). The findings table
+                names no phase, so this puts 'Ph6 Advance' in the tables and groups
+                the charts by phase. Without it they name the detector only.
+            ped_press_counts: Presses per 15 minutes of ped inputs (TimeStamp,
+                DeviceId, Detector = the input, Total) over the health window. Only
+                used to draw the Pedestrian Button Health charts and their sparklines.
+            expected_data_end: When the data should end (the midnight after the last day the report covers), to tell when the
+                source stopped being updated. By default the end of the day most signals last reported on.
+            atspm_ped_inputs: The phase each ped input calls (DeviceId, Input, Phase), from
+                atspm-detector's ped health. Needed to rank ped buttons with the detectors.
+            detector_usual_counts: What each detector usually counts (DeviceId, Detector,
+                weekend, clock, Total), the traffic weights of the detector triage; see
+                detector_triage.usual_detector_counts. Without it the triage reads them
+                off detector_counts, which only reach over the health window.
             past_alerts: Dict of alert_type -> DataFrame for suppression.
-                Keys: 'maxout', 'actuations', 'missing_data', 'pedestrian',
+                Keys: 'maxout', 'missing_data',
                       'phase_skips', 'clearance_intervals', 'overlap_dual_indications',
                       'general_phase_conflicts', 'overlap_conflicts', 'system_outages',
-                      'preempts'
+                      'preempts', 'atspm_detector_health'
 
         Returns:
             dict with keys:
                 - 'reports': Dict[str, BytesIO] - region name -> PDF bytes (empty if no alerts)
                 - 'alerts': Dict[str, pd.DataFrame] - alert type -> alert DataFrame
-                    Keys: 'maxout', 'actuations', 'missing_data', 'pedestrian',
+                    Keys: 'maxout', 'missing_data',
                           'phase_skips', 'clearance_intervals', 'overlap_dual_indications',
                           'general_phase_conflicts', 'overlap_conflicts', 'system_outages',
-                          'preempts'
+                          'preempts', 'atspm_detector_health'
                 - 'ongoing_alerts': Dict[str, pd.DataFrame] - repeat alerts suppression
                     removed, carrying an OngoingSince column; empty unless
                     include_ongoing_issues is set
                 - 'updated_past_alerts': Dict[str, pd.DataFrame] - for next run's suppression
                 - 'updated_alarm_history': pd.DataFrame - for next run's alarm totals
                 - 'updated_preempt_history': pd.DataFrame - for next run's preempt baseline
+                - 'updated_preempt_calls': pd.DataFrame - for next run's cascade and duration checks
+                - 'updated_atspm_detector_minutes': pd.DataFrame - for next run's detector health running totals
+                - 'preempt_cascade_links': pd.DataFrame - cascade patterns learned this run
+                - 'overruled_preempt_alerts': pd.DataFrame - frequency alerts the cascade review dropped
                 - 'alarms': pd.DataFrame - controller alarms listed this run
+                - 'data_stopped_at': pd.Timestamp or None - when the data stopped for the whole network, if it did
+                - 'signal_focus': Dict[str, pd.DataFrame] - report (region or 'All Regions') -> its Signal Focus rows
+                - 'silent_ped_phases': pd.DataFrame - with the detector triage, ped phases with no press at all that normally
+                    get many: for review, not alerts, as a button with no press is not on the ped health list
                 - 'hourly_data': Dict[str, pd.DataFrame] - intermediate hourly aggregates
-                    Keys: 'maxout_hourly', 'detector_hourly', 'ped_hourly'
+                    Keys: 'maxout_hourly', and with has_data 'missing_hourly' (DeviceId, TimeStamp,
+                    MissingData: the share of each hour's 15-minute records missing over the last 7 days) and 'outage_hourly'
+                    (the same per Region over every day), which the missing data and system outage tables and charts show
         """
         # Validate required input
         if _is_empty(signals):
@@ -384,13 +731,18 @@ class ReportGenerator:
         # Normalize DeviceId to string in all inputs
         signals = _normalize_deviceid(signals)
         terminations = _normalize_deviceid(terminations)
-        detector_health = _normalize_deviceid(detector_health)
+        detector_counts = _normalize_deviceid(detector_counts)
         has_data = _normalize_deviceid(has_data)
         pedestrian = _normalize_deviceid(pedestrian)
         phase_wait = _normalize_deviceid(phase_wait)
         coordination_agg = _normalize_deviceid(coordination_agg)
         timeline = _normalize_deviceid(timeline)
         device_days = _normalize_deviceid(device_days)
+        preempt_events = _normalize_deviceid(preempt_events)
+        atspm_detector_findings = _normalize_deviceid(atspm_detector_findings)
+        ped_press_counts = _normalize_deviceid(ped_press_counts)
+        atspm_ped_inputs = _normalize_deviceid(atspm_ped_inputs)
+        detector_usual_counts = _normalize_deviceid(detector_usual_counts)
         
         # Convert signals to pandas (needed for downstream operations)
         signals = _to_pandas(signals)
@@ -411,10 +763,21 @@ class ReportGenerator:
         for alert_type in ALERT_CONFIG:
             if alert_type not in past_alerts:
                 past_alerts[alert_type] = pd.DataFrame()
+        past_alerts = dict(past_alerts)
+        past_alerts['preempts'] = _preempt_alert_classes(past_alerts['preempts'], self.config['preempt_rail_numbers'])
+        # History from before ped health holds vehicle detectors only.
+        past_health = past_alerts[ATSPM_DETECTOR_HEALTH]
+        if not past_health.empty and 'DetectorType' not in past_health.columns:
+            past_alerts[ATSPM_DETECTOR_HEALTH] = past_health.assign(DetectorType=ATSPM_VEHICLE)
         
         # Initialize result containers
         new_alerts = {}
         hourly_data = {}
+
+        # The source itself can stop being updated: nothing after that is missing data, and a fault's end there is only the data's.
+        data_stopped_at = detect_feed_stop(has_data, expected_data_end) if not _is_empty(has_data) else None
+        if data_stopped_at is not None:
+            log_message(f"Data stopped updating at {data_stopped_at}", 1, verbosity)
         
         # Process maxout data if provided
         if not _is_empty(terminations):
@@ -427,97 +790,62 @@ class ReportGenerator:
             t = cusum(maxout_daily, k_value=1)
             new_alerts['maxout'] = alert(
                 t, self._maxout_thresholds(), self.config['alert_recency_days']
-            ).execute()
+            )
+            if self.config['maxout_drain_enabled']:
+                new_alerts['maxout'] = drain_maxout_alerts(
+                    new_alerts['maxout'], terminations, self.config['maxout_drain_per_hour'],
+                    self.config['maxout_drain_threshold'], self.config['alert_recency_days'])
         else:
             new_alerts['maxout'] = pd.DataFrame()
             hourly_data['maxout_hourly'] = pd.DataFrame()
         
-        # Process actuations data if provided
-        if not _is_empty(detector_health):
-            log_message("Processing actuations data...", 1, verbosity)
-            detector_daily, detector_hourly = process_actuations_data(detector_health)
-            hourly_data['detector_hourly'] = _to_pandas(detector_hourly)
-            log_message(f"Processed actuations data. Shape: {_get_shape_str(detector_daily)}", 1, verbosity)
-            
-            log_message("Calculating CUSUM statistics for actuations...", 1, verbosity)
-            t_actuations = cusum(detector_daily, k_value=1)
-            new_alerts['actuations'] = alert(
-                t_actuations, recency_days=self.config['alert_recency_days']
-            ).execute()
-        else:
-            new_alerts['actuations'] = pd.DataFrame()
-            hourly_data['detector_hourly'] = pd.DataFrame()
-        
         # Process missing data if provided
         if not _is_empty(has_data):
             log_message("Processing missing data...", 1, verbosity)
-            missing_data = process_missing_data(has_data)
+            missing_data = process_missing_data(has_data, data_stopped_at)
             log_message(f"Processed missing data. Shape: {_get_shape_str(missing_data)}", 1, verbosity)
             
-            # Filter out dates with system-wide missing data
-            ibis.options.interactive = True
-            signal_count = len(signals) * 0.30
-            
-            # Convert to ibis tables
-            missing_data_tbl = ibis.memtable(missing_data)
-            signals_tbl = ibis.memtable(signals)
-            
-            # Join and filter
-            md_with_region = missing_data_tbl.join(
-                signals_tbl,
-                missing_data_tbl.DeviceId == signals_tbl.DeviceId
-            )
-            
-            # Find dates/regions where average missing data < 0.3
-            valid_date_regions = md_with_region.group_by(['Date', 'Region']).aggregate(
-                avg_missing=md_with_region.MissingData.mean()
-            ).filter(lambda t: t.avg_missing < 0.3)
-            
-            # Get all devices for those valid date/regions
-            valid_combos = valid_date_regions.join(
-                signals_tbl,
-                valid_date_regions.Region == signals_tbl.Region
-            ).select(
-                Date=valid_date_regions.Date,
-                DeviceId=signals_tbl.DeviceId
-            )
-            
-            # Filter missing_data to keep only valid combinations
-            missing_data_filtered = missing_data_tbl.join(
-                valid_combos,
-                [missing_data_tbl.DeviceId == valid_combos.DeviceId,
-                 missing_data_tbl.Date == valid_combos.Date]
-            ).select(
-                DeviceId=missing_data_tbl.DeviceId,
-                Date=missing_data_tbl.Date,
-                MissingData=missing_data_tbl.MissingData
-            ).order_by(['Date', 'DeviceId']).execute()
+            # Filter out dates with system-wide missing data: a region-day whose
+            # signals average 30% or more missing is a system outage, reported on
+            # its own and kept out of the per-signal check.
+            missing_data_filtered = run_sql("""
+                WITH valid_date_regions AS (
+                    SELECT md.Date, s.Region
+                    FROM md JOIN sig AS s ON md.DeviceId = s.DeviceId
+                    GROUP BY 1, 2
+                    HAVING AVG(md.MissingData) < 0.3
+                ),
+                valid_combos AS (
+                    SELECT v.Date, s.DeviceId
+                    FROM valid_date_regions AS v JOIN sig AS s ON v.Region = s.Region
+                )
+                SELECT md.DeviceId, md.Date, md.MissingData
+                FROM md JOIN valid_combos AS v ON md.DeviceId = v.DeviceId AND md.Date = v.Date
+                ORDER BY md.Date, md.DeviceId
+            """, single_thread=True, md=missing_data, sig=signals)
 
             # Get system outages (dates/regions where avg missing data >= 0.3)
-            system_outages = md_with_region.group_by(['Date', 'Region']).aggregate(
-                MissingData=md_with_region.MissingData.mean()
-            ).filter(lambda t: t.MissingData >= 0.3).order_by(['Date', 'Region']).execute()
-            
+            system_outages = run_sql("""
+                SELECT md.Date, s.Region, AVG(md.MissingData) AS MissingData,
+                       (SELECT MAX(Date) FROM md) AS LatestDataDay
+                FROM md JOIN sig AS s ON md.DeviceId = s.DeviceId
+                GROUP BY 1, 2
+                HAVING AVG(md.MissingData) >= 0.3
+                ORDER BY 1, 2
+            """, single_thread=True, md=missing_data, sig=signals)
+
             log_message("Calculating CUSUM statistics for missing data...", 1, verbosity)
             t_missing_data = cusum(missing_data_filtered, k_value=1)
             new_alerts['missing_data'] = alert(
                 t_missing_data, recency_days=self.config['alert_recency_days']
-            ).execute()
+            )
             new_alerts['system_outages'] = system_outages
+            # What the report shows of them, hour by hour: where in time the data went missing. The alerts stay daily.
+            hourly_data['missing_hourly'] = missing_data_by_hour(has_data, data_stopped_at)
+            hourly_data['outage_hourly'] = region_missing_by_hour(has_data, signals, data_stopped_at)
         else:
             new_alerts['missing_data'] = pd.DataFrame()
             new_alerts['system_outages'] = pd.DataFrame()
-        
-        # Process pedestrian data if provided
-        if not _is_empty(pedestrian) and not _is_empty(terminations):
-            log_message("Processing pedestrian data...", 1, verbosity)
-            ped_alerts, ped_hourly = process_ped(df_ped=pedestrian, df_maxout=maxout_daily, df_intersections=signals)
-            new_alerts['pedestrian'] = _to_pandas(ped_alerts)
-            hourly_data['ped_hourly'] = _to_pandas(ped_hourly)
-            log_message(f"Processed pedestrian data. Shape: {_get_shape_str(ped_alerts)}", 1, verbosity)
-        else:
-            new_alerts['pedestrian'] = pd.DataFrame()
-            hourly_data['ped_hourly'] = pd.DataFrame()
         
         # Process phase wait data if provided
         if not _is_empty(phase_wait):
@@ -591,13 +919,58 @@ class ReportGenerator:
         # its alerts DO go through suppression (keyed on direction) so each
         # signal/preempt shows up once per change rather than daily.
         log_message("Processing preempt frequency...", 1, verbosity)
-        daily_preempts = summarize_daily_preempts(timeline, device_days=device_days)
-        updated_preempt_history = update_preempt_history(
-            daily_preempts,
-            preempt_history if preempt_history is not None else pd.DataFrame(),
-            verbosity=verbosity,
+        rail_numbers = self.config['preempt_rail_numbers']
+        # Every call with its timestamp, kept like the daily counts, feeds the
+        # cascade review (neighbouring preempts on one route or rail line) and
+        # the duration checks. Each call is classed (emergency vehicle, TSP, bus
+        # call that ran as a preempt, rail) by the shape of its episode and the
+        # raw preempt events, and the daily counts are kept per class.
+        updated_preempt_calls = classify_preempt_calls(
+            update_preempt_calls(preempt_calls_from_timeline(timeline), preempt_calls),
+            events=_to_pandas(preempt_events) if not _is_empty(preempt_events) else None,
+            rail_preempts=rail_numbers,
         )
-        preempt_alerts = build_preempt_alerts(updated_preempt_history, report_date=report_day)
+        daily_preempts = summarize_daily_preempts(timeline, device_days=device_days)
+        updated_preempt_history = rebuild_history_classes(
+            update_preempt_history(
+                daily_preempts,
+                preempt_history if preempt_history is not None else pd.DataFrame(),
+                verbosity=verbosity,
+            ),
+            updated_preempt_calls,
+        )
+        preempt_alerts = build_section_preempt_alerts(
+            updated_preempt_history, report_date=report_day, rail_preempts=rail_numbers,
+        )
+
+        preempt_cascade_links = pd.DataFrame()
+        overruled_preempt_alerts = pd.DataFrame()
+        if self.config['preempt_cascade_enabled'] and report_day is not None:
+            cascade = evaluate_preempt_cascades(
+                preempt_alerts,
+                updated_preempt_calls,
+                signals,
+                report_day,
+                rail_preempts=self.config['preempt_rail_numbers'],
+                max_miles=self.config['preempt_cascade_max_miles'],
+                min_mph=self.config['preempt_cascade_min_mph'],
+                max_mph=self.config['preempt_cascade_max_mph'],
+                verbosity=verbosity,
+                has_data=_to_pandas(has_data) if not _is_empty(has_data) else None,
+                false_calls=self.config['preempt_false_calls_enabled'],
+            )
+            preempt_alerts = cascade['alerts']
+            overruled_preempt_alerts = cascade['overruled']
+            preempt_cascade_links = cascade['links']
+        # TSP: bus priority calls that pulsed a preempt input, whether or not they ran as preempts.
+        if report_day is not None:
+            bus_alerts = build_bus_preempt_alerts(updated_preempt_calls, report_day)
+            if not bus_alerts.empty:
+                bus_alerts['ChartSeries'] = [[[d, int(p)]] for d, p in zip(bus_alerts['DeviceId'], bus_alerts['Preempt'])]
+                preempt_alerts = pd.concat([df for df in (preempt_alerts, bus_alerts) if not df.empty], ignore_index=True)
+        preempt_alerts = _preempt_alert_classes(preempt_alerts, rail_numbers)
+        if not preempt_alerts.empty:
+            preempt_alerts = _attach_daily_counts(preempt_alerts, updated_preempt_history, report_day, rail_numbers)
         new_alerts['preempts'] = preempt_alerts
         log_message(
             f"Processed preempt frequency. Shape: {preempt_alerts.shape}",
@@ -605,77 +978,93 @@ class ReportGenerator:
             verbosity,
         )
 
-        # This check is intentionally opt-in because not every agency uses
-        # same-numbered phase/overlap relationships.
-        if self.config['overlap_dual_indications_enabled']:
-            log_message('Processing overlap dual indications...', 1, verbosity)
-            overlap_dual_indications = process_overlap_dual_indications(timeline_latest, self.config)
-            new_alerts['overlap_dual_indications'] = overlap_dual_indications
+        # The atspm-detector health check judged each detector and ped button before
+        # it got here; this adds its minutes to the running totals, picks the ones
+        # to report and dates them to the report day.
+        atspm_window = None
+        updated_atspm_minutes = atspm_detector_minutes
+        atspm_info = atspm_detector_info(atspm_detector_config)
+        silent_phases = pd.DataFrame()
+        if atspm_detector_findings is not None:
+            log_message("Processing atspm-detector health...", 1, verbosity)
+            atspm_detector_findings = trim_findings_to_stop(_to_pandas(atspm_detector_findings), data_stopped_at)
+            atspm_alerts, updated_atspm_minutes = build_atspm_detector_health_alerts(
+                _to_pandas(atspm_detector_findings), report_date=report_day,
+                minutes_history=atspm_detector_minutes,
+                reported=_reported_days(has_data), info=atspm_detector_config,
+            )
+            # The health judges several days for context; the report shows only the
+            # days no earlier report showed (the report day, plus a skipped one).
+            if not atspm_alerts.empty:
+                atspm_window = atspm_report_window(atspm_alerts['Date'].max(),
+                                                   past_alerts.get(ATSPM_DETECTOR_HEALTH))
+                atspm_alerts = mark_open_periods(atspm_limit_to_window(atspm_alerts, *atspm_window), data_stopped_at)
+            if self.config['detector_triage_enabled'] and not (
+                    atspm_alerts.empty or _is_empty(terminations) or _is_empty(phase_wait) or _is_empty(has_data)):
+                log_message("Ranking detectors and ped buttons by urgency...", 1, verbosity)
+                usual = _to_pandas(detector_usual_counts) if not _is_empty(detector_usual_counts) else usual_detector_counts(detector_counts)
+                triage_rows = rank_detectors(
+                    atspm_findings_frame(_to_pandas(atspm_detector_findings)), atspm_info, terminations, phase_wait, has_data,
+                    atspm_alerts['Date'].max(),
+                    baseline_days=max(self.config['historical_window_days'] - 3, 0),
+                    wait_days=max(self.config['phase_skip_retention_days'] - 3, 0),
+                    pedestrian=pedestrian, ped_inputs=_to_pandas(atspm_ped_inputs), usual_counts=usual,
+                    coordination=coordination_agg,
+                )
+                atspm_alerts = attach_triage(atspm_alerts, triage_rows)
+                silent_phases = silent_ped_phases(pedestrian, terminations, has_data, atspm_alerts['Date'].max())
+            new_alerts[ATSPM_DETECTOR_HEALTH] = atspm_alerts
             log_message(
-                f'Processed overlap dual indications. Shape: {overlap_dual_indications.shape}',
+                f"Processed atspm-detector health. Shape: {new_alerts[ATSPM_DETECTOR_HEALTH].shape}",
                 1,
                 verbosity,
             )
         else:
-            new_alerts['overlap_dual_indications'] = pd.DataFrame()
+            new_alerts[ATSPM_DETECTOR_HEALTH] = pd.DataFrame()
 
+        # The overlap dual indication and signal conflict checks read the report
+        # day's clean indications, which are built once for all of them. The dual
+        # indication check is opt-in because not every agency uses same-numbered
+        # phase/overlap relationships.
+        conflict_checks = {}
+        if self.config['overlap_dual_indications_enabled']:
+            conflict_checks['overlap_dual_indications'] = (
+                overlap_dual_indication_sql(self.config), dual_indications_frame)
         if self.config['general_phase_conflicts_enabled']:
-            log_message('Processing general phase conflicts...', 1, verbosity)
             general_phase_config = _config_with_signal_exclusions(
                 self.config,
                 signals,
                 'general_phase_conflict_excluded_signals',
                 'general_phase_conflict_excluded_device_ids',
             )
-            general_phase_conflicts = process_general_phase_conflicts(
-                timeline_latest,
-                general_phase_config,
-            )
-            new_alerts['general_phase_conflicts'] = general_phase_conflicts
-            log_message(
-                f'Processed general phase conflicts. Shape: {general_phase_conflicts.shape}',
-                1,
-                verbosity,
-            )
-        else:
-            new_alerts['general_phase_conflicts'] = pd.DataFrame()
-
+            conflict_checks['general_phase_conflicts'] = (
+                general_phase_conflict_sql(general_phase_config), conflicts_frame)
         if self.config['overlap_conflicts_enabled']:
-            log_message('Processing overlap conflicts...', 1, verbosity)
             overlap_conflict_config = _config_with_signal_exclusions(
                 self.config,
                 signals,
                 'overlap_conflict_excluded_signals',
                 'overlap_conflict_excluded_device_ids',
             )
-            overlap_conflicts = process_overlap_conflicts(
-                timeline_latest,
-                overlap_conflict_config,
-            )
-            new_alerts['overlap_conflicts'] = overlap_conflicts
-            log_message(
-                f'Processed overlap conflicts. Shape: {overlap_conflicts.shape}',
-                1,
-                verbosity,
-            )
-        else:
-            new_alerts['overlap_conflicts'] = pd.DataFrame()
-
+            conflict_checks['overlap_conflicts'] = (
+                overlap_conflict_sql(overlap_conflict_config), conflicts_frame)
         if self.config['same_movement_color_conflicts_enabled']:
-            log_message('Processing same movement color conflicts...', 1, verbosity)
-            same_movement_color_conflicts = process_same_movement_color_conflicts(
-                timeline_latest,
-                self.config,
-            )
-            new_alerts['same_movement_color_conflicts'] = same_movement_color_conflicts
-            log_message(
-                f'Processed same movement color conflicts. Shape: {same_movement_color_conflicts.shape}',
-                1,
-                verbosity,
-            )
-        else:
-            new_alerts['same_movement_color_conflicts'] = pd.DataFrame()
-        
+            conflict_checks['same_movement_color_conflicts'] = (
+                same_movement_color_conflict_sql(self.config), conflicts_frame)
+
+        for alert_type in ('overlap_dual_indications', 'general_phase_conflicts',
+                           'overlap_conflicts', 'same_movement_color_conflicts'):
+            new_alerts[alert_type] = pd.DataFrame()
+        if conflict_checks:
+            log_message(f"Processing {', '.join(conflict_checks)}...", 1, verbosity)
+            queries = {name: sql for name, (sql, _) in conflict_checks.items() if sql is not None}
+            context = ' for overlap dual indications' if 'overlap_dual_indications' in queries else ''
+            checked_timeline = validate_timeline(timeline_latest, context) if queries else None
+            results = run_conflict_queries(checked_timeline, queries) if checked_timeline is not None else {}
+            for name, (_, to_alerts) in conflict_checks.items():
+                new_alerts[name] = to_alerts(results.get(name, pd.DataFrame()))
+                log_message(f'Processed {name}. Shape: {new_alerts[name].shape}', 1, verbosity)
+
         # Filter new alerts to only recent ones (alert_flagging_days)
         log_message(f"Filtering newly generated alerts to the last {self.config['alert_flagging_days']} days...", 1, verbosity)
         flagging_cutoff_date = datetime.now() - timedelta(days=self.config['alert_flagging_days'])
@@ -695,7 +1084,7 @@ class ReportGenerator:
         recency_days = self.config['alert_recency_days']
         for alert_type in ('phase_skips', 'clearance_intervals', 'general_phase_conflicts',
                            'overlap_conflicts', 'same_movement_color_conflicts',
-                           'overlap_dual_indications', 'preempts'):
+                           'overlap_dual_indications', 'preempts', ATSPM_DETECTOR_HEALTH):
             df = recent_new_alerts.get(alert_type)
             if df is None or df.empty or 'Date' not in df.columns:
                 continue
@@ -711,6 +1100,29 @@ class ReportGenerator:
             for alert_type in ALERT_CONFIG:
                 if alert_type in UNSUPPRESSED_ALERT_TYPES:
                     final_alerts[alert_type] = recent_new_alerts.get(alert_type, pd.DataFrame())
+                elif alert_type == ATSPM_DETECTOR_HEALTH and not recent_new_alerts.get(
+                        alert_type, pd.DataFrame()).empty:
+                    # Lane closures are information, listed every run (the window
+                    # already keeps a closure an earlier report showed out); only
+                    # faults, timing plans and ped set-up issues go through suppression.
+                    frame = recent_new_alerts[alert_type]
+                    closures = frame[frame['Issue'] == 'lane_closure']
+                    kept, suppressed_alerts[alert_type] = self._suppress_alerts(
+                        frame[frame['Issue'] != 'lane_closure'],
+                        past_alerts.get(alert_type, pd.DataFrame()),
+                        self.config['alert_suppression_days'],
+                        ALERT_CONFIG[alert_type]['id_cols'],
+                        verbosity
+                    )
+                    final_alerts[alert_type] = pd.concat(
+                        [f for f in (kept, closures) if not f.empty] or [closures], ignore_index=True)
+                elif alert_type == 'system_outages' and not recent_new_alerts.get(alert_type, pd.DataFrame()).empty:
+                    # An outage is judged as a whole, not by its region alone.
+                    final_alerts[alert_type], suppressed_alerts[alert_type] = _split_system_outages(
+                        new_alerts[alert_type],
+                        recent_new_alerts[alert_type],
+                        past_alerts.get(alert_type, pd.DataFrame()),
+                    )
                 elif alert_type in recent_new_alerts and not recent_new_alerts[alert_type].empty:
                     final_alerts[alert_type], suppressed_alerts[alert_type] = self._suppress_alerts(
                         recent_new_alerts[alert_type],
@@ -733,53 +1145,172 @@ class ReportGenerator:
         else:
             ongoing_alerts = {alert_type: pd.DataFrame() for alert_type in ALERT_CONFIG}
 
+        # Signal Focus: each report's worst signals across the checks, which then leave its other tables and charts.
+        signal_focus = {}
+        if self.config['signal_focus_signals'] > 0:
+            # Counts of the signals with vehicle faults, so 'all detectors down' can tell spare channels from dead detectors.
+            focus_counts = None
+            fault_frames = [frame for frame in (final_alerts.get(ATSPM_DETECTOR_HEALTH), suppressed_alerts.get(ATSPM_DETECTOR_HEALTH))
+                            if frame is not None and not frame.empty and 'DetectorType' in frame]
+            if fault_frames and atspm_window is not None and not _is_empty(detector_counts):
+                fault_devices = sorted(pd.concat([frame.loc[frame['DetectorType'] == ATSPM_VEHICLE, 'DeviceId']
+                                                  for frame in fault_frames]).astype(str).unique())
+                if fault_devices:
+                    focus_counts = _window_counts(detector_counts, fault_devices, *atspm_window)
+            # The phases each signal with a fault ran, so a rise on every one of them reads 'all phases'.
+            runs = {}
+            if fault_frames and atspm_window is not None and not _is_empty(terminations):
+                runs = signal_phases(terminations, sorted(pd.concat([frame['DeviceId'] for frame in fault_frames]).astype(str).unique()),
+                                     *atspm_window)
+            problems, problem_information = collect_problems(
+                final_alerts, suppressed_alerts, alarm_alerts, atspm_info, self.config['phase_skip_retention_days'],
+                detector_counts=focus_counts, signal_phases=runs)
+            signal_focus = build_signal_focus(problems, signals, problem_information, self.config['signal_focus_signals'])
+        focus_hidden = hidden_signals(signal_focus)
+
         # Generate visualizations
         log_message("Creating visualization plots...", 1, verbosity)
         num_figures = self.config['figures_per_device']
-        
+
         phase_figures = create_device_plots(final_alerts['maxout'], signals, num_figures,
-                                           hourly_data.get('maxout_hourly', pd.DataFrame()))
-        detector_figures = create_device_plots(final_alerts['actuations'], signals, num_figures,
-                                              hourly_data.get('detector_hourly', pd.DataFrame()))
-        missing_data_figures = create_device_plots(final_alerts['missing_data'], signals, num_figures)
-        ped_figures = create_device_plots(final_alerts['pedestrian'], signals, num_figures,
-                                         hourly_data.get('ped_hourly', pd.DataFrame()))
+                                           hourly_data.get('maxout_hourly', pd.DataFrame()), exclude=focus_hidden)
+        missing_hourly = hourly_data.get('missing_hourly')
+        missing_data_figures = create_device_plots(final_alerts['missing_data'], signals, num_figures, missing_hourly, exclude=focus_hidden)
 
         # Ongoing issues get their own charts, drawn the same way and capped the same.
         ongoing_phase_figures = create_device_plots(ongoing_alerts['maxout'], signals, num_figures,
-                                                   hourly_data.get('maxout_hourly', pd.DataFrame()))
-        ongoing_detector_figures = create_device_plots(ongoing_alerts['actuations'], signals, num_figures,
-                                                       hourly_data.get('detector_hourly', pd.DataFrame()))
-        ongoing_missing_data_figures = create_device_plots(ongoing_alerts['missing_data'], signals, num_figures)
-        ongoing_ped_figures = create_device_plots(ongoing_alerts['pedestrian'], signals, num_figures,
-                                                 hourly_data.get('ped_hourly', pd.DataFrame()))
+                                                   hourly_data.get('maxout_hourly', pd.DataFrame()), exclude=focus_hidden)
+        ongoing_missing_data_figures = create_device_plots(ongoing_alerts['missing_data'], signals, num_figures,
+                                                          missing_hourly, exclude=focus_hidden)
 
         # Phase skip visualizations
         # A new skip is news about one day; an ongoing one is about persistence.
         phase_skip_figures = self._create_phase_skip_figures(
             final_alerts['phase_skips'], signals, num_figures,
-            days_plotted=self.config['phase_skip_new_chart_days'],
+            days_plotted=self.config['phase_skip_new_chart_days'], exclude=focus_hidden,
         )
         ongoing_phase_skip_figures = self._create_phase_skip_figures(
             ongoing_alerts['phase_skips'], signals, num_figures,
-            days_plotted=self.config['phase_skip_ongoing_chart_days'],
+            days_plotted=self.config['phase_skip_ongoing_chart_days'], exclude=focus_hidden,
         )
         
+        preempt_figures = self._create_preempt_figures(
+            final_alerts['preempts'], updated_preempt_calls, updated_preempt_history, signals, exclude=focus_hidden
+        )
+        ongoing_preempt_figures = self._create_preempt_figures(
+            ongoing_alerts['preempts'], updated_preempt_calls, updated_preempt_history, signals, exclude=focus_hidden
+        )
+
+        # Detector health (atspm-detector): one chart per signal phase for the faults, the lane
+        # closures and the timing plans, from the 15-minute actuations in
+        # detector_counts over the days this report covers; ped buttons one chart per
+        # signal, from their presses.
+        def charted(alerts, statuses, kind=ATSPM_VEHICLE):
+            if alerts is None or alerts.empty or 'Status' not in alerts.columns or atspm_window is None:
+                return None
+            chosen = alerts[alerts['Status'].isin(statuses) & (alerts['DetectorType'] == kind)]
+            return None if chosen.empty else chosen
+
+        atspm_charted = {
+            'fault': charted(final_alerts[ATSPM_DETECTOR_HEALTH], ATSPM_FAULT_STATUSES),
+            'closure': charted(final_alerts[ATSPM_DETECTOR_HEALTH], ('lane_closure',)),
+            'plan': charted(final_alerts[ATSPM_DETECTOR_HEALTH], ('timing_plan',)),
+            'ongoing': charted(ongoing_alerts.get(ATSPM_DETECTOR_HEALTH), ATSPM_FAULT_STATUSES),
+        }
+        ped_charted = {
+            'ped_fault': charted(final_alerts[ATSPM_DETECTOR_HEALTH], ATSPM_FAULT_STATUSES, ATSPM_PED),
+            'ped_ongoing': charted(ongoing_alerts.get(ATSPM_DETECTOR_HEALTH), ATSPM_FAULT_STATUSES, ATSPM_PED),
+        }
+        # The counts of every charted signal, read once for all the chart sets.
+        chart_counts = None
+        charted_frames = [frame for frame in atspm_charted.values() if frame is not None]
+        if charted_frames and not _is_empty(detector_counts):
+            devices = pd.concat([frame['DeviceId'] for frame in charted_frames]).astype(str).unique().tolist()
+            devices = sorted(set(devices).union(*focus_hidden.values()))
+            chart_counts = _window_counts(detector_counts, devices, *atspm_window)
+        atspm_detector_hourly = _hourly_actuations(chart_counts, *atspm_window) if chart_counts is not None else {}
+        atspm_detector_expected = _usual_by_hour(
+            _to_pandas(detector_usual_counts) if not _is_empty(detector_usual_counts) else None,
+            sorted({device for device, _ in atspm_detector_hourly}), *(atspm_window or (None, None)), stop=data_stopped_at)
+
+        # Ped charts and sparklines read the presses and walks of the signals with a flagged or set-up button.
+        ped_rows = [frame for frame in (final_alerts[ATSPM_DETECTOR_HEALTH], ongoing_alerts.get(ATSPM_DETECTOR_HEALTH))
+                    if frame is not None and not frame.empty]
+        ped_rows = pd.concat(ped_rows, ignore_index=True) if ped_rows else pd.DataFrame()
+        if not ped_rows.empty:
+            ped_rows = ped_rows[ped_rows['DetectorType'] == ATSPM_PED]
+        atspm_ped_hourly, ped_services = {}, None
+        ped_inputs_table = _to_pandas(atspm_ped_inputs)
+        # Greens by hour of the Signal Focus signals and the signals with a flagged button, from far enough back for the
+        # overview's normal range: the overview's max outs and greens, and the ped charts' cycles.
+        ped_devices = sorted(set(ped_rows['DeviceId'].astype(str)).union(*focus_hidden.values())) if not ped_rows.empty else []
+        overview_devices = sorted(set(ped_devices).union(*focus_hidden.values()))
+        term_hourly, ped_cycles = None, None
+        if overview_devices and not _is_empty(terminations):
+            reach_end = atspm_window[1] if atspm_window is not None else pd.Timestamp(datetime.now().date())
+            reach_start = (atspm_window[0] if atspm_window is not None else reach_end - pd.Timedelta(days=1)) - pd.Timedelta(days=OVERVIEW_BASELINE_DAYS)
+            term_hourly = hourly_terminations(terminations, overview_devices, reach_start, reach_end)
+            if atspm_window is not None:
+                ped_cycles = hourly_cycles(term_hourly, *atspm_window)
+        if not ped_rows.empty and atspm_window is not None:
+            if not _is_empty(ped_press_counts):
+                atspm_ped_hourly = _hourly_actuations(_window_counts(ped_press_counts, ped_devices, *atspm_window), *atspm_window, fill=0.0)
+            hours = len(pd.date_range(*atspm_window, freq='h', inclusive='left'))
+            for key in zip(ped_rows['DeviceId'].astype(str), ped_rows['Detector'].astype(int)):
+                atspm_ped_hourly.setdefault(key, [0.0] * hours)    # no row for a button nobody pressed
+            if not _is_empty(pedestrian):
+                ped_services = _window_services(pedestrian, ped_devices, *atspm_window)
+
+        def operational(chosen):
+            """With the urgency tiers, only the faults that affect operations are charted: the others are data only."""
+            if chosen is None or 'Tier' not in chosen.columns:
+                return chosen
+            kept = chosen[atspm_affects_operations(chosen)]
+            return None if kept.empty else kept
+
+        def atspm_figures(key, kind, figures=None):
+            chosen = operational(atspm_charted[key]) if kind == 'fault' else atspm_charted[key]
+            if chosen is None or chart_counts is None:
+                return []
+            devices = chosen['DeviceId'].astype(str).unique().tolist()
+            counts = chart_counts[chart_counts['DeviceId'].isin(devices)]
+            return create_atspm_detector_health_plots(chosen, signals, figures or num_figures, counts, atspm_info,
+                                                      window=atspm_window, kind=kind, exclude=focus_hidden)
+        def ped_figures_for(key):
+            chosen = operational(ped_charted[key])
+            if chosen is None or _is_empty(ped_press_counts):
+                return []
+            devices = chosen['DeviceId'].astype(str).unique().tolist()
+            presses = _window_counts(ped_press_counts, devices, *atspm_window)
+            # Fewer than the detectors': one chart per signal, and two panels each.
+            return create_atspm_detector_health_plots(chosen, signals, max(num_figures - 1, 1), presses, window=atspm_window,
+                                                      kind='ped', exclude=focus_hidden, ped_services=ped_services,
+                                                      ped_inputs=ped_inputs_table, ped_cycles=ped_cycles)
+        atspm_detector_health_figures = {
+            'fault': atspm_figures('fault', 'fault'),
+            # Lane closures and timing plans are information: fewer charts.
+            'closure': atspm_figures('closure', 'closure', max(num_figures - 1, 1)),
+            'plan': atspm_figures('plan', 'closure', max(num_figures - 1, 1)),
+            'ped_fault': ped_figures_for('ped_fault'),
+        }
+        ongoing_atspm_detector_health_figures = atspm_figures('ongoing', 'fault')
+        ongoing_atspm_ped_figures = ped_figures_for('ped_ongoing')
+
+        signal_focus_figures = self._signal_focus_figures(
+            signal_focus, final_alerts, suppressed_alerts, signals, hourly_data, updated_preempt_calls,
+            updated_preempt_history, chart_counts, atspm_info, atspm_window,
+            ped_press_counts if not _is_empty(ped_press_counts) else None, ped_services, ped_inputs_table,
+            term_hourly=term_hourly, ped_cycles=ped_cycles)
+
         log_message("Plots created successfully", 1, verbosity)
         
         # Generate PDF reports
         log_message("Generating PDF reports...", 1, verbosity)
         reports = generate_pdf_report(
             filtered_df_maxouts=final_alerts['maxout'],
-            filtered_df_actuations=final_alerts['actuations'],
-            filtered_df_ped=final_alerts['pedestrian'],
-            ped_hourly_df=hourly_data.get('ped_hourly', pd.DataFrame()),
-            detector_hourly_df=hourly_data.get('detector_hourly', pd.DataFrame()),
             filtered_df_missing_data=final_alerts['missing_data'],
             system_outages_df=final_alerts['system_outages'],
             phase_figures=phase_figures,
-            detector_figures=detector_figures,
-            ped_figures=ped_figures,
             missing_data_figures=missing_data_figures,
             signals_df=signals,
             verbosity=verbosity,
@@ -792,19 +1323,30 @@ class ReportGenerator:
             general_phase_conflicts_df=final_alerts['general_phase_conflicts'],
             overlap_conflicts_df=final_alerts['overlap_conflicts'],
             same_movement_color_conflicts_df=final_alerts['same_movement_color_conflicts'],
-            clearance_yellow_min_seconds=self.config['clearance_yellow_min_seconds'],
-            clearance_red_min_seconds=self.config['clearance_red_min_seconds'],
             max_table_rows=self.config['max_table_rows'],
             joke_index=self.config['joke_index'],
             custom_logo_path=self.config['custom_logo_path'],
             alarms_df=alarm_alerts,
             preempt_alerts_df=final_alerts['preempts'],
+            atspm_detector_health_df=final_alerts[ATSPM_DETECTOR_HEALTH],
+            atspm_detector_hourly=atspm_detector_hourly,
+            atspm_detector_expected=atspm_detector_expected,
+            atspm_ped_hourly=atspm_ped_hourly,
+            table_row_limits=self.config['table_row_limits'],
+            atspm_detector_health_figures=atspm_detector_health_figures,
+            ongoing_atspm_detector_health_figures=ongoing_atspm_detector_health_figures,
+            ongoing_atspm_ped_figures=ongoing_atspm_ped_figures,
             ongoing_alerts=ongoing_alerts,
             ongoing_phase_figures=ongoing_phase_figures,
-            ongoing_detector_figures=ongoing_detector_figures,
-            ongoing_ped_figures=ongoing_ped_figures,
             ongoing_missing_data_figures=ongoing_missing_data_figures,
             ongoing_phase_skip_figures=ongoing_phase_skip_figures,
+            preempt_figures=preempt_figures,
+            ongoing_preempt_figures=ongoing_preempt_figures,
+            signal_focus=signal_focus,
+            signal_focus_figures=signal_focus_figures,
+            data_stopped_at=data_stopped_at,
+            missing_data_hourly=missing_hourly,
+            system_outages_hourly=hourly_data.get('outage_hourly'),
         )
         
         # Update and save past alerts with retention
@@ -815,9 +1357,15 @@ class ReportGenerator:
             # repeats suppression moved to Ongoing. Writing the wider working frame
             # would file alerts that no report ever showed, and suppression would
             # then hide them for the next three weeks - silently, and forever.
+            new_reported = final_alerts.get(alert_type, pd.DataFrame())
+            if alert_type == ATSPM_DETECTOR_HEALTH and new_reported is not None and not new_reported.empty:
+                # Only what the tables listed: an alert cut by the row limit was never
+                # seen, so it must not be suppressed as a repeat on the next run.
+                new_reported = atspm_listed_alerts(new_reported, signals, self.config['max_table_rows'], hidden=focus_hidden,
+                                                   limits=self.config['table_row_limits'])
             reported = [
                 frame for frame in (
-                    final_alerts.get(alert_type, pd.DataFrame()),
+                    new_reported,
                     suppressed_alerts.get(alert_type, pd.DataFrame()),
                 ) if frame is not None and not frame.empty
             ]
@@ -841,7 +1389,14 @@ class ReportGenerator:
             'updated_past_alerts': updated_past_alerts,
             'updated_alarm_history': updated_alarm_history,
             'updated_preempt_history': updated_preempt_history,
+            'updated_preempt_calls': updated_preempt_calls,
+            'updated_atspm_detector_minutes': updated_atspm_minutes,
+            'preempt_cascade_links': preempt_cascade_links,
+            'overruled_preempt_alerts': overruled_preempt_alerts,
             'alarms': alarm_alerts,
+            'signal_focus': signal_focus,
+            'data_stopped_at': data_stopped_at,
+            'silent_ped_phases': silent_phases,
             'hourly_data': hourly_data
         }
     
@@ -878,8 +1433,211 @@ class ReportGenerator:
             if self.config.get(key) is not None
         }
 
+    def _signal_focus_figures(self, focus, new_alerts, held_back, signals, hourly_data, preempt_calls, preempt_history,
+                              detector_counts, detector_table, window, ped_presses, ped_services=None, ped_inputs=None,
+                              term_hourly=None, ped_cycles=None) -> dict:
+        """{signal: (figure, width, height, chart kinds) charts} for the signals of every report's Signal Focus, in the order of its table.
+
+        First one overview (focus_overview): the faults of its detectors and buttons over the max outs, waits and greens of the
+        phases its table names, against their normal range, with its skips, preempt calls and hours without data, all on the days
+        its detector charts cover. Then the detector charts, the phases hurt first (none when every detector was down at once: the
+        overview shows that), and its ped buttons' chart. Conflicts, clearance and alarms have no chart.
+        """
+        per_signal = self.config['signal_focus_charts_per_signal']
+        wanted = {}
+        for rows in focus.values():
+            for _, row in rows.iterrows():
+                wanted[row['DeviceId']] = row
+        if window is None:
+            end = pd.Timestamp(datetime.now().date())
+            window = (end - pd.Timedelta(days=1), end)
+        start, end = pd.Timestamp(window[0]), pd.Timestamp(window[1])
+        waits = self.phase_skip_waits if self.phase_skip_waits is not None else pd.DataFrame()
+
+        def rows_of(key, device):
+            frames = [source.get(key) for source in (new_alerts, held_back)]
+            frames = [frame[frame['DeviceId'].astype(str) == device] for frame in frames if frame is not None and not frame.empty]
+            frames = [frame for frame in frames if not frame.empty]
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+        def unique(created):
+            return list(dict.fromkeys(figure for figure, _ in created))
+
+        def of_device(frame, device):
+            return frame[frame['DeviceId'].astype(str) == device] if frame is not None and not frame.empty else pd.DataFrame()
+
+        figures = {}
+        for device, row in wanted.items():
+            one = signals[signals['DeviceId'] == device]
+            health = rows_of(ATSPM_DETECTOR_HEALTH, device)
+            types = {told['type'] for told in row['Rows']}
+            phases = row['Charts']
+            charts = []
+
+            def add(created, kind, width=6.5 * inch, height=2.8 * inch):
+                charts.extend((figure, width, height, kind) for figure in created)
+
+            def detector_charts(faults):
+                if faults.empty or detector_counts is None:
+                    return []
+                counts = detector_counts[detector_counts['DeviceId'] == device]
+                return unique(create_atspm_detector_health_plots(faults, one, faults['Detector'].nunique(), counts, detector_table, window=window, max_drawn=12))
+
+            faults = health[(health['DetectorType'] == ATSPM_VEHICLE) & health['Status'].isin(ATSPM_FAULT_STATUSES)] if not health.empty else health
+            buttons = health[(health['DetectorType'] == ATSPM_PED) & health['Status'].isin(ATSPM_FAULT_STATUSES)] if not health.empty else health
+            harm_faults, other_faults = faults, faults.iloc[0:0]
+            if not faults.empty:
+                placed = faults.drop(columns=['Phase'], errors='ignore').merge(
+                    detector_table[['DeviceId', 'Detector', 'Phase']].assign(DeviceId=detector_table['DeviceId'].astype(str)), on=['DeviceId', 'Detector'], how='left')
+                placed['Phase'] = placed['Phase'].fillna(-1)
+                hurting = placed['Tier'].isin(FOCUS_HARM_TIERS) if 'Tier' in placed else pd.Series(False, index=placed.index)
+                first = placed['Phase'].isin(placed.loc[hurting, 'Phase']).to_numpy()
+                harm_faults, other_faults = faults[first], faults[~first]
+            # Every detector down at once: one row of the overview for them all, and no chart per phase that all say the same.
+            device_counts = detector_counts[detector_counts['DeviceId'] == device] if detector_counts is not None else None
+            known = active_detectors(known_detectors(detector_table, device), device_counts)
+            together = detectors_down_together(faults, known, device_counts) if not faults.empty else []
+
+            # The overview.
+            strip = []
+            if not (faults.empty and buttons.empty):
+                strip = fault_rows(pd.concat([harm_faults, other_faults, buttons], ignore_index=True), start, end, together, len(known))
+            covered = {FOCUS_CHART_DETECTOR} if strip else set()
+            mine = of_device(term_hourly, device)
+            stamps = pd.to_datetime(mine['TimeStamp']) if not mine.empty else None
+            in_window = mine[(stamps >= start) & (stamps < end)] if not mine.empty else mine
+            all_phases = sorted(in_window.loc[in_window['Total'] > 0, 'Phase'].astype(int).unique()) if not in_window.empty else []
+            panels = []
+            for kind, chart in ((OVERVIEW_MAX_OUT, FOCUS_CHART_MAX_OUT), (OVERVIEW_WAIT, FOCUS_CHART_WAIT), (OVERVIEW_GREEN, FOCUS_CHART_GREEN)):
+                wanted_phases = phases.get(chart)
+                if not wanted_phases:
+                    continue
+                data = of_device(waits, device) if kind == OVERVIEW_WAIT else mine
+                series = overview_measure(kind, data, wanted_phases)
+                if series.empty:
+                    continue
+                # Wait is measured from a call to its green: with no calls logged (every detector down) there is none to show.
+                panels.append({'kind': kind, 'series': series, 'band': normal_range(series, start, end),
+                               'title': f"{OVERVIEW_TITLES[kind]} ({overview_phase_words(wanted_phases, all_phases)})",
+                               'blank': OVERVIEW_NO_WAIT if kind == OVERVIEW_WAIT else None})
+                covered.add(chart)
+            ticks = []
+            if FOCUS_SKIPS in types:
+                skipped = sorted(rows_of('phase_skips', device)['Phase'].dropna().astype(int).unique())
+                bins = of_device(waits, device)
+                bins = bins[bins['TotalSkips'] > 0] if not bins.empty else bins
+                ticks.append({'title': 'Skips', 'empty': 'none in these days',
+                              'rows': [(f"Ph{phase}", bins.loc[bins['Phase'] == phase, 'TimeStamp'].tolist() if not bins.empty else [])
+                                       for phase in skipped]})
+                covered.add(FOCUS_CHART_SKIPS)
+            if FOCUS_PREEMPT in types:
+                alerted_rows = rows_of('preempts', device)
+                alerted = sorted(alerted_rows['Preempt'].dropna().astype(int).unique())
+                tsp_alerted = set(alerted_rows.loc[alerted_rows.get('Class', pd.Series(dtype=object)) == SECTION_TSP, 'Preempt']
+                                  .dropna().astype(int)) if 'Class' in alerted_rows.columns else set()
+                calls = of_device(preempt_calls, device)
+                days = of_device(preempt_history, device)
+                rail = {int(p) for p in (self.config['preempt_rail_numbers'] or [])}
+                rows = []
+                for number in alerted:
+                    mine = calls[calls['Preempt'].astype(int) == number] if not calls.empty else calls
+                    classes = mine['Class'] if 'Class' in mine.columns else pd.Series(None, index=mine.index, dtype=object)
+                    if number in rail:
+                        times = mine['StartTime'].tolist() if not mine.empty else []
+                        rows.append((f"Rail P{number}", times, _no_calls_note(number, times, days, start)))
+                        continue
+                    # Emergency vehicle calls and bus calls on their own rows, so the bus pulses are not read as vehicles.
+                    ev = mine[~classes.isin(TSP_CLASSES)] if not mine.empty else mine
+                    times = ev['StartTime'].tolist() if not ev.empty else []
+                    in_window = (mine['StartTime'] >= start) & (mine['StartTime'] < end) if not mine.empty else None
+                    ev_alerted = number in set(alerted_rows.loc[alerted_rows.get('Class') != SECTION_TSP, 'Preempt']
+                                               .dropna().astype(int)) if 'Class' in alerted_rows.columns else True
+                    if ev_alerted or (not ev.empty and bool(in_window[~classes.isin(TSP_CLASSES)].any())):
+                        # The last call before these days counts emergency vehicle calls only, not bus pulses.
+                        ev_days = days
+                        if not days.empty and 'Class' in days.columns:
+                            ev_days = days[~days['Class'].isin(TSP_CLASSES)]
+                        rows.append((f"P{number} emergency", times, _no_calls_note(number, times, ev_days, start)))
+                    for cls, label in ((CLASS_BUS_PREEMPT, 'bus, ran preempt'), (CLASS_TSP, 'bus, no preempt')):
+                        bus = mine[classes == cls] if not mine.empty else mine
+                        if number in tsp_alerted or (not bus.empty and bool(in_window[classes == cls].any())):
+                            rows.append((f"P{number} {label}", bus['StartTime'].tolist() if not bus.empty else [],
+                                         'none in these days'))
+                ticks.append({'title': 'Preempt Calls', 'empty': 'no calls in these days', 'rows': rows})
+                covered.add(FOCUS_CHART_PREEMPT)
+            gaps = no_data_hours(hourly_data.get('missing_hourly'), device, start, end)
+            if gaps:
+                covered.add(FOCUS_CHART_MISSING)
+            overview = create_focus_overview(row['Signal'], (start, end), strip, panels, ticks, gaps)
+            if overview is not None:
+                add([overview], frozenset(covered), 7.5 * inch, None)
+
+            if together:
+                harm_faults = other_faults = faults.iloc[0:0]
+            add(detector_charts(harm_faults), FOCUS_CHART_DETECTOR, 7.5 * inch, None)
+            if not buttons.empty and ped_presses is not None:
+                presses = _window_counts(ped_presses, [device], *window)
+                add(unique(create_atspm_detector_health_plots(buttons, one, 1, presses, window=window, kind='ped', max_drawn=12,
+                                                              ped_services=ped_services, ped_inputs=ped_inputs,
+                                                              ped_cycles=ped_cycles))[:1], FOCUS_CHART_PED, 7.5 * inch, None)
+            other_charts = detector_charts(other_faults)
+            add(other_charts, FOCUS_CHART_DETECTOR, 7.5 * inch, None)
+            figures[device] = charts[:per_signal]
+            # Both detector rows share a kind of chart, so past the limit the second has to say so itself.
+            kept = {id(chart[0]) for chart in figures[device]}
+            if other_charts and not any(id(figure) in kept for figure in other_charts) and FOCUS_CHART_DETECTOR not in covered:
+                for told in row['Rows']:
+                    if told['type'] == FOCUS_OTHER_DETECTORS_ROW:
+                        told['no_chart'] = True
+        return figures
+
+    def _create_preempt_figures(self, alerts_df, calls, history, signals, exclude=None) -> dict:
+        """{section: (figure, region) charts} for preempt alerts: stacked daily-count and call-duration charts, each section
+        drawing only its own calls. The TSP charts count bus calls (bursts of pulses), split into those that ran as
+        preempts and normal TSP requests, over the length of each pulse."""
+        if alerts_df is None or alerts_df.empty:
+            return {}
+        rail = self.config['preempt_rail_numbers']
+        alerts_df = _preempt_alert_classes(alerts_df, rail)
+        calls = calls if calls is not None else pd.DataFrame()
+        hist = history if history is not None else pd.DataFrame()
+        call_sections = _history_sections(calls, rail)
+        hist_sections = _history_sections(hist, rail)
+        presence = hist[hist['Preempt'] == PRESENCE_PREEMPT] if not hist.empty else hist
+        figures = {}
+        for section in PREEMPT_SECTIONS:
+            alerts = alerts_df[alerts_df['Class'] == section]
+            if alerts.empty:
+                continue
+            section_calls = calls[call_sections == section] if not calls.empty else calls
+            extra = {}
+            if section == SECTION_TSP:
+                days = preempt_episode_days(section_calls)
+                section_history = pd.concat([df for df in (presence, days) if not df.empty]) if not days.empty else presence
+                extra = dict(class_labels={CLASS_BUS_PREEMPT: 'ran as preempt', CLASS_TSP: 'no preempt'},
+                             chatter_seconds=PULSE_MAX_SECONDS, stuck_lines=False, count_label='Bus calls/day')
+            elif not hist.empty:
+                section_history = pd.concat([presence, hist[(hist_sections == section) & (hist['Preempt'] != PRESENCE_PREEMPT)]])
+            else:
+                section_history = hist
+            if section == SECTION_EV and self.config['preempt_false_calls_enabled'] and not section_calls.empty:
+                lengths = pd.to_numeric(section_calls.loc[section_calls['IsValid'].fillna(False).astype(bool), 'Duration'], errors='coerce')
+                if lengths.notna().any():
+                    extra['usual_lengths'] = tuple(float(lengths.quantile(q)) for q in USUAL_LENGTH_QUANTILES)
+            figures[section] = create_preempt_plots(
+                alerts,
+                section_calls,
+                section_history,
+                signals,
+                num_figures=self.config['preempt_figures'],
+                rail_preempts=rail,
+                exclude=exclude,
+                **extra,
+            )
+        return figures
+
     def _create_phase_skip_figures(self, alerts_df: pd.DataFrame, signals: pd.DataFrame,
-                                   num_figures: int, days_plotted: int = None) -> list:
+                                   num_figures: int, days_plotted: int = None, exclude: dict = None) -> list:
         """Build phase skip charts for one set of alerts, ranking devices by total skips."""
         if alerts_df is None or alerts_df.empty or self.phase_skip_summary.empty:
             return []
@@ -897,14 +1655,15 @@ class ReportGenerator:
                 .rename(columns={'AggregatedSkips': 'TotalSkips'})
             )
 
-        annotated_phase_waits = self.phase_skip_waits.merge(
+        # Only the alerting signals are drawn, so only their rows are annotated.
+        alert_devices = alert_pairs['DeviceId'].unique()
+        alert_device_waits = self.phase_skip_waits[self.phase_skip_waits['DeviceId'].isin(alert_devices)]
+        plot_phase_skip_waits = alert_device_waits.merge(
             alert_pairs.assign(AlertPhase=True),
             on=['DeviceId', 'Phase'],
             how='left'
         )
-        annotated_phase_waits['AlertPhase'] = annotated_phase_waits['AlertPhase'].fillna(False).astype(bool)
-        alert_devices = alert_pairs['DeviceId'].unique()
-        plot_phase_skip_waits = annotated_phase_waits[annotated_phase_waits['DeviceId'].isin(alert_devices)]
+        plot_phase_skip_waits['AlertPhase'] = plot_phase_skip_waits['AlertPhase'].fillna(False).astype(bool)
 
         return create_phase_skip_plots(
             plot_phase_skip_waits,
@@ -913,6 +1672,7 @@ class ReportGenerator:
             num_figures,
             self.cycle_length_data,
             days_plotted=days_plotted,
+            exclude=exclude,
         )
 
     def _suppress_alerts(self, new_alerts_df: pd.DataFrame, past_alerts_df: pd.DataFrame,
@@ -1027,7 +1787,7 @@ class ReportGenerator:
 
         # Drop duplicates
         if not combined_alerts.empty:
-            combined_alerts.drop_duplicates(subset=required_cols, inplace=True)
+            combined_alerts = combined_alerts.drop_duplicates(subset=required_cols)
 
             # Apply retention policy
             if retention_weeks > 0:

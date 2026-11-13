@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Optional
 
 import duckdb
 import pandas as pd
-import ibis.expr.types as ir
+from .duckdb_utils import quote_literal, to_pandas
 
 
 STANDARD_CONFLICT_PAIRS = [
@@ -59,8 +59,16 @@ OVERLAP_PAIR_VALUES = ', '.join(
     f'({left}, {right})' for left, right in OVERLAP_CONFLICT_PAIRS
 )
 
-CLEAN_TIMELINE_CTES = """
-timeline AS (
+# Interval classes the conflict checks compare.
+INDICATION_CLASSES = ('Green', 'Yellow', 'Red', 'Overlap Green', 'Overlap Yellow', 'Overlap Red')
+
+# The valid indication intervals that overlap no invalid interval of their
+# signal. Built once per timeline and shared by every conflict check (and the
+# overlap dual indication check): a signal's clean intervals do not depend on
+# any other signal or on which check reads them.
+CLEAN_TIMELINE_SQL = """
+CREATE TABLE clean_indications AS
+WITH timeline AS (
     SELECT * FROM timeline_input
 ),
 invalid_intervals AS (
@@ -69,18 +77,23 @@ invalid_intervals AS (
     WHERE IsValid IS FALSE
       AND StartTime IS NOT NULL
       AND EndTime IS NOT NULL
-),
+)
+SELECT candidate.*
+FROM timeline AS candidate
+WHERE candidate.IsValid IS TRUE
+  AND candidate.EventClass IN ({indication_classes})
+  AND NOT EXISTS (
+      SELECT 1
+      FROM invalid_intervals AS invalid
+      WHERE invalid.DeviceId = CAST(candidate.DeviceId AS VARCHAR)
+        AND candidate.StartTime < invalid.EndTime
+        AND invalid.StartTime < candidate.EndTime
+  )
+""".format(indication_classes=', '.join(f"'{name}'" for name in INDICATION_CLASSES))
+
+CLEAN_TIMELINE_CTES = """
 clean_timeline AS (
-    SELECT candidate.*
-    FROM timeline AS candidate
-    WHERE candidate.IsValid IS TRUE
-      AND NOT EXISTS (
-          SELECT 1
-          FROM invalid_intervals AS invalid
-          WHERE invalid.DeviceId = CAST(candidate.DeviceId AS VARCHAR)
-            AND candidate.StartTime < invalid.EndTime
-            AND invalid.StartTime < candidate.EndTime
-      )
+    SELECT * FROM clean_indications{device_filter}
 ),
 conflict_pairs(Phase1, Phase2) AS (
     VALUES {pair_values}
@@ -290,51 +303,51 @@ def _empty_conflicts() -> pd.DataFrame:
     return pd.DataFrame(columns=CONFLICT_COLUMNS)
 
 
-def _to_pandas(data: Union[pd.DataFrame, 'ir.Table', None]) -> Optional[pd.DataFrame]:
-    if data is None:
-        return None
-    if isinstance(data, pd.DataFrame):
-        return data
-    if isinstance(data, ir.Table):
-        return data.execute()
-    return None
-
-
-def _validate_timeline(timeline) -> Optional[pd.DataFrame]:
-    df = _to_pandas(timeline)
+def validate_timeline(timeline, context: str = '') -> Optional[pd.DataFrame]:
+    """The timeline as a DataFrame ready for the conflict queries, None when empty."""
+    df = to_pandas(timeline)
     if df is None or df.empty:
         return None
     required = ['DeviceId', 'StartTime', 'EndTime', 'IsValid', 'EventClass', 'EventValue']
     missing = [column for column in required if column not in df.columns]
     if missing:
-        raise ValueError('Missing required timeline column(s): ' + ', '.join(missing))
+        raise ValueError(f'Missing required timeline column(s){context}: ' + ', '.join(missing))
     # DuckDB needs real timestamps for the interval arithmetic; callers may
     # hand over strings (or Parquet-typed columns), so coerce here.
-    df = df.copy()
-    df['StartTime'] = pd.to_datetime(df['StartTime'], errors='coerce')
-    df['EndTime'] = pd.to_datetime(df['EndTime'], errors='coerce')
+    if not all(pd.api.types.is_datetime64_dtype(df[column]) for column in ('StartTime', 'EndTime')):
+        df = df.copy()
+        df['StartTime'] = pd.to_datetime(df['StartTime'], errors='coerce')
+        df['EndTime'] = pd.to_datetime(df['EndTime'], errors='coerce')
     return df
 
 
-def _exclude_device_ids(df: pd.DataFrame, device_ids) -> pd.DataFrame:
-    excluded = {
-        str(device_id)
-        for device_id in (device_ids or [])
-        if pd.notna(device_id) and str(device_id).strip()
-    }
-    if not excluded:
-        return df
-    return df[~df['DeviceId'].astype(str).isin(excluded)].copy()
-
-
-def _execute_conflict_query(df: pd.DataFrame, sql: str) -> pd.DataFrame:
+def run_conflict_queries(timeline: pd.DataFrame, queries: dict) -> dict:
+    """Run each query (name -> SQL reading clean_indications) on one connection,
+    with the timeline's clean indications built once -> name -> DataFrame."""
     con = duckdb.connect()
     try:
-        con.register('timeline_input', df)
-        conflicts = con.execute(sql).df()
+        con.register('timeline_input', timeline)
+        con.execute(CLEAN_TIMELINE_SQL)
+        con.unregister('timeline_input')
+        return {name: con.execute(sql).df() for name, sql in queries.items()}
     finally:
         con.close()
 
+
+def _device_filter(device_ids) -> str:
+    excluded = sorted({
+        str(device_id)
+        for device_id in (device_ids or [])
+        if pd.notna(device_id) and str(device_id).strip()
+    })
+    if not excluded:
+        return ''
+    ids = ', '.join(quote_literal(device_id) for device_id in excluded)
+    return f' WHERE CAST(DeviceId AS VARCHAR) NOT IN ({ids})'
+
+
+def conflicts_frame(conflicts: pd.DataFrame) -> pd.DataFrame:
+    """A conflict query's rows as the report's conflict alerts."""
     if conflicts.empty:
         return _empty_conflicts()
     conflicts['ConflictStart'] = pd.to_datetime(conflicts['ConflictStart'], errors='coerce')
@@ -345,55 +358,67 @@ def _execute_conflict_query(df: pd.DataFrame, sql: str) -> pd.DataFrame:
     return conflicts.reindex(columns=CONFLICT_COLUMNS)
 
 
-def process_general_phase_conflicts(timeline, config: Optional[dict] = None) -> pd.DataFrame:
+def general_phase_conflict_sql(config: Optional[dict] = None) -> Optional[str]:
+    """The general phase conflict query for this config, None when the check is off."""
     config = config or {}
     if not bool(config.get('general_phase_conflicts_enabled', False)):
-        return _empty_conflicts()
-    df = _validate_timeline(timeline)
-    if df is None:
-        return _empty_conflicts()
-    df = _exclude_device_ids(df, config.get('general_phase_conflict_excluded_device_ids'))
-    if df.empty:
-        return _empty_conflicts()
-    clean_ctes = CLEAN_TIMELINE_CTES.format(pair_values=PAIR_VALUES)
-    sql = GENERAL_PHASE_CONFLICT_SQL.format(clean_timeline_ctes=clean_ctes)
-    return _execute_conflict_query(df, sql)
+        return None
+    clean_ctes = CLEAN_TIMELINE_CTES.format(
+        pair_values=PAIR_VALUES,
+        device_filter=_device_filter(config.get('general_phase_conflict_excluded_device_ids')),
+    )
+    return GENERAL_PHASE_CONFLICT_SQL.format(clean_timeline_ctes=clean_ctes)
 
 
-def process_overlap_conflicts(timeline, config: Optional[dict] = None) -> pd.DataFrame:
+def overlap_conflict_sql(config: Optional[dict] = None) -> Optional[str]:
+    """The phase/overlap conflict query for this config, None when the check is off."""
     config = config or {}
     if not bool(config.get('overlap_conflicts_enabled', False)):
-        return _empty_conflicts()
+        return None
     overlaps = sorted({
         int(number)
         for number in config.get('overlap_conflict_numbers', [])
         if pd.notna(number) and 1 <= int(number) <= 8
     })
     if not overlaps:
-        return _empty_conflicts()
-    df = _validate_timeline(timeline)
-    if df is None:
-        return _empty_conflicts()
-    df = _exclude_device_ids(df, config.get('overlap_conflict_excluded_device_ids'))
-    if df.empty:
-        return _empty_conflicts()
-    clean_ctes = CLEAN_TIMELINE_CTES.format(pair_values=OVERLAP_PAIR_VALUES)
+        return None
+    clean_ctes = CLEAN_TIMELINE_CTES.format(
+        pair_values=OVERLAP_PAIR_VALUES,
+        device_filter=_device_filter(config.get('overlap_conflict_excluded_device_ids')),
+    )
     overlap_values = ', '.join(f'({number})' for number in overlaps)
-    sql = OVERLAP_CONFLICT_SQL.format(
+    return OVERLAP_CONFLICT_SQL.format(
         clean_timeline_ctes=clean_ctes,
         overlap_values=overlap_values,
         stale_overlap_ms=int(OVERLAP_STALE_INDICATION_SECONDS * 1000),
     )
-    return _execute_conflict_query(df, sql)
+
+
+def same_movement_color_conflict_sql(config: Optional[dict] = None) -> Optional[str]:
+    """The same phase/overlap multi-color query for this config, None when the check is off."""
+    config = config or {}
+    if not bool(config.get('same_movement_color_conflicts_enabled', False)):
+        return None
+    clean_ctes = CLEAN_TIMELINE_CTES.format(pair_values=PAIR_VALUES, device_filter='')
+    return SAME_MOVEMENT_COLOR_CONFLICT_SQL.format(clean_timeline_ctes=clean_ctes)
+
+
+def _process(timeline, sql: Optional[str]) -> pd.DataFrame:
+    if sql is None:
+        return _empty_conflicts()
+    df = validate_timeline(timeline)
+    if df is None:
+        return _empty_conflicts()
+    return conflicts_frame(run_conflict_queries(df, {'conflicts': sql})['conflicts'])
+
+
+def process_general_phase_conflicts(timeline, config: Optional[dict] = None) -> pd.DataFrame:
+    return _process(timeline, general_phase_conflict_sql(config))
+
+
+def process_overlap_conflicts(timeline, config: Optional[dict] = None) -> pd.DataFrame:
+    return _process(timeline, overlap_conflict_sql(config))
 
 
 def process_same_movement_color_conflicts(timeline, config: Optional[dict] = None) -> pd.DataFrame:
-    config = config or {}
-    if not bool(config.get('same_movement_color_conflicts_enabled', False)):
-        return _empty_conflicts()
-    df = _validate_timeline(timeline)
-    if df is None:
-        return _empty_conflicts()
-    clean_ctes = CLEAN_TIMELINE_CTES.format(pair_values=PAIR_VALUES)
-    sql = SAME_MOVEMENT_COLOR_CONFLICT_SQL.format(clean_timeline_ctes=clean_ctes)
-    return _execute_conflict_query(df, sql)
+    return _process(timeline, same_movement_color_conflict_sql(config))

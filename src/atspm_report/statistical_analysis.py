@@ -1,87 +1,60 @@
-import ibis
+import pandas as pd
 
-def cusum(df, k_value=0.5, forgetfulness=2):
-    """Calculate CUSUM statistics for anomaly detection"""
-    ibis.options.interactive = True
-    
-    # Create ibis table from dataframe
-    table = ibis.memtable(df)
+from .duckdb_utils import TableLike, columns, quote, run_sql
 
-    # Set whether to use Phase, Detector, or just DeviceId (for missing data)
-    if 'Phase' in table.columns:
-        column = 'Percent MaxOut'
-        cusum_column_name = 'CUSUM_Percent MaxOut'
-        group_column = 'Phase'
-    elif 'Detector' in table.columns:
-        column = 'PercentAnomalous'
-        cusum_column_name = 'CUSUM_PercentAnomalous'
-        group_column = 'Detector'
-    elif 'MissingData' in table.columns:
-        column = 'MissingData'
-        cusum_column_name = 'CUSUM_MissingData'
-        group_column = None
-    else:
-        raise ValueError("Unknown data format for CUSUM analysis")
 
-    # Calculate group-based metrics
-    if group_column:
-        group_metrics = table.group_by(['DeviceId', group_column]).aggregate(
-            _MinDate=table['Date'].min(),
-            _MaxDate=table['Date'].max(),
-            _Average=table[column].mean(),
-            _StdDev=table[column].std()
+def _cusum_columns(columns):
+    """(value column, CUSUM column name, group columns) for maxout or missing data."""
+    if 'Phase' in columns:
+        return 'Percent MaxOut', 'CUSUM_Percent MaxOut', ['DeviceId', 'Phase']
+    if 'MissingData' in columns:
+        return 'MissingData', 'CUSUM_MissingData', ['DeviceId']
+    raise ValueError("Unknown data format for CUSUM analysis")
+
+
+def cusum(df: TableLike, k_value=0.5, forgetfulness=2) -> pd.DataFrame:
+    """Calculate CUSUM statistics for anomaly detection.
+
+    Adds _MinDate, _MaxDate, _Average and _StdDev (per DeviceId, or per
+    DeviceId/Phase for max outs) and the CUSUM column: a date-weighted sum of the
+    positive shift above average + k standard deviations over the trailing 7 days.
+    """
+    column, cusum_column_name, groups = _cusum_columns(columns(df))
+    col = quote(column)
+    keys = ', '.join(groups)
+    on = ' AND '.join(f't.{g} = g.{g}' for g in groups)
+    window = (f"PARTITION BY {keys} ORDER BY Date "
+              "RANGE BETWEEN INTERVAL 6 DAY PRECEDING AND CURRENT ROW")
+    return run_sql(f"""
+        WITH joined AS (
+            SELECT t.*, g._MinDate, g._MaxDate, g._Average, g._StdDev
+            FROM t
+            JOIN (
+                SELECT {keys},
+                    MIN(Date) AS _MinDate,
+                    MAX(Date) AS _MaxDate,
+                    AVG({col}) AS _Average,
+                    STDDEV_SAMP({col}) AS _StdDev
+                FROM t
+                GROUP BY {keys}
+            ) AS g ON {on}
+        ),
+        weighted AS (
+            SELECT *, POWER(DATE_DIFF('day', _MinDate, Date) + 1, $forgetfulness) AS DateWeight
+            FROM joined
+        ),
+        summed AS (
+            SELECT *,
+                SUM(DateWeight) OVER ({window}) AS DateWeightSum,
+                GREATEST(0, ({col} - _Average) - (_StdDev * $k)) * DateWeight AS DaySum
+            FROM weighted
         )
-        # Join the metrics back to the original table
-        joined = table.join(group_metrics, ['DeviceId', group_column])
-        # Set up window for calculations
-        window = ibis.window(
-            group_by=['DeviceId', group_column],
-            order_by=['Date'],
-            preceding=ibis.interval(days=6),
-            following=0
-        )
-    else:
-        # For missing data (no group_column)
-        group_metrics = table.group_by(['DeviceId']).aggregate(
-            _MinDate=table['Date'].min(),
-            _MaxDate=table['Date'].max(),
-            _Average=table[column].mean(),
-            _StdDev=table[column].std()
-        )
-        # Join the metrics back to the original table
-        joined = table.join(group_metrics, ['DeviceId'])
-        # Set up window for calculations
-        window = ibis.window(
-            group_by=['DeviceId'],
-            order_by=['Date'],
-            preceding=ibis.interval(days=6),
-            following=0
-        )
+        SELECT * EXCLUDE (DateWeight, DateWeightSum, DaySum),
+            (SUM(DaySum) OVER ({window}) / DateWeightSum) * 7 AS {quote(cusum_column_name)}
+        FROM summed
+        ORDER BY {keys}, Date
+    """, params={'k': k_value, 'forgetfulness': forgetfulness}, single_thread=True, t=df)
 
-    # Add date weight column
-    result = joined.mutate(
-        DateWeight=(joined['Date'].delta(joined['_MinDate'], unit='days') + 1)**forgetfulness,
-    )
-    # Add Date Weight Sum
-    result = result.mutate(
-        DateWeightSum=result['DateWeight'].sum().over(window),
-    )
-    result = result.mutate(
-        DaySum=ibis.greatest(0, result[column] - result['_Average'] - k_value * result['_StdDev']) *
-                result['DateWeight']
-    )
-
-    # Use the dynamic column name here
-    result = result.mutate(**{
-        cusum_column_name: result['DaySum'].sum().over(window) / result['DateWeightSum'] * 7
-    })
-
-    # Drop everything but the CUSUM column
-    result = result.drop(
-        ['DateWeight', 'DateWeightSum', 'DaySum']
-    )
-
-    return result
 
 # Phase termination alerting thresholds. A day is flagged only when all four are
 # exceeded, so raising any one of them makes the check less sensitive.
@@ -92,107 +65,133 @@ MAXOUT_ALERT_DEFAULTS = {
     'maxout_min_services': 30,           # ignore phases that barely ran
 }
 
+# Max-out drain: a flagged day also needs its max outs to still be high when the day ends. Hour by hour
+# through that day, each hour adds how far its max-out share sits above the same hour's average on the earlier days, less
+# the drain, and the total never drops below zero. A spike that went back to normal drains away; a phase still maxing out
+# keeps building. The total is in max-out share x hours: 1.0 is about one hour fully maxed out above normal.
+MAXOUT_DRAIN_DEFAULTS = {
+    'maxout_drain_enabled': True,
+    'maxout_drain_per_hour': 0.1,
+    'maxout_drain_threshold': 1.0,
+}
+
+
+def maxout_end_of_day_totals(days: pd.DataFrame, terminations: TableLike, drain_per_hour: float) -> pd.Series:
+    """The running max-out total at the end of each (DeviceId, Phase, Date) in days, as described at MAXOUT_DRAIN_DEFAULTS.
+
+    terminations: the same rows the daily check used. Hours of the day with no terminations count as normal. Returns a
+    Series indexed like days.
+    """
+    if days.empty:
+        return pd.Series(dtype='float64', index=days.index)
+    wanted = days[['DeviceId', 'Phase']].drop_duplicates()
+    hourly = run_sql("""
+        SELECT t.DeviceId, t.Phase, DATE_TRUNC('hour', t.TimeStamp) AS Hour,
+            SUM(CASE WHEN t.PerformanceMeasure IN ('MaxOut', 'ForceOff') THEN t.Total ELSE 0 END) / SUM(t.Total) AS Share
+        FROM t SEMI JOIN w ON t.DeviceId = w.DeviceId AND t.Phase = w.Phase
+        GROUP BY 1, 2, 3
+        HAVING SUM(t.Total) > 0
+    """, single_thread=True, t=terminations, w=wanted)
+    hourly['Hour'] = pd.to_datetime(hourly['Hour'])
+    hourly['Phase'] = hourly['Phase'].astype('int64')
+    groups = {key: frame for key, frame in hourly.groupby(['DeviceId', 'Phase'])}
+    totals = {}
+    for index, row in days.iterrows():
+        mine = groups.get((row['DeviceId'], int(row['Phase'])))
+        day = pd.Timestamp(row['Date']).normalize()
+        total = 0.0
+        if mine is not None:
+            before = mine[mine['Hour'] < day]
+            usual = before.groupby(before['Hour'].dt.hour)['Share'].mean()
+            today = mine[(mine['Hour'] >= day) & (mine['Hour'] < day + pd.Timedelta(days=1))]
+            shares = dict(zip(today['Hour'].dt.hour, today['Share']))
+            for hour in range(24):
+                normal = usual.get(hour, 0.0)
+                total = max(0.0, total + shares.get(hour, normal) - normal - drain_per_hour)
+        totals[index] = total
+    return pd.Series(totals, dtype='float64')
+
+
+def drain_maxout_alerts(alerts: pd.DataFrame, terminations: TableLike, drain_per_hour: float, threshold: float,
+                        recency_days: int = None) -> pd.DataFrame:
+    """alert()'s max-out result without the flagged days whose running total had drained to threshold or less by the day's
+    end, and without the phases left with no recent flagged day. Adds MaxOutEndTotal on the flagged days."""
+    if alerts.empty:
+        return alerts
+    recency_days = DEFAULT_ALERT_RECENCY_DAYS if recency_days is None else recency_days
+    alerts = alerts.copy()
+    flagged = alerts[(alerts['Alert'] == 1) & (alerts['days_from_max'] <= recency_days)]
+    totals = maxout_end_of_day_totals(flagged, terminations, drain_per_hour)
+    alerts['MaxOutEndTotal'] = totals.reindex(alerts.index)
+    drained = totals.index[totals <= threshold]
+    alerts.loc[drained, 'Alert'] = 0
+    recent = alerts[(alerts['Alert'] == 1) & (alerts['days_from_max'] <= recency_days)][['DeviceId', 'Phase']].drop_duplicates()
+    return alerts.merge(recent, on=['DeviceId', 'Phase'])
+
+
 # Days back from the newest data an alert may have occurred and still be
 # reported. 0 means it must have happened on the most recent day: an issue that
 # came and went earlier in the week is not a live problem.
 DEFAULT_ALERT_RECENCY_DAYS = 0
 
 
-def alert(table, maxout_thresholds: dict = None,
-          recency_days: int = DEFAULT_ALERT_RECENCY_DAYS):
-    """Generate alerts based on CUSUM analysis results.
+def alert(table: TableLike, maxout_thresholds: dict = None,
+          recency_days: int = DEFAULT_ALERT_RECENCY_DAYS) -> pd.DataFrame:
+    """Generate alerts based on CUSUM analysis results (the output of cusum()).
 
     maxout_thresholds overrides MAXOUT_ALERT_DEFAULTS for phase terminations; the
-    detector and missing-data conditions are unaffected. recency_days is how far
+    missing-data conditions are unaffected. recency_days is how far
     back from the newest data an alert may have occurred and still be reported.
+    Returns every row of each DeviceId (or DeviceId/Phase) that alerted recently
+    enough, with z_score, Alert (0/1) and days_from_max added.
     """
     limits = {**MAXOUT_ALERT_DEFAULTS, **(maxout_thresholds or {})}
+    table_columns = columns(table)
 
-    if 'Percent MaxOut' in table.columns:
-        cusum_column_name = 'CUSUM_Percent MaxOut'
-        column = 'Percent MaxOut'
-        group_column = 'Phase'
-    elif 'PercentAnomalous' in table.columns:
-        cusum_column_name = 'CUSUM_PercentAnomalous'
-        column = 'PercentAnomalous'
-        group_column = 'Detector'
-    elif 'MissingData' in table.columns:
-        cusum_column_name = 'CUSUM_MissingData'
-        column = 'MissingData'
-        group_column = None
+    if 'Percent MaxOut' in table_columns:
+        column, cusum_column_name, groups = 'Percent MaxOut', 'CUSUM_Percent MaxOut', ['DeviceId', 'Phase']
+        condition = ("({cusum} > $cusum) AND (Services > $min_services) "
+                     "AND ((({col} - _Average) / _StdDev) > $zscore) AND ({col} > $percent)")
+        params = {
+            'cusum': limits['maxout_cusum_threshold'],
+            'min_services': limits['maxout_min_services'],
+            'zscore': limits['maxout_zscore_threshold'],
+            'percent': limits['maxout_percent_threshold'],
+        }
+    elif 'MissingData' in table_columns:
+        column, cusum_column_name, groups = 'MissingData', 'CUSUM_MissingData', ['DeviceId']
+        condition = ("({cusum} > 0.1) AND ((({col} - _Average) / _StdDev) > 3) "
+                     "AND ({col} > 0.05)")
+        params = {}
     else:
         raise ValueError("Unknown data format for alert generation")
 
-    # Add z-score column
-    result = table.mutate(
-        z_score=(table[column] - table['_Average']) / table['_StdDev']
-    )
+    col, cusum_col = quote(column), quote(cusum_column_name)
+    condition = condition.format(cusum=cusum_col, col=col)
+    keys = ', '.join(groups)
+    on = ' AND '.join(f'r.{g} = a.{g}' for g in groups)
+    params['recency_days'] = recency_days
 
-    if 'Percent MaxOut' in table.columns:
-        # Include Services in alert conditions for Percent MaxOut
-        result = result.mutate(
-            Alert=(
-                (result[cusum_column_name] > limits['maxout_cusum_threshold']) &
-                (result['Services'] > limits['maxout_min_services']) &
-                (result['z_score'] > limits['maxout_zscore_threshold']) &
-                (result[column] > limits['maxout_percent_threshold'])
-            ).cast('int32')  # Convert boolean to 0/1
+    result = run_sql(f"""
+        WITH r AS (
+            SELECT *,
+                ({col} - _Average) / _StdDev AS z_score,
+                CAST({condition} AS INTEGER) AS Alert,
+                ABS(DATE_DIFF('day', _MaxDate, Date)) AS days_from_max
+            FROM t
         )
-    elif 'PercentAnomalous' in table.columns:
-        # Alert condition for PercentAnomalous
-        result = result.mutate(
-            Alert=(
-                (result[cusum_column_name] > 0.20) &
-                (result['z_score'] > 3.5) &
-                (result[column] > 0.10)
-            ).cast('int32')  # Convert boolean to 0/1
-        )
+        SELECT r.*
+        FROM r
+        SEMI JOIN (
+            SELECT DISTINCT {keys} FROM r WHERE Alert = 1 AND days_from_max <= $recency_days
+        ) AS a ON {on}
+        ORDER BY {', '.join('r.' + g for g in groups)}, r.Date
+    """, params=params, single_thread=True, t=table)
+    for date_column in ('Date', '_MinDate', '_MaxDate'):
+        result[date_column] = result[date_column].astype('datetime64[us]')
+    # Alert is 0/1; a NULL comparison (no spread to score against) counts as no alert.
+    if result['Alert'].isna().any():
+        result['Alert'] = result['Alert'].astype('float64')
     else:
-        # Alert condition for MissingData
-        result = result.mutate(
-            Alert=(
-                (result[cusum_column_name] > 0.1) &
-                (result['z_score'] > 3) &
-                (result[column] > 0.05) 
-            ).cast('int32')  # Convert boolean to 0/1
-        )
-
-    # Calculate days from max date for each row
-    result = result.mutate(
-        days_from_max=result['Date'].delta(result['_MaxDate'], unit='days').abs(),
-    )
-
-    # Find DeviceId/Group pairs that alerted recently enough to report
-    if group_column:
-        alert_pairs = (
-            result.filter(
-                (result['Alert'] == 1) &
-                (result['days_from_max'] <= recency_days)
-            )
-            .select('DeviceId', group_column)
-            .distinct()
-        )
-
-        # Join back to get all records for these DeviceId/Group pairs
-        final_result = result.semi_join(
-            alert_pairs,
-            ['DeviceId', group_column]
-        )
-    else:
-        # For missing data (no group_column)
-        alert_devices = (
-            result.filter(
-                (result['Alert'] == 1) &
-                (result['days_from_max'] <= recency_days)
-            )
-            .select('DeviceId')
-            .distinct()
-        )
-
-        # Join back to get all records for these DeviceId
-        final_result = result.semi_join(
-            alert_devices,
-            ['DeviceId']
-        )
-
-    return final_result
+        result['Alert'] = result['Alert'].astype('int32')
+    return result

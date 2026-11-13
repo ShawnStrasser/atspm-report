@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
-import duckdb
 import pandas as pd
-import ibis.expr.types as ir
+from .phase_conflict_processing import run_conflict_queries, validate_timeline
+
+if TYPE_CHECKING:
+    import duckdb
 
 
 OVERLAP_DUAL_INDICATION_COLUMNS = [
@@ -20,28 +22,11 @@ OVERLAP_DUAL_INDICATION_COLUMNS = [
 ]
 
 
+# Reads the clean indications phase_conflict_processing builds (valid intervals
+# overlapping no invalid interval of their signal).
 CONFLICT_SQL = """
-WITH invalid_intervals AS (
-    SELECT
-        CAST(DeviceId AS VARCHAR) AS DeviceId,
-        StartTime,
-        EndTime
-    FROM timeline
-    WHERE IsValid IS FALSE
-      AND StartTime IS NOT NULL
-      AND EndTime IS NOT NULL
-),
-clean_timeline AS (
-    SELECT candidate.*
-    FROM timeline AS candidate
-    WHERE candidate.IsValid IS TRUE
-      AND NOT EXISTS (
-          SELECT 1
-          FROM invalid_intervals AS invalid
-          WHERE invalid.DeviceId = CAST(candidate.DeviceId AS VARCHAR)
-            AND candidate.StartTime < invalid.EndTime
-            AND invalid.StartTime < candidate.EndTime
-      )
+WITH clean_timeline AS (
+    SELECT * FROM clean_indications
 ),
 phase_green AS (
     SELECT
@@ -89,70 +74,23 @@ def _empty_conflicts() -> pd.DataFrame:
     return pd.DataFrame(columns=OVERLAP_DUAL_INDICATION_COLUMNS)
 
 
-def _to_pandas(
-    data: Union[pd.DataFrame, "ir.Table", None],
-) -> Optional[pd.DataFrame]:
-    if data is None:
-        return None
-    if isinstance(data, pd.DataFrame):
-        return data
-    if isinstance(data, ir.Table):
-        return data.execute()
-    return None
-
-
-def process_overlap_dual_indications(
-    timeline: Union[pd.DataFrame, "ir.Table", None],
-    config: Optional[dict] = None,
-) -> pd.DataFrame:
-    """Return valid same-numbered phase-green/overlap-yellow-or-red conflicts."""
+def overlap_dual_indication_sql(config: Optional[dict] = None) -> Optional[str]:
+    """The overlap dual indication query for this config, None when the check is off."""
     config = config or {}
     if not bool(config.get("overlap_dual_indications_enabled", False)):
-        return _empty_conflicts()
-
+        return None
     phases = sorted({
         int(phase)
         for phase in config.get("overlap_dual_indication_phases", [])
         if pd.notna(phase) and int(phase) > 0
     })
     if not phases:
-        return _empty_conflicts()
+        return None
+    return CONFLICT_SQL.format(phase_numbers=", ".join(str(phase) for phase in phases))
 
-    df = _to_pandas(timeline)
-    if df is None or df.empty:
-        return _empty_conflicts()
 
-    required_cols = [
-        "DeviceId",
-        "StartTime",
-        "EndTime",
-        "IsValid",
-        "EventClass",
-        "EventValue",
-    ]
-    missing_cols = [column for column in required_cols if column not in df.columns]
-    if missing_cols:
-        raise ValueError(
-            "Missing required timeline column(s) for overlap dual indications: "
-            + ", ".join(missing_cols)
-        )
-
-    # DuckDB needs real timestamps for the interval arithmetic; callers may
-    # hand over strings (or Parquet-typed columns), so coerce here.
-    df = df.copy()
-    df["StartTime"] = pd.to_datetime(df["StartTime"], errors="coerce")
-    df["EndTime"] = pd.to_datetime(df["EndTime"], errors="coerce")
-
-    phase_numbers = ", ".join(str(phase) for phase in phases)
-    con = duckdb.connect()
-    try:
-        con.register("timeline", df)
-        conflicts = con.execute(
-            CONFLICT_SQL.format(phase_numbers=phase_numbers)
-        ).df()
-    finally:
-        con.close()
-
+def dual_indications_frame(conflicts: pd.DataFrame) -> pd.DataFrame:
+    """The query's rows as the report's overlap dual indication alerts."""
     if conflicts.empty:
         return _empty_conflicts()
 
@@ -164,3 +102,17 @@ def process_overlap_dual_indications(
     conflicts = conflicts[conflicts["DurationSeconds"] > 0].copy()
 
     return conflicts.reindex(columns=OVERLAP_DUAL_INDICATION_COLUMNS)
+
+
+def process_overlap_dual_indications(
+    timeline: Union[pd.DataFrame, "duckdb.DuckDBPyRelation", None],
+    config: Optional[dict] = None,
+) -> pd.DataFrame:
+    """Return valid same-numbered phase-green/overlap-yellow-or-red conflicts."""
+    sql = overlap_dual_indication_sql(config)
+    if sql is None:
+        return _empty_conflicts()
+    df = validate_timeline(timeline, " for overlap dual indications")
+    if df is None:
+        return _empty_conflicts()
+    return dual_indications_frame(run_conflict_queries(df, {"dual": sql})["dual"])
