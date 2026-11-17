@@ -115,6 +115,20 @@ from .signal_focus import (
     collect_problems,
     hidden_signals,
 )
+from .coordination_check import (
+    ALERT_TYPE as COORDINATION,
+    CONFIDENCE_HIGH,
+    COORDINATION_HISTORY_DAYS,
+    build_coordination_alerts,
+    listed_alerts,
+    create_coordination_plots,
+)
+from . import measure_inputs
+from .measure_checks import (
+    DELAY_RISE, PLATOON_TREND, SPLIT_FAIL_TREND, delay_rise_alerts, trend_alerts,
+    STEP_LOOKBACK_DAYS as DELAY_RISE_LOOKBACK_DAYS,
+)
+from . import timing_checks
 from .utils import log_message
 from . import duckdb_utils
 from .duckdb_utils import TableLike, run_sql
@@ -401,6 +415,13 @@ ALERT_CONFIG = {
         'id_cols': ['DeviceId', 'DetectorType', 'Detector', 'Issue'],
         'file_suffix': 'atspm_detector_health_alerts',
     },
+    # Coordination plans set wrong (Cause 'Schedule') and controller clocks off (Cause 'Clock'), see coordination_check.
+    COORDINATION: {'id_cols': ['DeviceId', 'Cause'], 'file_suffix': 'coordination_alerts'},
+    # Checks on atspm's per-phase measures (measure_checks, timing_checks), each behind its own switch, off by default.
+    DELAY_RISE: {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'delay_rise_alerts'},
+    SPLIT_FAIL_TREND: {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'split_failure_trend_alerts'},
+    PLATOON_TREND: {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'platoon_ratio_trend_alerts'},
+    timing_checks.ALERT_TYPE: {'id_cols': timing_checks.ID_COLUMNS, 'file_suffix': 'phase_timing_alerts'},
 }
 
 # A detector's usual count needs this many samples of a typical quarter hour before a sparkline shows it.
@@ -498,6 +519,9 @@ class ReportGenerator:
             - same_movement_color_conflicts_enabled (bool): Enable same phase/overlap multi-color checks. Default: False
             - signal_focus_signals (int): At most this many signals in each report's Signal Focus section, which then leave
               its other tables and charts; 0 leaves the section out. Default: 3
+            - signal_focus_related_only (bool): A signal's problems must belong together (share a phase, such as a
+              detector fault and max outs on its phase, or a flash alarm and a conflict) and reach the score by
+              themselves, unless there are 3 or more different kinds of them. False: any problems in two areas. Default: True
             - signal_focus_charts_per_signal (int): At most this many charts each, in the order of the signal's table; a row whose chart falls past the limit says No chart. Default: 10
             - table_row_limits (dict): Table -> its own row limit instead of max_table_rows. Keys: 'detector_faults',
               'lane_closure', 'timing_plan', 'ped_faults', 'ped_setup', and 'ongoing' for every Ongoing table. Default: {}
@@ -505,6 +529,22 @@ class ReportGenerator:
               other phases) and add the Impact column; needs atspm_detector_config, terminations, phase_wait and has_data,
               and for all its measures pedestrian, atspm_ped_inputs, detector_usual_counts and coordination_agg. It never
               changes which detectors alert. Default: False
+            - coordination_clock_check_enabled (bool): Alert a signal whose clock is off against nearby signals' (its
+              emergency vehicle calls line up with theirs a fixed time apart, as after a missed clock change); reads
+              the stored preempt calls and needs Latitude/Longitude. Default: True
+            - coordination_plan_check_enabled (bool): Alert a signal that, on one kind of day, runs another plan, runs
+              free or changes plans at other hours than the coordinated signals around it; needs coordination_agg with
+              Pattern and CycleLength over six weeks and Latitude/Longitude. Default: False
+            - coordination_figures (int): Coordination alerts listed per region in a run, each with its chart; the
+              rest are listed on later runs. Default: 5
+            - delay_rise_check_enabled (bool): Alert a phase whose delay per vehicle rose suddenly against the same hours
+              of earlier days of the same kind (measure_checks); needs approach_delay and arrival_on_green over
+              measure_checks.STEP_LOOKBACK_DAYS. Default: False
+            - split_failure_trend_enabled / platoon_ratio_trend_enabled (bool): The max-out method on each phase's daily
+              split failures or platoon ratio (measure_checks); needs split_failures or platoon_ratio over
+              historical_window_days, and quietly does nothing before 18 days of them. Default: False
+            - split_failures_no_maxout_check_enabled (bool): Phases ending green too early: split failures without max
+              outs, from split_failures and terminations (timing_checks). Default: False
             - joke_index (int): Specific joke index. Default: None (auto-cycle by date)
             - custom_logo_path (str): Path to custom logo. Default: None (use ODOT logo)
         """
@@ -553,6 +593,7 @@ class ReportGenerator:
             'overlap_fixed_within_seconds': 2.0,
             'overlap_fixed_within_ratio': 0.95,
             'signal_focus_signals': 3,
+            'signal_focus_related_only': True,
             'signal_focus_charts_per_signal': 10,
             'table_row_limits': {},
             # Ranks the health tables by urgency. Off until approved.
@@ -574,6 +615,22 @@ class ReportGenerator:
             'preempt_false_calls_enabled': True,
             # Preempt alert charts per region (alerts and information each).
             'preempt_figures': 6,
+            # Controller clocks off against nearby signals, from the stored preempt calls: approved 2026-11-16.
+            'coordination_clock_check_enabled': True,
+            # Coordination plans set wrong against the signal's group: needs coordination_agg with Pattern and
+            # CycleLength over COORDINATION_HISTORY_DAYS and signal coordinates. Off until approved.
+            'coordination_plan_check_enabled': False,
+            # Plan check: also judge signals that sit between two signals of a group while running none of its plans
+            # (free all day in the middle of a corridor). Off until reviewed.
+            'coordination_position_check_enabled': False,
+            # Coordination alerts listed per region in a run (new and ongoing each), every one with its chart; the
+            # rest wait for a later run and are not held back as told until they are listed.
+            'coordination_figures': 5,
+            # Checks on atspm's per-phase measures. Off until approved.
+            'delay_rise_check_enabled': False,
+            'split_failure_trend_enabled': False,
+            'platoon_ratio_trend_enabled': False,
+            **{switch: False for switch in timing_checks.CONFIG_SWITCHES.values()},
         }
         return {**defaults, **config}
     
@@ -600,6 +657,10 @@ class ReportGenerator:
         atspm_ped_inputs: Optional[pd.DataFrame] = None,
         detector_usual_counts: Optional[TableLike] = None,
         expected_data_end=None,
+        split_failures: Optional[TableLike] = None,
+        arrival_on_green: Optional[TableLike] = None,
+        platoon_ratio: Optional[TableLike] = None,
+        approach_delay: Optional[TableLike] = None,
     ) -> dict:
         """
         Generate reports from provided pandas DataFrames or DuckDB relations.
@@ -624,7 +685,9 @@ class ReportGenerator:
                 TimeStamp, DeviceId, Phase, AvgPhaseWait, MaxPhaseWait, TotalSkips
             coordination_agg: Coordination aggregation data with columns:
                 TimeStamp, DeviceId, ActualCycleLength
-                (15-minute bin aggregated data for cycle length plotting)
+                (15-minute bin aggregated data for cycle length plotting). The coordination plan check also needs
+                Pattern and CycleLength over six weeks (COORDINATION_HISTORY_DAYS); the phase skip charts then
+                draw only the span phase_wait covers.
             timeline: ATSPM timeline data with columns:
                 DeviceId, StartTime, EndTime, Duration, IsValid, EventClass, EventValue
                 Usually the report day alone. The latest day present is the report
@@ -690,11 +753,36 @@ class ReportGenerator:
                 weekend, clock, Total), the traffic weights of the detector triage; see
                 detector_triage.usual_detector_counts. Without it the triage reads them
                 off detector_counts, which only reach over the health window.
+            split_failures, arrival_on_green, platoon_ratio, approach_delay: atspm's
+                per-phase measures in 15-minute bins, each optional; a check or chart that
+                needs one is left out without it. A DuckDB relation is filtered to the
+                signals and days needed before anything is read, so weeks can be passed.
+                Hours whose zones had a known fault (health findings, timeline Stuck On
+                and Erratic, atspm_detector_minutes) are never used.
+                - split_failures: TimeStamp, DeviceId, Phase, Split_Failure (cycles
+                  failed), Cycles (cycles ended in the bin), Green_Occupancy and
+                  Red_Occupancy (0-1), from the stop-bar zones. The split failure trend
+                  (historical_window_days) and the phase timing checks (the report day and
+                  the two earlier days of its kind, up to three weeks back).
+                - arrival_on_green: TimeStamp, DeviceId, Phase, Total_Actuations (vehicles
+                  from the advance zones reaching the stop bar), Percent_AOG (0-1).
+                - approach_delay: TimeStamp, DeviceId, Phase, Delay_Seconds (measured),
+                  Queued_Delay_Seconds (estimated), seconds summed over the bin's vehicles.
+                  With arrival_on_green: delay per vehicle = (SUM(Delay_Seconds) +
+                  SUM(Queued_Delay_Seconds)) / SUM(Total_Actuations), bins joined first. Told
+                  in the detector triage's Impact (wait_days before its window), drawn on
+                  the coordination impact charts (as many days as given, three weeks is
+                  enough) and judged by the delay rise check (STEP_LOOKBACK_DAYS).
+                - platoon_ratio: TimeStamp, DeviceId, Phase, Total_Actuations,
+                  Green_Actuations, Green_Seconds (seconds of green in the bin); never
+                  averaged over bins: SUM(Green_Actuations) / SUM(Total_Actuations) /
+                  (SUM(Green_Seconds) / (bins x 900)). Supporting evidence of the delay
+                  rise check, and the platoon ratio trend (historical_window_days).
             past_alerts: Dict of alert_type -> DataFrame for suppression.
                 Keys: 'maxout', 'missing_data',
                       'phase_skips', 'clearance_intervals', 'overlap_dual_indications',
                       'general_phase_conflicts', 'overlap_conflicts', 'system_outages',
-                      'preempts', 'atspm_detector_health'
+                      'preempts', 'atspm_detector_health', 'coordination'
 
         Returns:
             dict with keys:
@@ -703,7 +791,7 @@ class ReportGenerator:
                     Keys: 'maxout', 'missing_data',
                           'phase_skips', 'clearance_intervals', 'overlap_dual_indications',
                           'general_phase_conflicts', 'overlap_conflicts', 'system_outages',
-                          'preempts', 'atspm_detector_health'
+                          'preempts', 'atspm_detector_health', 'coordination'
                 - 'ongoing_alerts': Dict[str, pd.DataFrame] - repeat alerts suppression
                     removed, carrying an OngoingSince column; empty unless
                     include_ongoing_issues is set
@@ -743,7 +831,10 @@ class ReportGenerator:
         ped_press_counts = _normalize_deviceid(ped_press_counts)
         atspm_ped_inputs = _normalize_deviceid(atspm_ped_inputs)
         detector_usual_counts = _normalize_deviceid(detector_usual_counts)
-        
+        split_failures, arrival_on_green, platoon_ratio, approach_delay = (
+            _normalize_deviceid(table) if measure_inputs.present(table) else None
+            for table in (split_failures, arrival_on_green, platoon_ratio, approach_delay))
+
         # Convert signals to pandas (needed for downstream operations)
         signals = _to_pandas(signals)
 
@@ -851,9 +942,14 @@ class ReportGenerator:
         if not _is_empty(phase_wait):
             log_message("Processing phase wait data...", 1, verbosity)
             
+            phase_coordination = coordination_agg
+            if self.config['coordination_plan_check_enabled'] and not _is_empty(coordination_agg):
+                # The plan check reads weeks of coordination_agg; the cycle line under the phase waits covers their span.
+                phase_coordination = run_sql("SELECT * FROM c WHERE TimeStamp >= (SELECT min(TimeStamp) FROM w)",
+                                             c=coordination_agg, w=phase_wait)
             phase_skip_waits, phase_skip_alert_rows, cycle_length_data = process_phase_wait_data(
                 phase_wait,
-                coordination_agg
+                phase_coordination
             )
             
             # Convert to pandas for downstream processing
@@ -978,6 +1074,21 @@ class ReportGenerator:
             verbosity,
         )
 
+        # Coordination: clocks off against nearby signals (from the preempt calls above) and plans set wrong against
+        # the signal's group (from coordination_agg history), each behind its own switch.
+        new_alerts[COORDINATION] = pd.DataFrame()
+        plan_check = self.config['coordination_plan_check_enabled'] and not _is_empty(coordination_agg)
+        clock_check = self.config['coordination_clock_check_enabled']
+        if report_day is not None and (plan_check or clock_check):
+            log_message("Processing coordination plans and clocks...", 1, verbosity)
+            new_alerts[COORDINATION] = build_coordination_alerts(
+                signals, report_day,
+                coordination=coordination_agg if plan_check else None,
+                preempt_calls=updated_preempt_calls if clock_check else None,
+                plan_check=plan_check, clock_check=clock_check, verbosity=verbosity,
+                by_position=self.config['coordination_position_check_enabled'],
+            )['alerts']
+
         # The atspm-detector health check judged each detector and ped button before
         # it got here; this adds its minutes to the running totals, picks the ones
         # to report and dates them to the report day.
@@ -985,6 +1096,13 @@ class ReportGenerator:
         updated_atspm_minutes = atspm_detector_minutes
         atspm_info = atspm_detector_info(atspm_detector_config)
         silent_phases = pd.DataFrame()
+        # No measure from a detector while it is faulting: when each phase's stop-bar and advance zones had a known fault.
+        measure_faults = None
+        if any(table is not None for table in (split_failures, arrival_on_green, platoon_ratio, approach_delay)):
+            measure_faults = measure_inputs.fault_spans(
+                trim_findings_to_stop(_to_pandas(atspm_detector_findings), data_stopped_at)
+                if atspm_detector_findings is not None else None,
+                atspm_info, timeline, atspm_detector_minutes)
         if atspm_detector_findings is not None:
             log_message("Processing atspm-detector health...", 1, verbosity)
             atspm_detector_findings = trim_findings_to_stop(_to_pandas(atspm_detector_findings), data_stopped_at)
@@ -1009,7 +1127,8 @@ class ReportGenerator:
                     baseline_days=max(self.config['historical_window_days'] - 3, 0),
                     wait_days=max(self.config['phase_skip_retention_days'] - 3, 0),
                     pedestrian=pedestrian, ped_inputs=_to_pandas(atspm_ped_inputs), usual_counts=usual,
-                    coordination=coordination_agg,
+                    coordination=coordination_agg, approach_delay=approach_delay, arrival_on_green=arrival_on_green,
+                    measure_faults=measure_faults,
                 )
                 atspm_alerts = attach_triage(atspm_alerts, triage_rows)
                 silent_phases = silent_ped_phases(pedestrian, terminations, has_data, atspm_alerts['Date'].max())
@@ -1021,6 +1140,30 @@ class ReportGenerator:
             )
         else:
             new_alerts[ATSPM_DETECTOR_HEALTH] = pd.DataFrame()
+
+        # Checks on atspm's per-phase measures, each behind its own switch; none takes part in Signal Focus.
+        measure_devices = signals['DeviceId'].astype(str).unique().tolist()
+        for alert_type in (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND, timing_checks.ALERT_TYPE):
+            new_alerts[alert_type] = pd.DataFrame()
+        if report_day is not None:
+            if self.config['delay_rise_check_enabled'] and approach_delay is not None and arrival_on_green is not None:
+                log_message("Checking for sudden rises in delay per vehicle...", 1, verbosity)
+                new_alerts[DELAY_RISE] = delay_rise_alerts(approach_delay, arrival_on_green, report_day, measure_faults,
+                                                           platoon_ratio, devices=measure_devices)
+            for alert_type, switch, table in ((SPLIT_FAIL_TREND, 'split_failure_trend_enabled', split_failures),
+                                              (PLATOON_TREND, 'platoon_ratio_trend_enabled', platoon_ratio)):
+                if self.config[switch] and table is not None:
+                    log_message(f"Checking {alert_type.replace('_', ' ')}s...", 1, verbosity)
+                    new_alerts[alert_type] = trend_alerts(alert_type, table, report_day, measure_faults,
+                                                          history_days=self.config['historical_window_days'],
+                                                          recency_days=self.config['alert_recency_days'],
+                                                          devices=measure_devices)
+            timing = {check for check, switch in timing_checks.CONFIG_SWITCHES.items() if self.config[switch]}
+            if timing and split_failures is not None and not _is_empty(terminations):
+                log_message("Checking phase timing from split failures and max outs...", 1, verbosity)
+                new_alerts[timing_checks.ALERT_TYPE] = timing_checks.build_timing_alerts(
+                    split_failures, terminations, phase_wait, coordination_agg, measure_faults, report_day, timing,
+                    signals=signals)
 
         # The overlap dual indication and signal conflict checks read the report
         # day's clean indications, which are built once for all of them. The dual
@@ -1141,9 +1284,20 @@ class ReportGenerator:
         # so they are tracked separately from whether the report displays them.
         # History is written from both, never from the wider working frames.
         if self.config['include_ongoing_issues']:
-            ongoing_alerts = suppressed_alerts
+            ongoing_alerts = dict(suppressed_alerts)
+            # A coordination alert stays on the Ongoing list only at high confidence; the others were told once.
+            held = ongoing_alerts.get(COORDINATION)
+            if held is not None and not held.empty and 'Confidence' in held.columns:
+                ongoing_alerts[COORDINATION] = listed_alerts(held[held['Confidence'] == CONFIDENCE_HIGH], signals,
+                                                             self.config['coordination_figures'])
         else:
             ongoing_alerts = {alert_type: pd.DataFrame() for alert_type in ALERT_CONFIG}
+
+        # Coordination alerts: a few per region each run, every one with its chart. The ones left over are not in
+        # final_alerts, so they are not filed as told and come up on the next run.
+        if final_alerts.get(COORDINATION) is not None and not final_alerts[COORDINATION].empty:
+            final_alerts[COORDINATION] = listed_alerts(final_alerts[COORDINATION], signals,
+                                                       self.config['coordination_figures'])
 
         # Signal Focus: each report's worst signals across the checks, which then leave its other tables and charts.
         signal_focus = {}
@@ -1165,7 +1319,8 @@ class ReportGenerator:
             problems, problem_information = collect_problems(
                 final_alerts, suppressed_alerts, alarm_alerts, atspm_info, self.config['phase_skip_retention_days'],
                 detector_counts=focus_counts, signal_phases=runs)
-            signal_focus = build_signal_focus(problems, signals, problem_information, self.config['signal_focus_signals'])
+            signal_focus = build_signal_focus(problems, signals, problem_information, self.config['signal_focus_signals'],
+                                              related_only=self.config['signal_focus_related_only'])
         focus_hidden = hidden_signals(signal_focus)
 
         # Generate visualizations
@@ -1200,6 +1355,17 @@ class ReportGenerator:
         ongoing_preempt_figures = self._create_preempt_figures(
             ongoing_alerts['preempts'], updated_preempt_calls, updated_preempt_history, signals, exclude=focus_hidden
         )
+        coordination_frames = [final_alerts.get(COORDINATION), ongoing_alerts.get(COORDINATION)]
+        near = (self._clock_neighbours(coordination_frames, signals)
+                if approach_delay is not None and arrival_on_green is not None else None)
+        impact_hourly = self._impact_measures(coordination_frames, signals, approach_delay, arrival_on_green, measure_faults,
+                                              report_day, near)
+        coordination_figures = self._coordination_figures(final_alerts.get(COORDINATION), signals, impact_hourly, near)
+        ongoing_coordination_figures = self._coordination_figures(ongoing_alerts.get(COORDINATION), signals, impact_hourly, near)
+        timing_figures = timing_checks.create_timing_plots(
+            final_alerts.get(timing_checks.ALERT_TYPE), signals, num_figures)
+        ongoing_timing_figures = timing_checks.create_timing_plots(
+            ongoing_alerts.get(timing_checks.ALERT_TYPE), signals, num_figures)
 
         # Detector health (atspm-detector): one chart per signal phase for the faults, the lane
         # closures and the timing plans, from the 15-minute actuations in
@@ -1347,6 +1513,13 @@ class ReportGenerator:
             data_stopped_at=data_stopped_at,
             missing_data_hourly=missing_hourly,
             system_outages_hourly=hourly_data.get('outage_hourly'),
+            coordination_alerts_df=final_alerts.get(COORDINATION),
+            coordination_figures=coordination_figures,
+            ongoing_coordination_figures=ongoing_coordination_figures,
+            measure_alerts={alert_type: final_alerts.get(alert_type) for alert_type in
+                            (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND, timing_checks.ALERT_TYPE)},
+            timing_figures=timing_figures,
+            ongoing_timing_figures=ongoing_timing_figures,
         )
         
         # Update and save past alerts with retention
@@ -1400,6 +1573,68 @@ class ReportGenerator:
             'hourly_data': hourly_data
         }
     
+    @staticmethod
+    def _impact_group(alert, near: pd.DataFrame) -> list:
+        """The signals an impact chart compares with: a Schedule alert's group, a Clock alert's neighbours (near: the
+        signal pairs within the clock check's distance)."""
+        group = alert.get('Group')
+        if isinstance(group, (list, tuple, np.ndarray)) and len(group):
+            return [str(member) for member in group]
+        if near is None or near.empty:
+            return []
+        return near.loc[near['DeviceId'].astype(str) == str(alert['DeviceId']), 'NextDeviceId'].astype(str).tolist()
+
+    @staticmethod
+    def _clock_neighbours(frames, signals) -> Optional[pd.DataFrame]:
+        """The signal pairs within the clock check's distance, once per report, when a Clock alert needs them."""
+        if not any(frame is not None and not frame.empty and (frame['Cause'] == 'Clock').any() for frame in frames):
+            return None
+        from .coordination_check import CLOCK_MAX_MILES
+        from .preempt_cascade import signal_neighbours
+        return signal_neighbours(signals, CLOCK_MAX_MILES)
+
+    def _impact_measures(self, frames, signals, approach_delay, arrival_on_green, faults, report_day, near=None):
+        """Hourly arrivals and delay of the coordination alerts' signals and their groups, faulting hours left out; None
+        without the tables or alerts."""
+        alerts = [frame for frame in frames if frame is not None and not frame.empty]
+        if not alerts or approach_delay is None or arrival_on_green is None or report_day is None:
+            return None
+        devices = set()
+        for frame in alerts:
+            for _, alert in frame.iterrows():
+                devices.add(str(alert['DeviceId']))
+                devices.update(self._impact_group(alert, near))
+        start, end = measure_inputs.chart_window(report_day, COORDINATION_HISTORY_DAYS)
+        hourly = measure_inputs.hourly_delay(approach_delay, arrival_on_green, start, end, sorted(devices))
+        return measure_inputs.unmasked(hourly, faults, measure_inputs.ADVANCE)
+
+    def _coordination_figures(self, alerts, signals, hourly, near=None) -> list:
+        """create_coordination_plots, with each alert's impact chart (create_coordination_impact_chart) right after its
+        own chart where there is one."""
+        # The alerts were cut to the ones listed (listed_alerts); each of them is drawn, in every report it is in.
+        limit = len(alerts) if alerts is not None else 0
+        if hourly is None or alerts is None or alerts.empty or signals is None:
+            return create_coordination_plots(alerts, signals, limit)
+        from .coordination_check import create_coordination_impact_chart, in_report_order
+        measures = {'hourly': hourly, 'signals': signals}
+        drawn = {}
+        for idx, alert in alerts.iterrows():
+            own = create_coordination_plots(alerts.loc[[idx]], signals, 1)
+            impact = create_coordination_impact_chart(alert, self._impact_group(alert, near), alert.get('Runs'),
+                                                      alert.get('Matched'), measures)
+            figures = ([own[0][0]] if own else []) + ([impact] if impact is not None else [])
+            if figures:
+                drawn[idx] = figures
+        # The order and limits of create_coordination_plots, per report.
+        info = signals.assign(DeviceId=signals['DeviceId'].astype(str)).drop_duplicates('DeviceId').set_index('DeviceId')
+        ordered = in_report_order(alerts, info['Name'])
+        regions = ordered['DeviceId'].astype(str).map(info['Region'])
+        out = []
+        for scope in ['All Regions'] + sorted(regions.dropna().unique().tolist()):
+            chosen = ordered.index if scope == 'All Regions' else ordered.index[regions == scope]
+            out += [(figure, scope) for idx in list(chosen)[:limit] if idx in drawn for figure in drawn[idx]]
+        return out
+
     def _summarize_phase_skip_alerts(self, alert_rows_all: pd.DataFrame, threshold: int) -> tuple:
         """Aggregate alert rows by device/phase and flag those exceeding the skip threshold."""
         PHASE_SKIP_SUMMARY_COLUMNS = ['DeviceId', 'Phase', 'AggregatedSkips', 'LatestDate']
@@ -1441,7 +1676,8 @@ class ReportGenerator:
         First one overview (focus_overview): the faults of its detectors and buttons over the max outs, waits and greens of the
         phases its table names, against their normal range, with its skips, preempt calls and hours without data, all on the days
         its detector charts cover. Then the detector charts, the phases hurt first (none when every detector was down at once: the
-        overview shows that), and its ped buttons' chart. Conflicts, clearance and alarms have no chart.
+        overview shows that), the preempt section's charts of its preempt alerts, and its ped buttons' chart. Conflicts,
+        clearance and alarms have no chart.
         """
         per_signal = self.config['signal_focus_charts_per_signal']
         wanted = {}
@@ -1575,6 +1811,11 @@ class ReportGenerator:
             if together:
                 harm_faults = other_faults = faults.iloc[0:0]
             add(detector_charts(harm_faults), FOCUS_CHART_DETECTOR, 7.5 * inch, None)
+            if FOCUS_PREEMPT in types:
+                # The preempt section's own charts (calls a day over the call lengths), which the signal has left.
+                drawn = self._create_preempt_figures(rows_of('preempts', device), preempt_calls, preempt_history, one)
+                add(unique(created for section in PREEMPT_SECTIONS for created in drawn.get(section, [])), FOCUS_CHART_PREEMPT,
+                    6.5 * inch, None)
             if not buttons.empty and ped_presses is not None:
                 presses = _window_counts(ped_presses, [device], *window)
                 add(unique(create_atspm_detector_health_plots(buttons, one, 1, presses, window=window, kind='ped', max_drawn=12,

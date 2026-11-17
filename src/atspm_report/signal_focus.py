@@ -6,6 +6,10 @@ each in a two-column table, problem type and problems, followed by its charts in
 every other table and chart of that report. Fewer is good: a signal has to reach MIN_SCORE, which is set for one to three
 signals a day over all regions, and many days no signal in a region does.
 
+Its problems must also belong together (see related): a group of them that share a phase, such as a detector fault and max
+outs on its phase, has to span more than one area and reach MIN_SCORE by itself. Problems that only happen at the same signal,
+such as a detector fault and a preempt input, bring it here only when there are MIN_TYPES or more different kinds of them.
+
 The table holds measured facts only: no causes, no advice. A problem with no chart says so in its row.
 
 The score, from new alerts only: for each area the signal has a problem in, its severity plus AREA_POINTS, plus LINK_POINTS for a
@@ -70,6 +74,12 @@ MAX_HURT_PHASE_POINTS = 2
 # 12 November 2026: one or two signals over all regions on an ordinary day, eight on a morning when whole approaches' detectors
 # stuck on at many signals at once (each report still lists its top three).
 MIN_SCORE = 7.0
+# Problems at one signal that have nothing to do with each other (a detector fault on one phase and a preempt input) bring it
+# here only when there are this many different kinds of them; fewer have to belong together (see related).
+MIN_TYPES = 3
+# A detector or button fault belongs with max outs, skips or another fault on a phase they share.
+FAULT_CATEGORIES = frozenset({DETECTORS, PED_CATEGORY})
+PHASE_CATEGORIES = frozenset({MAX_OUTS, SKIPS})
 # What an area's score is worth by how many days before the most recent day of data its latest new problem was; older still counts the last.
 RECENCY_WEIGHTS = (1.0, 0.5, 0.25)
 # The table's rows, and so the charts' order, with Missing data always last.
@@ -90,9 +100,9 @@ ALL_DOWN_MINUTES = 30
 CHART_DETECTOR, CHART_MAX_OUT, CHART_WAIT, CHART_GREEN, CHART_SKIPS, CHART_PREEMPT, CHART_PED, CHART_MISSING = (
     'detector', 'max out', 'wait', 'green', 'skips', 'preempt', 'ped', 'missing')
 # A measured rise its chart shows, in words without the numbers the chart gives.
-RISE_WORDS = {CHART_WAIT: 'Wait rose on {}', CHART_MAX_OUT: 'Max-outs rose on {}'}
+RISE_WORDS = {CHART_WAIT: 'Phase wait rose on {}', CHART_MAX_OUT: 'Max-outs rose on {}'}
 
-PROBLEM_COLUMNS = ['DeviceId', 'Category', 'Points', 'Links', 'Items', 'Lines', 'Harm', 'Phases', 'New', 'LastDay']
+PROBLEM_COLUMNS = ['DeviceId', 'Category', 'Points', 'Links', 'Items', 'Lines', 'Harm', 'Phases', 'New', 'LastDay', 'OnPhases']
 FOCUS_COLUMNS = ['Rank', 'DeviceId', 'Signal', 'Region', 'Score', 'Categories', 'Items', 'Rows', 'HasOngoing', 'Charts']
 
 
@@ -146,10 +156,23 @@ def _last_day(group):
     return max(days) if days else pd.NaT
 
 
-def _problem(device, category, severity, items, lines, group, links=0.0, harm=None, phases=None):
+def _problem(device, category, severity, items, lines, group, links=0.0, harm=None, phases=None, on=None):
+    """on: the phases the problem is on (its detectors' and buttons' phases and the phases they hurt, the phases that max out
+    or skip), so problems that share one can be told apart from problems that only happen at the same signal."""
     held = group['_held'].astype(bool) if '_held' in group else pd.Series(False, index=group.index)
     return {'DeviceId': device, 'Category': category, 'Points': float(severity), 'Links': float(links), 'Items': int(items), 'Lines': lines,
-            'Harm': harm or [], 'Phases': phases or {}, 'New': bool((~held).any()), 'LastDay': _last_day(group)}
+            'Harm': harm or [], 'Phases': phases or {}, 'New': bool((~held).any()), 'LastDay': _last_day(group),
+            'OnPhases': sorted({int(phase) for phase in (() if on is None else on) if pd.notna(phase) and int(phase) > 0})}
+
+
+def _phases_of(rows, urgent=None, phases: dict = None) -> set:
+    """The phases of these fault rows, the phases the urgent ones were measured to hurt, and those their charts name."""
+    found = set(pd.to_numeric(rows['Phase'], errors='coerce').dropna().astype(int)) if 'Phase' in rows else set()
+    if urgent is not None and not urgent.empty:
+        found |= {int(phase) for text in urgent['HurtPhases'].dropna() for phase in str(text).split(',') if phase.strip().lstrip('-').isdigit()}
+    for named in (phases or {}).values():
+        found |= {int(phase) for phase in named}
+    return found
 
 
 def _faults(frame, info):
@@ -354,7 +377,8 @@ def _detector_problems(faults, info=None, counts=None, runs=None, told: set = No
         points = SEVERITY[severity]
         hurt = {phase for text in urgent['HurtPhases'].dropna() for phase in str(text).split(',') if phase}
         points += min(max(len(hurt) - 1, 0), MAX_HURT_PHASE_POINTS)
-        problems.append(_problem(device, DETECTORS, points, group['Detector'].nunique(), lines, group, harm=harm, phases=phases))
+        problems.append(_problem(device, DETECTORS, points, group['Detector'].nunique(), lines, group, harm=harm, phases=phases,
+                                 on=_phases_of(group, urgent, phases)))
     return problems
 
 
@@ -382,7 +406,7 @@ def _max_out_problems(frame, faults) -> list:
             lines.append(_line(f"Ph{int(row['Phase'])} reached {row['Percent MaxOut']:.0%} on {_date(row['Date'])}", CHART_MAX_OUT, rows))
             linked = linked or _linked(faults, device, row['Phase'], MAX_OUT_CAUSES)
         problems.append(_problem(device, MAX_OUTS, SEVERITY[MAX_OUTS], len(worst), lines, group, links=LINK_POINTS if linked else 0.0,
-                                 phases={CHART_MAX_OUT: {int(phase) for phase in worst['Phase']}}))
+                                 phases={CHART_MAX_OUT: {int(phase) for phase in worst['Phase']}}, on=worst['Phase']))
     return problems
 
 
@@ -400,7 +424,7 @@ def _skip_problems(frame, faults, retention_days) -> list:
             lines.append(_line(f"Ph{int(row['Phase'])} skipped {count} {'time' if count == 1 else 'times'} in {retention_days} days", CHART_SKIPS, rows))
             linked = linked or _linked(faults, device, row['Phase'], SKIP_CAUSES)
         problems.append(_problem(device, SKIPS, SEVERITY[SKIPS if frequent else 'skips rare'], len(worst), lines, group,
-                                 links=LINK_POINTS if linked else 0.0))
+                                 links=LINK_POINTS if linked else 0.0, on=worst['Phase']))
     return problems
 
 
@@ -433,7 +457,7 @@ def _ped_problems(faults, runs=None, told: set = None) -> list:
         hurt = {phase for text in urgent['HurtPhases'].dropna() for phase in str(text).split(',') if phase}
         points = SEVERITY[severity] + min(max(len(hurt) - 1, 0), MAX_HURT_PHASE_POINTS)
         problems.append(_problem(device, PED_CATEGORY, points, pressed['Detector'].nunique(), lines, pressed,
-                                 harm=harm, phases=phases))
+                                 harm=harm, phases=phases, on=_phases_of(pressed, urgent, phases)))
     return problems
 
 
@@ -615,12 +639,13 @@ def collect_problems(new_alerts: dict, held_back: dict = None, alarms: pd.DataFr
     new_alarms = alarms[alarms['TotalCount'] <= alarms['DayCount']] if alarms is not None and not alarms.empty else None
     counted = pd.DataFrame(_collect(new_alerts, None, new_alarms, info, skip_retention_days, detector_counts, signal_phases),
                            columns=PROBLEM_COLUMNS)
-    points = counted.set_index(['DeviceId', 'Category'])[['Points', 'Links', 'Items', 'LastDay']]
+    points = counted.set_index(['DeviceId', 'Category'])[['Points', 'Links', 'Items', 'LastDay', 'OnPhases']]
     keys = pd.MultiIndex.from_frame(told[['DeviceId', 'Category']])
     told['Points'] = points['Points'].reindex(keys).fillna(0.0).values
     told['Links'] = points['Links'].reindex(keys).fillna(0.0).values
     told['_items_new'] = points['Items'].reindex(keys).fillna(0).astype(int).values
     told['LastDay'] = pd.to_datetime(points['LastDay'].reindex(keys)).values
+    told['OnPhases'] = [phases if isinstance(phases, list) else [] for phases in points['OnPhases'].reindex(keys)]
     health = _combined(new_alerts, held_back, ALERT_TYPE)
     return told, _information(health)
 
@@ -639,11 +664,53 @@ def _recency(last_days: pd.Series) -> pd.Series:
     return age.map(lambda value: RECENCY_WEIGHTS[value])
 
 
-def rank_signals(problems: pd.DataFrame, min_score: float = MIN_SCORE) -> pd.DataFrame:
-    """One row per signal with new problems in more than one area that reaches min_score, worst first: DeviceId, Score, Categories, Items.
+def related(first, second) -> bool:
+    """Whether two of a signal's problems (rows of the problems frame) plausibly belong together: a detector or button fault
+    and max outs, skips or another detector or button fault on a phase they share (the fault's own phase or one it was
+    measured to hurt), or a flash alarm and a conflict. A preempt, clearance, other alarms and missing data belong with none."""
+    pair = {first['Category'], second['Category']}
+    if pair == {ALARMS, CONFLICTS}:
+        alarm = first if first['Category'] == ALARMS else second
+        return float(alarm['Links']) > 0
+    faults = [problem for problem in (first, second) if problem['Category'] in FAULT_CATEGORIES]
+    if not faults or not pair <= FAULT_CATEGORIES | PHASE_CATEGORIES:
+        return False
+    on = lambda problem: set(problem.get('OnPhases') or ())
+    return bool(on(first) & on(second))
 
-    Missing data is never one of those areas. A detector or button fault measured to affect operations (see detector_triage)
-    counts as two: the detection, and the operations."""
+
+def _qualifies(rows: pd.DataFrame, min_score: float) -> bool:
+    """A signal's new problems qualify when a group of them that belong together (see related) spans more than one area and
+    reaches min_score by itself, or when they are of MIN_TYPES or more different kinds and reach it together. A fault measured
+    to affect operations is two areas that belong together on its own."""
+    if rows['Category'].nunique() >= MIN_TYPES and round(rows['_worth'].sum(), 1) >= min_score:
+        return True
+    records = rows.to_dict('records')
+    group = list(range(len(records)))
+
+    def root(index):
+        while group[index] != index:
+            index = group[index]
+        return index
+
+    for one in range(len(records)):
+        for other in range(one + 1, len(records)):
+            if related(records[one], records[other]):
+                group[root(other)] = root(one)
+    totals = {}
+    for index, record in enumerate(records):
+        areas, worth = totals.get(root(index), (0, 0.0))
+        totals[root(index)] = (areas + 1 + int(record['_harm']), worth + record['_worth'])
+    return any(areas > 1 and round(worth, 1) >= min_score for areas, worth in totals.values())
+
+
+def rank_signals(problems: pd.DataFrame, min_score: float = MIN_SCORE, related_only: bool = True) -> pd.DataFrame:
+    """One row per signal whose new problems qualify (see _qualifies), worst first: DeviceId, Score, Categories, Items. The score
+    is that of all its new problems.
+
+    Missing data is never one of the problems. A detector or button fault measured to affect operations (see detector_triage)
+    counts as two areas: the detection, and the operations. related_only False: any new problems in more than one area that
+    reach min_score together, related or not."""
     columns = ['DeviceId', 'Score', 'Categories', 'Items']
     if problems is None or problems.empty:
         return pd.DataFrame(columns=columns)
@@ -653,11 +720,17 @@ def rank_signals(problems: pd.DataFrame, min_score: float = MIN_SCORE) -> pd.Dat
     # A fault measured to affect operations is a problem in two areas: the detection, and how the signal ran.
     harm = new['Harm'].map(lambda lines: len(lines) > 0) if 'Harm' in new else pd.Series(False, index=new.index)
     worth = (_severity(new) + AREA_POINTS * (1 + harm.astype(int)) + new['Links']) * _recency(problems['LastDay']).reindex(new.index)
-    table = new.assign(_worth=worth, _harm=harm).groupby('DeviceId', as_index=False).agg(
+    scored = new.assign(_worth=worth, _harm=harm)
+    if 'OnPhases' not in scored:
+        scored['OnPhases'] = [[] for _ in range(len(scored))]
+    table = scored.groupby('DeviceId', as_index=False).agg(
         Worth=('_worth', 'sum'), Categories=('Category', 'nunique'), Items=('Items', 'sum'), Harm=('_harm', 'max'))
     table['Categories'] = table['Categories'] + table['Harm'].astype(int)
     table['Score'] = table['Worth'].round(1)
     table = table[(table['Categories'] > 1) & (table['Score'] >= min_score)]
+    if related_only and not table.empty:
+        keep = {device for device, rows in scored[scored['DeviceId'].isin(table['DeviceId'])].groupby('DeviceId') if _qualifies(rows, min_score)}
+        table = table[table['DeviceId'].isin(keep)]
     return table.sort_values(['Score', 'Categories', 'Items', 'DeviceId'], ascending=[False, False, False, True])[columns].reset_index(drop=True)
 
 
@@ -680,11 +753,11 @@ def _signal_rows(problems: pd.DataFrame, information: list = None) -> tuple:
 
 
 def build_signal_focus(problems: pd.DataFrame, signals: pd.DataFrame, information: dict = None, top_signals: int = 3,
-                       min_score: float = MIN_SCORE) -> dict:
-    """{report: rows}: each report's own worst signals (FOCUS_COLUMNS), per region and 'All Regions'."""
+                       min_score: float = MIN_SCORE, related_only: bool = True) -> dict:
+    """{report: rows}: each report's own worst signals (FOCUS_COLUMNS), per region and 'All Regions'. related_only: see rank_signals."""
     if top_signals <= 0 or problems is None or problems.empty:
         return {}
-    table = rank_signals(problems, min_score)
+    table = rank_signals(problems, min_score, related_only)
     names = signals[['DeviceId', 'Name', 'Region']].assign(DeviceId=signals['DeviceId'].astype(str)).drop_duplicates('DeviceId')
     table = table.merge(names, on='DeviceId', how='inner')
     focus = {}

@@ -31,8 +31,10 @@ SOLO_SHARE), and otherwise on all its hours.
 
 This changes the order and the Impact text. It never changes which detectors alert.
 
-Measured: greens, walks, presses, max outs and wait during the fault hours. Inferred: that the detector caused the change, and
-the vehicle-hours, which multiply a per-service wait by rough detector counts.
+Measured: greens, walks, presses, max outs and phase wait (the time from a phase's call to its green) during the fault hours.
+Inferred: that the detector caused the change. Phase wait is a measure of the phases, not of how long each vehicle was held, so
+the text says phase wait; the 'vehicle-hours' (ExtraVehHoursPerDay: the rise times rough detector counts) are a weight for the
+threshold and the order, never told as a delay.
 """
 
 from typing import Optional
@@ -476,8 +478,49 @@ def _phase_list(items: list) -> str:
     return f"{shown} and {len(items) - NAMED_PHASES} more" if len(items) > NAMED_PHASES else shown
 
 
-def _impact_text(row: pd.Series, phases: pd.DataFrame) -> tuple:
-    """(what the fault did, naming its phases; the phases measured to be hurt)."""
+def _phase_wait_words(row: pd.Series, over: str, named: list) -> str:
+    """The rise in phase wait (the time from a phase's call to its green), averaged over the phases by their traffic: 'Phase
+    wait on other phases up 20 s on average over 4 h: Ph4 20 to 40 s'. It is a measure of the phases, not of how long each
+    vehicle was held; where vehicle delay was measured, _delay_words tells that instead."""
+    whose = 'its phases' if row['SignalWide'] else 'other phases'
+    return f"Phase wait on {whose} up {row['OtherWaitUp']:.0f} s on average {over}: {_phase_list(named)}"
+
+
+# Delay per vehicle in the wording (approach_delay and arrival_on_green): a harmed phase's delay is told in place of its
+# phase wait when it had DELAY_MIN_VEHICLES_PER_HOUR arrivals an hour or more through the fault, on DELAY_MIN_COVER of the
+# fault's bins, against MIN_NORMAL_DAYS normal days. Never for a phase one of whose advance zones is the faulty detector
+# (the delay is measured by it), nor in bins whose advance zones had a fault. It changes the words and the number shown,
+# never the tier: harm is still judged on phase wait. When delay did not rise by DELAY_MIN_RISE_SECONDS on average the
+# phase-wait wording stays, as the measure the harm was judged on.
+DELAY_MIN_VEHICLES_PER_HOUR = 30.0
+DELAY_MIN_COVER = 0.8
+DELAY_MIN_RISE_SECONDS = 1.0
+
+
+def _delay_words(row: pd.Series, over: str, waits: pd.DataFrame, delay: dict) -> Optional[str]:
+    """'Delay per vehicle on other phases up 8 s on average over 4 h: Ph4 10 to 18 s', with the named phases that have no
+    delay told by their phase wait after it; None when no named phase has a usable delay, or it did not rise."""
+    usable = [p for p in waits.itertuples() if int(p.Phase) in delay]
+    if not usable:
+        return None
+    vehicles = sum(delay[int(p.Phase)]['veh'] for p in usable)
+    rise = sum(delay[int(p.Phase)]['veh'] * (delay[int(p.Phase)]['dpv'] - delay[int(p.Phase)]['dpv_n']) for p in usable) / vehicles
+    if rise < DELAY_MIN_RISE_SECONDS:
+        return None
+    whose = 'its phases' if row['SignalWide'] else 'other phases'
+    # As with the waits, the phases named are the ones whose delay rose; the average is over all of them.
+    named = [f"Ph{int(p.Phase)} {delay[int(p.Phase)]['dpv_n']:.0f} to {delay[int(p.Phase)]['dpv']:.0f} s" for p in usable
+             if delay[int(p.Phase)]['dpv'] - delay[int(p.Phase)]['dpv_n'] >= DELAY_MIN_RISE_SECONDS]
+    text = f"Delay per vehicle on {whose} up {rise:.0f} s on average {over}: {_phase_list(named)}"
+    rest = [f"Ph{int(p.Phase)} {p.wait_n:.0f} to {p.wait:.0f} s" for p in waits.itertuples() if int(p.Phase) not in delay]
+    if rest:
+        text += f"; phase wait {_phase_list(rest)}"
+    return text
+
+
+def _impact_text(row: pd.Series, phases: pd.DataFrame, delay: Optional[dict] = None) -> tuple:
+    """(what the fault did, naming its phases; the phases measured to be hurt). delay: {phase: dpv_n, dpv, veh} of the
+    phases with a usable delay per vehicle (_delays), told in place of their phase wait."""
     hours = row['FaultHours']
     over = f"over {hours * 60:.0f} min" if hours < 1 else f"over {round(hours * 2) / 2:g} h"
     tier = row['Tier']
@@ -497,8 +540,8 @@ def _impact_text(row: pd.Series, phases: pd.DataFrame) -> tuple:
         waits = phases[(phases['wait'] - phases['wait_n'] >= NAMED_WAIT_SECONDS) & phases['veh_w'].gt(0)].sort_values('extra_veh_s', ascending=False)
         if row['WaitHarm']:
             named = [f"Ph{int(p.Phase)} {p.wait_n:.0f} to {p.wait:.0f} s" for p in waits.itertuples()]
-            subject = 'Its phases wait' if row['SignalWide'] else 'Other phases wait'
-            parts.append(f"{subject} longer {over}, {row['OtherWaitUp']:.0f} s a vehicle on average: {_phase_list(named)}")
+            told = _delay_words(row, over, waits, delay) if delay else None
+            parts.append(told if told is not None else _phase_wait_words(row, over, named))
             hurt += waits['Phase'].astype(int).tolist()
         if row['MaxOutHarm']:
             served = phases[phases['services'] > 0].assign(
@@ -540,7 +583,7 @@ def _impact_facts(row: pd.Series, phases: pd.DataFrame) -> list:
     if row['WaitHarm']:
         waits = phases[(phases['wait'] - phases['wait_n'] >= NAMED_WAIT_SECONDS) & phases['veh_w'].gt(0)].sort_values('extra_veh_s', ascending=False)
         named = ', '.join(f"Ph{int(p.Phase)} {p.wait_n:.0f} to {p.wait:.0f} s" for p in waits.itertuples())
-        facts.append({'text': f"Wait, normal to {during}: {named}", 'chart': 'wait', 'phases': waits['Phase'].astype(int).tolist()})
+        facts.append({'text': f"Phase wait, normal to {during}: {named}", 'chart': 'wait', 'phases': waits['Phase'].astype(int).tolist()})
     if row['MaxOutHarm']:
         served = phases[phases['services'] > 0].assign(
             pct_n=lambda t: 100.0 * t['maxouts_n'] / t['services'], pct=lambda t: 100.0 * t['maxouts'] / t['services'])
@@ -656,16 +699,108 @@ def _tiers(rows: pd.DataFrame, phases: pd.DataFrame, days: float, daily: pd.Data
     return pd.DataFrame(records)
 
 
+def _harmed_waits(phases: pd.DataFrame) -> pd.DataFrame:
+    """The phases _impact_text names for a wait harm, in its order."""
+    return phases[(phases['wait'] - phases['wait_n'] >= NAMED_WAIT_SECONDS) & phases['veh_w'].gt(0)].sort_values('extra_veh_s', ascending=False)
+
+
+def _delays(con, wanted: pd.DataFrame, approach_delay, arrival_on_green, faults, wait_start, window_start, window_end) -> pd.DataFrame:
+    """Delay per vehicle of the wanted (rid, Phase) over the row's judged bins (dpv, veh) and the median of its normal days in the
+    same clock bins (dpv_n), as the phase wait is compared: rid, Phase, dpv, dpv_n, veh, hours, cover, ndays. Bins whose
+    advance zones had a fault are left out."""
+    from . import measure_inputs as mi
+    con.register('wanted_in', wanted)
+    devices = [row[0] for row in con.execute(
+        "SELECT DISTINCT m.DeviceId FROM fr r JOIN dmap m USING (did) WHERE r.rid IN (SELECT rid FROM wanted_in)").fetchall()]
+    start = pd.Timestamp(wait_start)
+    bins = mi.rows(arrival_on_green, 'DeviceId, Phase, TimeStamp, Total_Actuations', start, window_end, devices).merge(
+        mi.rows(approach_delay, 'DeviceId, Phase, TimeStamp, Delay_Seconds, Queued_Delay_Seconds', start, window_end, devices),
+        on=['DeviceId', 'Phase', 'TimeStamp'])
+    bins = pd.DataFrame({'DeviceId': bins['DeviceId'].astype(str), 'Phase': bins['Phase'].astype('int64'),
+                         'ts': pd.to_datetime(bins['TimeStamp']).astype('datetime64[us]'),
+                         'dsum': (bins['Delay_Seconds'] + bins['Queued_Delay_Seconds']).astype(float),
+                         'veh': bins['Total_Actuations'].astype(float)})
+    bins = mi.unmasked(bins, faults, mi.ADVANCE, '15 MINUTE', 'ts')
+    con.register('dl_in', bins)
+    return con.execute(f"""
+        WITH d AS (SELECT m.did, dl.Phase, dl.ts, cast(dl.ts AS DATE) AS dy, cast(dl.ts AS TIME) AS clock, isodow(dl.ts) >= 6 AS wk,
+                          dl.dsum, dl.veh FROM dl_in dl JOIN dmap m USING (DeviceId)),
+        fbins AS (SELECT rid, fday, count(*) AS nb FROM ep WHERE rid IN (SELECT rid FROM wanted_in) GROUP BY ALL),
+        per AS (SELECT e.rid, e.fday, w.Phase, d.dy, count(*) AS nb, sum(d.dsum) AS ds, sum(d.veh) AS v
+                FROM ep e JOIN wanted_in w USING (rid)
+                JOIN d ON d.did = e.did AND d.Phase = w.Phase AND d.clock = e.clock AND d.wk = e.wk
+                ANTI JOIN ex x ON x.rid = e.rid AND x.ts = d.ts AND d.dy <> e.fday
+                GROUP BY ALL),
+        n AS (SELECT p.rid, p.fday, p.Phase, median(p.ds / p.v) AS dpv_n, count(*) AS nd
+              FROM per p JOIN fbins f USING (rid, fday)
+              WHERE p.dy <> p.fday AND p.dy >= DATE '{wait_start}' AND p.nb >= {MIN_NORMAL_COVER} * f.nb AND p.v > 0
+              GROUP BY ALL HAVING count(*) >= {MIN_NORMAL_DAYS}),
+        t AS (SELECT rid, sum(nb) AS nb FROM fbins GROUP BY 1)
+        SELECT p.rid, p.Phase, sum(p.ds) / nullif(sum(p.v), 0) AS dpv, sum(p.v * n.dpv_n) / nullif(sum(p.v), 0) AS dpv_n,
+               sum(p.v) AS veh, any_value(t.nb) / 4.0 AS hours, sum(p.nb) / any_value(t.nb) AS cover, min(n.nd) AS ndays
+        FROM per p JOIN n USING (rid, fday, Phase) JOIN t USING (rid)
+        WHERE p.dy = p.fday GROUP BY p.rid, p.Phase""").df()
+
+
+def _retell_with_delay(con, ranked: pd.DataFrame, phases: pd.DataFrame, days: float, approach_delay, arrival_on_green, faults,
+                       wait_start, window_start, window_end, notes: Optional[list]) -> pd.DataFrame:
+    """ranked with the ImpactText of its wait-harm rows told as delay per vehicle where it was measured (see _delay_words)."""
+    if approach_delay is None or arrival_on_green is None or ranked.empty:
+        return ranked
+    harmed = ranked[(ranked['Tier'] == OTHER_PHASES) & ranked['WaitHarm'].astype(bool)]
+    if harmed.empty:
+        return ranked
+    phases_of = dict(tuple(phases.groupby('rid')))
+    judged = {row['rid']: _harmed_waits(_own_phase(row, phases_of.get(row['rid'], phases.head(0)), days)['judged'])
+              .astype({'Phase': 'int64'})
+              for row in harmed.to_dict('records')}
+    # Never a phase one of whose advance zones is a faulty detector of the event (the delay is measured by it).
+    own_advance = con.execute("""SELECT DISTINCT j.rid, m.Phase FROM judged j JOIN judged g ON g.grp = j.grp
+                                 JOIN fr m ON m.rid = g.rid WHERE m.Function = 'Advance' AND m.Phase IS NOT NULL""").df()
+    blocked = set(zip(own_advance['rid'].astype(int), own_advance['Phase'].astype(int)))
+    wanted = pd.DataFrame([(rid, int(p)) for rid, w in judged.items() for p in w['Phase'] if (int(rid), int(p)) not in blocked],
+                          columns=['rid', 'Phase']).astype('int64')
+    found = _delays(con, wanted, approach_delay, arrival_on_green, faults, wait_start, window_start, window_end) \
+        if not wanted.empty else pd.DataFrame(columns=['rid', 'Phase', 'dpv', 'dpv_n', 'veh', 'hours', 'cover', 'ndays'])
+    usable = found[(found['veh'] >= DELAY_MIN_VEHICLES_PER_HOUR * found['hours']) & (found['cover'] >= DELAY_MIN_COVER)
+                   & found['dpv'].notna() & found['dpv_n'].notna()]
+    ranked = ranked.copy()
+    # For review only: the phases with any delay measured at all in the days compared (else no advance zones there).
+    measured = set()
+    if notes is not None and not wanted.empty:
+        measured = {(str(d), int(p)) for d, p in con.execute("SELECT DISTINCT DeviceId, Phase FROM dl_in").fetchall()}
+    for idx, row in harmed.iterrows():
+        mine = usable[usable['rid'] == row['rid']]
+        delay = {int(r.Phase): {'dpv': float(r.dpv), 'dpv_n': float(r.dpv_n), 'veh': float(r.veh)} for r in mine.itertuples()}
+        text, _ = _impact_text(row, _own_phase(row.to_dict(), phases_of.get(row['rid'], phases.head(0)), days)['judged'], delay)
+        ranked.at[idx, 'ImpactText'] = text
+        if notes is not None:
+            seen = set(found.loc[found['rid'] == row['rid'], 'Phase'].astype(int))
+            told_delay = text.startswith('Delay per vehicle') or '. Delay per vehicle' in text
+            for p in judged[row['rid']]['Phase'].astype(int):
+                how = ('delay' if p in delay and told_delay else 'delay did not rise' if p in delay
+                       else 'its advance zone is the faulty detector' if (int(row['rid']), p) in blocked
+                       else 'too few arrivals or normal days' if p in seen
+                       else 'fewer than 3 normal days with delay' if (str(row['DeviceId']), p) in measured
+                       else 'no delay measured (no advance zone)')
+                notes.append((row['DeviceId'], row['Detector'], p, how))
+    return ranked
+
+
 def rank_detectors(findings: pd.DataFrame, detectors: pd.DataFrame, terminations: TableLike, phase_wait: TableLike,
                    has_data: TableLike, report_day, days: int = 3, baseline_days: int = 18, wait_days: int = 11,
                    pedestrian: TableLike = None, ped_inputs: pd.DataFrame = None, usual_counts: pd.DataFrame = None,
-                   coordination: TableLike = None) -> pd.DataFrame:
+                   coordination: TableLike = None, approach_delay: TableLike = None, arrival_on_green: TableLike = None,
+                   measure_faults: pd.DataFrame = None, delay_notes: Optional[list] = None) -> pd.DataFrame:
     """One row per flagged detector or ped button at its most urgent fault, most urgent first (RANK_COLUMNS).
 
     findings: the health findings of the window. detectors: detector_info() rows (DeviceId, Detector, Phase, Function).
     terminations, phase_wait, has_data, pedestrian (PedServices, PedActuation) and coordination (CycleLength): the report's
     15-minute inputs, reaching baseline_days and wait_days before the window. ped_inputs: DeviceId, Input, Phase, the phase each
     button calls. usual_counts: usual_detector_counts(), the traffic weights; without it no harm to other phases can be measured.
+    approach_delay and arrival_on_green (atspm's tables, optional): the harm to other phases is then told as delay per vehicle
+    where it was measured (_delay_words); measure_faults: measure_inputs.fault_spans(), the bins whose advance zones it leaves out.
+    delay_notes: a list to which each harmed phase's (DeviceId, Detector, Phase, how it was told) is added, for review.
     """
     empty = pd.DataFrame(columns=RANK_COLUMNS)
     if findings is None or findings.empty or detectors is None or detectors.empty:
@@ -700,11 +835,14 @@ def rank_detectors(findings: pd.DataFrame, detectors: pd.DataFrame, terminations
                               FROM fr r JOIN judged j USING (rid) LEFT JOIN own_c c USING (rid) WHERE r.rid IN (SELECT rid FROM fb)""").df()
         phases = con.execute("SELECT * FROM pr_flag").df()
         daily = con.execute("SELECT * FROM days").df()
+        if rows.empty:
+            return empty
+        ranked = _tiers(rows, phases, float(days), daily, window_start)
+        # The tiers are fixed: delay per vehicle only changes the words of the rows with harm to other phases' waits.
+        ranked = _retell_with_delay(con, ranked, phases, float(days), approach_delay, arrival_on_green, measure_faults, wait_start,
+                                    window_start, window_end, delay_notes)
     finally:
         con.close()
-    if rows.empty:
-        return empty
-    ranked = _tiers(rows, phases, float(days), daily, window_start)
     ranked['KindOrder'] = ranked['Kind'].map(KIND_ORDER)
     urgent = ranked['Tier'].isin((SERVICE_LOST, OTHER_PHASES))
     how_much = ranked['Lost'].where(ranked['Tier'] == SERVICE_LOST, ranked['ExtraVehHoursPerDay']).fillna(0.0).where(urgent, 0.0)

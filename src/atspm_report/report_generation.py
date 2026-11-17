@@ -33,7 +33,14 @@ from .table_generation import (
 )
 from .atspm_detector_health import ALERT_TYPE as ATSPM_DETECTOR_HEALTH, FAULT_STATUSES, PED, VEHICLE
 from .preempt_cascade import SECTION_EV, SECTION_RAIL, SECTION_TSP
+from .coordination_check import (
+    ALERT_TYPE as COORDINATION_ALERT_TYPE,
+    CHART_HEIGHT_INCHES as COORDINATION_CHART_INCHES,
+    SECTION_TITLE as COORDINATION_TITLE,
+    prepare_coordination_table,
+)
 from .signal_focus import SECTION_TITLE as SIGNAL_FOCUS_TITLE
+from . import measure_checks, timing_checks
 from .utils import log_message
 
 # Repeat alerts are normally held back so they do not crowd out new ones. When the
@@ -47,6 +54,27 @@ ONGOING_TITLE = 'Ongoing Issues'
 # drawn at close to print width so the text keeps its size.
 PREEMPT_CHART_HEIGHT = None
 HEADING_ROOM = 2.0*inch
+COORDINATION_CHART_HEIGHT = COORDINATION_CHART_INCHES*inch
+TIMING_CHART_HEIGHT = timing_checks.CHART_HEIGHT_INCHES*inch
+
+
+def _measure_sections(alerts, ongoing, signals_df, region, max_rows, ongoing_limit, figures, ongoing_figures) -> list:
+    """(title, rows, total, ongoing rows, ongoing total, charts, ongoing charts) of each section of the checks on atspm's
+    per-phase measures, in report order: the phase timing section, then the delay rise and the two trends."""
+    alerts, ongoing = alerts or {}, ongoing or {}
+    sections = []
+    for check in timing_checks.SECTION_TITLES:
+        rows, total = timing_checks.prepare_timing_table(alerts.get(timing_checks.ALERT_TYPE), signals_df, region, max_rows, check)
+        later, total_later = timing_checks.prepare_timing_table(ongoing.get(timing_checks.ALERT_TYPE), signals_df, region,
+                                                                ongoing_limit, check)
+        sections.append((timing_checks.SECTION_TITLES[check], rows, total, later, total_later,
+                         [fig for fig, reg in timing_checks.section_figures(figures or [], check) if reg == region],
+                         [fig for fig, reg in timing_checks.section_figures(ongoing_figures or [], check) if reg == region]))
+    for alert_type in (measure_checks.DELAY_RISE, measure_checks.SPLIT_FAIL_TREND, measure_checks.PLATOON_TREND):
+        rows, total = measure_checks.prepare_measure_table(alerts.get(alert_type), signals_df, region, max_rows)
+        later, total_later = measure_checks.prepare_measure_table(ongoing.get(alert_type), signals_df, region, ongoing_limit)
+        sections.append((measure_checks.SECTION_TITLES[alert_type], rows, total, later, total_later, [], []))
+    return sections
 
 
 def _preempt_rows(alerts: Optional[pd.DataFrame], signals_df, region, max_rows, section=None):
@@ -116,7 +144,9 @@ def _chart_flowables(figures: list, height: float = 2.8*inch, width: float = 6.5
     """Lay out alert charts one per row, each kept whole on a single page."""
     elements = []
     for figure in figures:
-        elements.append(KeepTogether([MatplotlibFigure(figure, width=width, height=height)]))
+        # A chart of another shape among them (a coordination impact chart) keeps its own proportions.
+        own = getattr(figure, 'report_own_proportions', False)
+        elements.append(KeepTogether([MatplotlibFigure(figure, width=width, height=None if own else height)]))
         elements.append(Spacer(1, 0.15*inch))
     return elements
 
@@ -502,6 +532,12 @@ def generate_pdf_report(
         data_stopped_at=None,
         missing_data_hourly: Optional[pd.DataFrame] = None,
         system_outages_hourly: Optional[pd.DataFrame] = None,
+        coordination_alerts_df: Optional[pd.DataFrame] = None,
+        coordination_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        ongoing_coordination_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        measure_alerts: Optional[Dict[str, pd.DataFrame]] = None,
+        timing_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        ongoing_timing_figures: Optional[List[tuple[plt.Figure, str]]] = None,
 ) -> Dict[str, BytesIO]:
     """Generate PDF reports for each region with the plots.
     
@@ -554,6 +590,14 @@ def generate_pdf_report(
         missing_data_hourly: Share of missing records per device and hour (DeviceId, TimeStamp, MissingData), which puts
             the missing data tables by hour; without it they name each signal's worst day
         system_outages_hourly: The same per region (Region, TimeStamp, MissingData), for the system outage tables
+        coordination_alerts_df: Coordination plan and clock alerts after suppression (see coordination_check); their
+            section lists every signal, Signal Focus ones included, as Signal Focus does not tell them
+        coordination_figures: (figure, region) charts of the new coordination alerts, one per alert
+        ongoing_coordination_figures: The same for the ongoing ones
+        measure_alerts: Alerts of the checks on atspm's per-phase measures after suppression, by alert type
+            (measure_checks: delay_rise, split_failure_trend, platoon_ratio_trend; timing_checks: phase_timing), each
+            in its own section after the coordination one; their held-back repeats come in ongoing_alerts
+        timing_figures / ongoing_timing_figures: (figure, region) charts of the phase timing alerts
 
     Returns:
         Dict mapping region name to BytesIO containing PDF bytes
@@ -606,6 +650,7 @@ def generate_pdf_report(
         same_movement_color_conflicts_df,
         preempt_alerts_df,
         atspm_detector_health_df,
+        coordination_alerts_df,
     ]:
         if conflict_df is not None and not conflict_df.empty and signals_df is not None:
             conflict_region_lookup = (
@@ -1297,6 +1342,48 @@ def generate_pdf_report(
                 chart_height=PREEMPT_CHART_HEIGHT,
             ))
 
+        # Section: Coordination Plans and Clocks. Signal Focus does not tell these, so its signals stay in.
+        coordination_rows, total_coordination = prepare_coordination_table(
+            coordination_alerts_df, all_signals_df, region, max_table_rows)
+        coordination_ongoing_rows, total_coordination_ongoing = prepare_coordination_table(
+            ongoing_alerts.get(COORDINATION_ALERT_TYPE), all_signals_df, region, ongoing_limit)
+        if not coordination_rows.empty:
+            content.append(Paragraph(COORDINATION_TITLE, styles['SectionHeading']))
+            content.append(Spacer(1, 0.1*inch))
+            content.extend(create_reportlab_table(coordination_rows, COORDINATION_TITLE, styles,
+                                                  total_count=total_coordination, max_rows=max_table_rows,
+                                                  include_trend=False))
+            content.append(Spacer(1, 0.3*inch))
+            content.extend(_chart_flowables(
+                [fig for fig, reg in (coordination_figures or []) if reg == region], COORDINATION_CHART_HEIGHT))
+        ongoing_content.extend(_ongoing_section(
+            COORDINATION_TITLE,
+            coordination_ongoing_rows,
+            total_coordination_ongoing,
+            styles,
+            max_table_rows,
+            figures=[fig for fig, reg in (ongoing_coordination_figures or []) if reg == region],
+            chart_height=COORDINATION_CHART_HEIGHT,
+        ))
+
+        # Sections: checks on atspm's per-phase measures (each off unless switched on). Signal Focus does not tell these.
+        measure_any = False
+        for title, rows, total, ongoing_rows, total_ongoing, figures, ongoing_figures in _measure_sections(
+                measure_alerts, ongoing_alerts, all_signals_df, region, max_table_rows, ongoing_limit,
+                timing_figures, ongoing_timing_figures):
+            if not rows.empty:
+                measure_any = True
+                content.append(Paragraph(title, styles['SectionHeading']))
+                content.append(Spacer(1, 0.1*inch))
+                content.extend(create_reportlab_table(rows, title, styles, total_count=total, max_rows=max_table_rows,
+                                                      include_trend=False))
+                content.append(Spacer(1, 0.3*inch))
+                content.extend(_chart_flowables(figures, TIMING_CHART_HEIGHT))
+            if not ongoing_rows.empty:
+                measure_any = True
+            ongoing_content.extend(_ongoing_section(title, ongoing_rows, total_ongoing, styles, max_table_rows,
+                                                    figures=ongoing_figures, chart_height=TIMING_CHART_HEIGHT))
+
         # Section: Missing Data - Changed to a single header
         missing_trend_header = MISSING_HOURLY_HEADER if _has_rows(missing_data_hourly) else 'Missing (7d)'
         if _has_rows(ongoing_alerts.get('missing_data')) and region_signals_df is not None:
@@ -1393,6 +1480,9 @@ def generate_pdf_report(
             not region_general_phase_ongoing_rows.empty,
             not region_overlap_conflict_ongoing_rows.empty,
             region_preempt_ongoing_any,
+            not coordination_rows.empty,
+            not coordination_ongoing_rows.empty,
+            measure_any,
             not region_atspm_fault_ongoing_rows.empty,
             not region_ped_fault_ongoing_rows.empty,
             not region_system_outages_ongoing_rows.empty,

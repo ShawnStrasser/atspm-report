@@ -344,6 +344,25 @@ def test_preempt_sections_come_after_detector_health_and_before_missing_data():
     assert [s[0] for s in report_generation.PREEMPT_SECTION_TEXT] == [SECTION_EV, SECTION_TSP, SECTION_RAIL]
 
 
+def test_a_focus_signal_with_preempt_alerts_gets_the_preempt_section_s_chart():
+    end = pd.Timestamp.today().normalize()
+    calls, events = _mixed(end)
+    flash = pd.DataFrame([{'DeviceId': 'dev-a', 'StartTime': end + pd.Timedelta(hours=2), 'EndTime': end + pd.Timedelta(hours=2, minutes=5),
+                           'Duration': 300.0, 'IsValid': True, 'EventClass': 'MMU Flash', 'EventValue': 1}])
+    config = {'verbosity': 0, 'preempt_rail_numbers': RAIL, 'signal_focus_related_only': False}
+    with patch('atspm_report.generator.generate_pdf_report', return_value={}) as pdf:
+        result = ReportGenerator(config).generate(signals=SIGNALS, timeline=pd.concat([_timeline(calls), flash], ignore_index=True),
+                                                  preempt_events=events)
+    assert result['signal_focus']['All Regions']['DeviceId'].tolist() == ['dev-a']
+    told = pdf.call_args.kwargs
+    charts = told['signal_focus_figures']['dev-a']
+    preempt_charts = [figure for figure, _, _, kind in charts if kind == 'preempt']
+    # The calls-a-day and call-length chart of each preempt section with an alert, as drawn in that section, which the signal has left.
+    assert len(preempt_charts) == len({section for section in result['alerts']['preempts']['Class']}) >= 2
+    assert all(not figures for figures in told['preempt_figures'].values())
+    assert [kind for _, _, _, kind in charts].index('preempt') == 1      # after the overview, in the table's order
+
+
 def test_signal_focus_lines_name_the_kind_of_preempt():
     from atspm_report.signal_focus import _preempt_line
     ev = pd.Series({'Preempt': 1, 'Class': SECTION_EV, 'Direction': 'Increase', 'BaselinePerDay': 0.5, 'RecentPerDay': 6.0})

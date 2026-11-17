@@ -50,6 +50,11 @@ def conflict(device, m1=2, m2=5, seconds=1.5, at=None):
             'ConflictStart': at if at is not None else DAY + pd.Timedelta(hours=14, minutes=3), 'DurationSeconds': seconds, 'Date': DAY}
 
 
+def preempt(device, number=4, direction='False Calls'):
+    return {'DeviceId': device, 'Preempt': number, 'Class': 'Emergency Vehicle', 'Direction': direction, 'Score': 1.0, 'Date': DAY,
+            'Note': '8 of 10 calls in the last 7 days had the same duration, lasting about 5.2 s. This does not represent normal EVP calls.'}
+
+
 def missing(device, share=0.42):
     return {'DeviceId': device, 'Date': DAY, 'MissingData': share, 'Alert': 1}
 
@@ -63,7 +68,7 @@ def problems_of(held=None, alarms=None, **kinds):
 
 
 def scores(problems):
-    return rank_signals(problems, min_score=0.0).set_index('DeviceId')['Score'].to_dict()
+    return rank_signals(problems, min_score=0.0, related_only=False).set_index('DeviceId')['Score'].to_dict()
 
 
 def lines_of(problem) -> list:
@@ -119,7 +124,7 @@ def test_missing_data_never_counts_and_comes_last():
     both, _ = problems_of(general_phase_conflicts=[conflict('A')], maxout=[maxout('A', 2)], missing_data=[missing('A')])
     without, _ = problems_of(general_phase_conflicts=[conflict('A')], maxout=[maxout('A', 2)])
     assert scores(both) == scores(without)
-    row = build_signal_focus(both, SIGNALS)['All Regions'].iloc[0]
+    row = build_signal_focus(both, SIGNALS, related_only=False)['All Regions'].iloc[0]
     assert [told['type'] for told in row['Rows']][-1] == MISSING and ROW_ORDER[-1] == MISSING
 
 
@@ -159,6 +164,60 @@ def test_interrelated_problems_score_more():
     assert flash.set_index('Category').loc['Alarms', 'Links'] == 2
 
 
+def focus_of(problems) -> list:
+    return rank_signals(problems)['DeviceId'].tolist()
+
+
+def test_a_detector_fault_and_an_unrelated_preempt_are_not_enough():
+    # 07048 on 16 Nov 2026: det 5 (Ph2) with no daily pattern, and false calls on emergency vehicle preempt 4. Score 7, no link.
+    fault = health('A', 5, label='no daily pattern', fault_kind='No daily pattern')
+    problems, _ = problems_of(atspm_detector_health=[fault], preempts=[preempt('A')])
+    assert scores(problems) == {'A': 7.0} and focus_of(problems) == []
+    assert rank_signals(problems, related_only=False)['DeviceId'].tolist() == ['A']      # as before
+    # Three different kinds of problem are enough, related or not.
+    third, _ = problems_of(atspm_detector_health=[fault], preempts=[preempt('A')], clearance_intervals=[clearance('A', short=1, samples=900)])
+    assert focus_of(third) == ['A']
+
+
+def test_problems_on_a_shared_phase_belong_together():
+    # Det 5 is on Ph2, det 6 on Ph4 (INFO).
+    together, _ = problems_of(atspm_detector_health=[health('A', 5)], maxout=[maxout('A', 2)])
+    assert scores(together) == {'A': 7.0} and focus_of(together) == ['A']
+    apart, _ = problems_of(atspm_detector_health=[health('A', 6)], general_phase_conflicts=[conflict('A')])
+    assert scores(apart) == {'A': 8.0} and focus_of(apart) == []
+    # A phase the fault was measured to hurt counts as its phase: det 5 hurt Ph4, which skips.
+    hurt, _ = problems_of(atspm_detector_health=[health('A', 5, tier=OTHER_PHASES, hurt='4')], phase_skips=[skips('A', 4, 30)])
+    assert focus_of(hurt) == ['A']
+    # A ped button and skips of its phase.
+    ped, _ = problems_of(atspm_detector_health=[health('A', 3, kind='Ped', label='erratic', fault_kind='Ped erratic', TriagePhase=4.0)],
+                         phase_skips=[skips('A', 4, 30)])
+    assert focus_of(ped) == ['A']
+    # A flash alarm and a conflict; another alarm and a conflict do not.
+    flash = pd.DataFrame([{'DeviceId': 'A', 'AlarmType': 'MMU Flash', 'DayCount': 1, 'TotalCount': 1, 'Date': DAY}])
+    linked, _ = problems_of(alarms=flash, general_phase_conflicts=[conflict('A')])
+    unlinked, _ = problems_of(alarms=flash.assign(AlarmType='Power Failure'), general_phase_conflicts=[conflict('A')])
+    assert focus_of(linked) == ['A'] and scores(unlinked) == {'A': 9.0} and focus_of(unlinked) == []
+
+
+def test_the_related_problems_have_to_reach_the_score_themselves():
+    # Harm to one phase (5) with an unrelated preempt fault (5): 10 in all, but nothing that belongs together reaches 7.
+    problems, _ = problems_of(atspm_detector_health=[health('A', 5, tier=OTHER_PHASES)], preempts=[preempt('A', direction='Stuck On')])
+    assert scores(problems) == {'A': 10.0} and focus_of(problems) == []
+    # Harm to three or more phases still qualifies by itself, and an unrelated problem beside it does not take that away.
+    wide, _ = problems_of(atspm_detector_health=[health('A', 5, tier=OTHER_PHASES, hurt='1,3,4,8')], preempts=[preempt('A')])
+    assert focus_of(wide) == ['A'] and scores(wide) == {'A': 12.0}
+
+
+def test_relatedness_reads_only_what_the_problems_share():
+    from atspm_report.signal_focus import related
+    fault = {'Category': 'Detectors', 'OnPhases': [2], 'Links': 0.0}
+    assert related(fault, {'Category': 'Max outs', 'OnPhases': [2], 'Links': 0.0})
+    assert not related(fault, {'Category': 'Max outs', 'OnPhases': [6], 'Links': 0.0})
+    assert not related(fault, {'Category': 'Preempt', 'OnPhases': [2], 'Links': 0.0})
+    assert not related({'Category': 'Max outs', 'OnPhases': [2], 'Links': 0.0}, {'Category': 'Phase skips', 'OnPhases': [2], 'Links': 0.0})
+    assert not related({'Category': 'Clearance', 'OnPhases': [], 'Links': 0.0}, {'Category': 'Conflicts', 'OnPhases': [], 'Links': 0.0})
+
+
 def test_detector_severity_follows_the_urgency_tiers():
     def points(tier):
         problems, _ = problems_of(atspm_detector_health=[health('A', 5, tier=tier)])
@@ -190,7 +249,7 @@ def test_ongoing_does_not_count_but_is_told_once_selected():
     problems, _ = problems_of(held=dict(maxout=[{**maxout('A', 2), 'OngoingSince': since}]),
                               general_phase_conflicts=[conflict('A')], phase_skips=[skips('A', 4, 30)])
     assert scores(problems) == {'A': 5 + 1 + 3 + 1}      # the ongoing max outs add nothing
-    row = build_signal_focus(problems, SIGNALS)['All Regions'].iloc[0]
+    row = build_signal_focus(problems, SIGNALS, related_only=False)['All Regions'].iloc[0]
     assert table_of(row)['Max outs'] == ['Ongoing since 10/12: Ph2 reached 64% on 11/3'] and row['HasOngoing']
 
 
@@ -253,10 +312,10 @@ def test_a_conflict_or_two_keep_their_exact_times_more_are_counted():
 def test_each_report_takes_at_most_its_own_top_three():
     rows = [conflict(device) for device in 'ABCD']
     problems, _ = problems_of(general_phase_conflicts=rows, phase_skips=[skips(device, 2, 30) for device in 'ABCD'])
-    focus = build_signal_focus(problems, SIGNALS)
+    focus = build_signal_focus(problems, SIGNALS, related_only=False)
     assert sorted(focus) == ['All Regions', 'Region 1', 'Region 2']
     assert len(focus['All Regions']) == 3 and focus['Region 2']['DeviceId'].tolist() == ['C', 'D']
-    one = build_signal_focus(problems, SIGNALS, top_signals=1)
+    one = build_signal_focus(problems, SIGNALS, top_signals=1, related_only=False)
     assert hidden_signals(one) == {'All Regions': {'A'}, 'Region 1': {'A'}, 'Region 2': {'C'}}
     assert build_signal_focus(problems, SIGNALS, top_signals=0) == {}
 
@@ -292,7 +351,7 @@ def test_report_tells_a_focus_signal_only_in_the_section():
     alerts = pd.DataFrame([health('A', 5, tier=OTHER_PHASES), health('B', 1)]).drop(columns=['TriageRank', 'Tier'])
     alerts = alerts.assign(Tier=[OTHER_PHASES, DATA_ONLY])
     problems, information = collect_problems(frames(atspm_detector_health=alerts.to_dict('records'), general_phase_conflicts=[conflict('A')]), None, None, INFO)
-    focus = build_signal_focus(problems, SIGNALS, information)
+    focus = build_signal_focus(problems, SIGNALS, information, related_only=False)
     empty = pd.DataFrame()
     reports = generate_pdf_report(
         empty, empty, empty, [], [], signals_df=SIGNALS, verbosity=0,
@@ -338,7 +397,11 @@ def test_generate_builds_the_section_and_leaves_the_alerts_whole():
                               'IsValid': True, 'EventClass': 'MMU Flash', 'EventValue': 1}])
     findings = pd.DataFrame([{'DeviceId': device, 'DetectorType': 'Vehicle', 'Detector': 5, 'Start': DAY.replace(hour=1), 'End': DAY.replace(hour=8),
                               'Label': 'stuck on', 'Confidence': 0.9, 'Detail': 'x'} for device in 'AB'])
-    result = ReportGenerator({'verbosity': 0, 'alert_flagging_days': 3650}).generate(signals=SIGNALS, timeline=timeline, atspm_detector_findings=findings)
+    # A stuck detector and a flash alarm do not belong together: by default two such problems are not enough.
+    unrelated = ReportGenerator({'verbosity': 0, 'alert_flagging_days': 3650}).generate(signals=SIGNALS, timeline=timeline, atspm_detector_findings=findings)
+    assert unrelated['signal_focus']['All Regions'].empty
+    result = ReportGenerator({'verbosity': 0, 'alert_flagging_days': 3650, 'signal_focus_related_only': False}).generate(
+        signals=SIGNALS, timeline=timeline, atspm_detector_findings=findings)
     rows = result['signal_focus']['All Regions']
     assert rows['DeviceId'].tolist() == ['A'] and rows['Signal'].tolist() == ['Alpha']
     assert 'MMU Flash' in table_of(rows.iloc[0])['Alarms'][0]
@@ -495,17 +558,17 @@ def test_all_detectors_down_together_is_one_line_and_one_chart():
 
 
 def test_wait_and_max_out_rises_name_the_phases_only():
-    facts = ('[{"text": "Wait, normal to during the fault (3 h): Ph3 20 to 45 s, Ph2 30 to 41 s, Ph5 9 to 30 s", "chart": "wait", "phases": [3, 2, 5]},'
+    facts = ('[{"text": "Phase wait, normal to during the fault (3 h): Ph3 20 to 45 s, Ph2 30 to 41 s, Ph5 9 to 30 s", "chart": "wait", "phases": [3, 2, 5]},'
              ' {"text": "Max outs, normal to during the fault (3 h): Ph4 10% to 40%", "chart": "max out", "phases": [4]}]')
     problems, _ = problems_of(atspm_detector_health=[health('A', 5, tier=OTHER_PHASES, ImpactLines=facts)])
     harm = [line['text'] for line in problems.iloc[0]['Harm']]
-    assert harm[1:] == ['Wait rose on phases 2, 3 & 5', 'Max-outs rose on phase 4']
+    assert harm[1:] == ['Phase wait rose on phases 2, 3 & 5', 'Max-outs rose on phase 4']
 
 
 def test_a_rise_on_every_phase_the_signal_runs_reads_all_phases():
-    facts = '[{"text": "Wait, normal to during the fault (3 h): Ph2 20 to 45 s, Ph4 30 to 41 s, Ph6 9 to 30 s", "chart": "wait", "phases": [2, 4, 6]}]'
+    facts = '[{"text": "Phase wait, normal to during the fault (3 h): Ph2 20 to 45 s, Ph4 30 to 41 s, Ph6 9 to 30 s", "chart": "wait", "phases": [2, 4, 6]}]'
     alerts = frames(atspm_detector_health=[health('A', 5, tier=OTHER_PHASES, ImpactLines=facts)])
     every, _ = collect_problems(alerts, None, None, INFO, signal_phases={'A': [2, 4, 6]})
     some, _ = collect_problems(alerts, None, None, INFO, signal_phases={'A': [2, 4, 6, 8]})
-    assert every.iloc[0]['Harm'][1]['text'] == 'Wait rose on all phases'
-    assert some.iloc[0]['Harm'][1]['text'] == 'Wait rose on phases 2, 4 & 6'
+    assert every.iloc[0]['Harm'][1]['text'] == 'Phase wait rose on all phases'
+    assert some.iloc[0]['Harm'][1]['text'] == 'Phase wait rose on phases 2, 4 & 6'

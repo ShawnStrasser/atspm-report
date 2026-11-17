@@ -4,7 +4,7 @@ Top to bottom, only the parts a signal's table names:
 - Faults: one row per group of detectors or ped buttons with the same fault times (when every detector was down at once, one
   row for them all), stuck on in dark red, sending nothing in light red, any other fault in orange (a fault with no time of its
   own too, across its whole row).
-- Percent max out (up to 100%), average wait and greens of the phases the table names, hour by hour as a line through the middle
+- Percent max out (up to 100%), average phase wait and greens of the phases the table names, hour by hour as a line through the middle
   of each hour, over their normal range, smoothed. A long stretch with no wait measured while the signal sent data (no calls
   logged, as when every detector is down) says so.
 - Skips and preempt calls, as ticks; a row with none in these days says so, with the last one before them when known.
@@ -67,7 +67,7 @@ SMOOTH_HOURS = 3
 MIN_BLANK_HOURS = 3
 
 MAX_OUT, WAIT, GREEN = 'max out', 'wait', 'green'
-PANEL_TITLES = {MAX_OUT: 'Percent Max Out', WAIT: 'Average Wait', GREEN: 'Greens per Hour'}
+PANEL_TITLES = {MAX_OUT: 'Percent Max Out', WAIT: 'Average Phase Wait', GREEN: 'Greens per Hour'}
 # What a wait panel says over a stretch with no wait: wait runs from a call to its green.
 NO_WAIT = 'no wait measured: no calls logged'
 

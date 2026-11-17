@@ -170,7 +170,7 @@ def test_a_wait_panel_says_when_nothing_was_measured_outside_the_no_data_hours()
     hours = pd.date_range(DAY - pd.Timedelta(days=7), END + pd.Timedelta(days=1), freq='h', inclusive='left')
     series = pd.Series(30.0, index=hours)
     series[(series.index >= at('12:00'))] = np.nan     # no calls from noon on
-    panels = [{'kind': WAIT, 'title': 'Average Wait', 'series': series, 'band': normal_range(series, DAY, END), 'blank': NO_WAIT}]
+    panels = [{'kind': WAIT, 'title': 'Average Phase Wait', 'series': series, 'band': normal_range(series, DAY, END), 'blank': NO_WAIT}]
     ax = create_focus_overview('Alpha', (DAY, END + pd.Timedelta(days=1)), panels=panels).axes[0]
     assert texts(ax) == [NO_WAIT]
     # The same hours with no data at all are the hatching's to tell.

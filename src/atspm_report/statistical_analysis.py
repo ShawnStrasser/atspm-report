@@ -3,8 +3,19 @@ import pandas as pd
 from .duckdb_utils import TableLike, columns, quote, run_sql
 
 
+# The phase trend checks (measure_checks) run the max-out method on these daily values per DeviceId and Phase. The
+# value is the share of cycles that failed, and the platoon ratio negated so that a fall is a rise, as the method
+# looks for a rise above the phase's own history.
+SPLIT_FAIL_COLUMN = 'Percent SplitFail'
+PLATOON_FALL_COLUMN = 'Platoon Ratio Negated'
+TREND_COLUMNS = (SPLIT_FAIL_COLUMN, PLATOON_FALL_COLUMN)
+
+
 def _cusum_columns(columns):
-    """(value column, CUSUM column name, group columns) for maxout or missing data."""
+    """(value column, CUSUM column name, group columns) for maxout, missing data or a phase trend."""
+    for column in TREND_COLUMNS:
+        if column in columns:
+            return column, f'CUSUM_{column}', ['DeviceId', 'Phase']
     if 'Phase' in columns:
         return 'Percent MaxOut', 'CUSUM_Percent MaxOut', ['DeviceId', 'Phase']
     if 'MissingData' in columns:
@@ -148,7 +159,15 @@ def alert(table: TableLike, maxout_thresholds: dict = None,
     limits = {**MAXOUT_ALERT_DEFAULTS, **(maxout_thresholds or {})}
     table_columns = columns(table)
 
-    if 'Percent MaxOut' in table_columns:
+    trend = next((column for column in TREND_COLUMNS if column in table_columns), None)
+    if trend is not None:
+        # A phase trend: the same four tests as max outs, with the trend's own limits (measure_checks): the rise over
+        # the phase's average in place of a fixed share, and its own count of cycles or vehicles (Volume).
+        column, cusum_column_name, groups = trend, f'CUSUM_{trend}', ['DeviceId', 'Phase']
+        condition = ("({cusum} > $cusum) AND (Volume >= $min_volume) "
+                     "AND ((({col} - _Average) / _StdDev) > $zscore) AND ({col} - _Average >= $rise)")
+        params = {key: limits[key] for key in ('cusum', 'min_volume', 'zscore', 'rise')}
+    elif 'Percent MaxOut' in table_columns:
         column, cusum_column_name, groups = 'Percent MaxOut', 'CUSUM_Percent MaxOut', ['DeviceId', 'Phase']
         condition = ("({cusum} > $cusum) AND (Services > $min_services) "
                      "AND ((({col} - _Average) / _StdDev) > $zscore) AND ({col} > $percent)")

@@ -75,9 +75,12 @@ def test_other_phases_waiting_longer_is_harm_and_names_them():
     row = rank([FAULT], lambda ts, phase: (1, 4, 40.0) if in_fault(ts) and phase == 4 else (1, 4, 20.0)).iloc[0]
     assert row.Tier == OTHER_PHASES and row.HurtPhases == '4'
     assert row.OtherWaitUp == pytest.approx(20) and row.ExtraVehHoursPerDay == pytest.approx(1600 * 20 / 3600 / 3)
-    assert row.ImpactText == 'Other phases wait longer over 4 h, 20 s a vehicle on average: Ph4 20 to 40 s'
+    # Phase wait, the time from a phase's call to its green, is what was measured: never told as each vehicle's delay.
+    assert row.ImpactText == 'Phase wait on other phases up 20 s on average over 4 h: Ph4 20 to 40 s'
+    assert 'vehicle' not in row.ImpactText and 'delay' not in row.ImpactText
+    assert row.ImpactLines.startswith('[{"text": "Phase wait, normal to during the fault (4 h): Ph4 20 to 40 s"')
     assert row.HarmProbability > 0.95
-    assert impact_label(row).startswith('<b>Harm to other phases.</b> Other phases wait')
+    assert impact_label(row).startswith('<b>Harm to other phases.</b> Phase wait on other phases up')
 
 
 def test_other_phases_maxing_out_more_is_harm():
@@ -116,7 +119,7 @@ def test_a_phase_with_a_fault_of_its_own_is_left_out_and_all_at_fault_is_signal_
     other = ('A', 6, '2026-10-27 08:00', '2026-10-27 12:00', 'stuck on', 0.8)
     ranked = rank([FAULT, other], lambda ts, phase: (1, 4, 40.0) if in_fault(ts) else (1, 4, 20.0))
     assert ranked['SignalWide'].tolist() == [True, True] and ranked['Tier'].tolist() == [OTHER_PHASES, OTHER_PHASES]
-    assert ranked.iloc[0].ImpactText.startswith('Its phases wait longer over 4 h, 20 s a vehicle on average:')
+    assert ranked.iloc[0].ImpactText.startswith('Phase wait on its phases up 20 s on average over 4 h:')
     assert ranked.iloc[0].ExtraVehHoursPerDay == pytest.approx(2 * 1600 * 20 / 3600 / 3)
     assert ranked['Group'].notna().all() and ranked['Group'].nunique() == 1     # one event, told once
 
