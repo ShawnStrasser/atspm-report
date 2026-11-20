@@ -1,13 +1,15 @@
 """Which detector configuration the report uses: the Signal Analysis Tool workbook's, except each detector where the AI
-model confidently disagrees (none of the signal's confident disagreements rejected); detectors missing from the workbook
-come from the model."""
+model confidently disagrees, and the whole signal at more than 3 of those (never at a signal with a rejection);
+detectors missing from the workbook come from the model."""
 import sys
 from pathlib import Path
 
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import odot_detector_health as h  # noqa: E402
+import pytest  # noqa: E402
+
+h = pytest.importorskip('odot_detector_health')   # ODOT's own script, not in the package
 
 DEV = 'aaaa-1'
 PROBS = ['PAdvance', 'PPresence', 'PCount', 'PYellowRed', 'POther', 'PMid', 'PBike']
@@ -64,14 +66,22 @@ def test_one_confident_disagreement_switches_that_detector_only():
     assert set(out.loc[out['Detector'] != 1, 'source']) == {'workbook'}
 
 
-def test_many_confident_disagreements_still_switch_detector_by_detector():
-    book, model = _signal(disagreements=5)
+def test_three_confident_disagreements_switch_detector_by_detector():
+    book, model = _signal(disagreements=3)
     model.loc[model['Detector'] == '8', ['Phase', 'Function', 'PhaseProb', 'FunctionProb']] = ['4', 'Advance', '0.6', '0.6']
     out = h.choose_detector_config(book, model, _feedback())
-    assert list(out.loc[out['source'] == 'model', 'Detector']) == [1, 2, 3, 4, 5]
-    assert (_row(out, 5)['phase'], _row(out, 5)['function']) == (6.0, 'Presence')
-    # an unconfident model answer never replaces the workbook's, however many others switch
+    assert list(out.loc[out['source'] == 'model', 'Detector']) == [1, 2, 3]
+    # an unconfident model answer does not replace the workbook's at a signal with 3 or fewer
     assert (_row(out, 8)['phase'], _row(out, 8)['function'], _row(out, 8)['source']) == (2.0, 'Count', 'workbook')
+
+
+def test_more_than_three_confident_disagreements_switch_the_whole_signal():
+    book, model = _signal(disagreements=4)
+    model.loc[model['Detector'] == '8', ['Phase', 'Function', 'PhaseProb', 'FunctionProb']] = ['4', 'Advance', '0.6', '0.6']
+    out = h.choose_detector_config(book, model, _feedback())
+    assert set(out['source']) == {'model'}
+    assert (_row(out, 4)['phase'], _row(out, 4)['function']) == (6.0, 'Presence')
+    assert (_row(out, 8)['phase'], _row(out, 8)['function']) == (4.0, 'Advance')
 
 
 def test_confidence_limit_is_inclusive():
@@ -104,10 +114,26 @@ def test_a_rejection_keeps_the_whole_signal_on_the_workbook():
     assert _row(out, 1)['function'] == 'Count'
 
 
-def test_a_rejection_of_another_suggestion_does_not_count():
+def test_any_rejection_at_the_signal_counts():
     book, model = _signal(disagreements=6)
     out = h.choose_detector_config(book, model, _feedback([(3, 4, 'Advance', 'rejected')]))
-    assert list(out.loc[out['source'] == 'model', 'Detector']) == [1, 2, 3, 4, 5, 6]
+    assert set(out['source']) == {'workbook'}
+
+
+def test_an_accepted_suggestion_is_not_a_rejection():
+    book, model = _signal(disagreements=6)
+    out = h.choose_detector_config(book, model, _feedback([(3, 6, 'Presence', 'accepted')]))
+    assert set(out['source']) == {'model'}
+
+
+def test_a_rejected_detector_takes_nothing_from_the_model():
+    book = _workbook([(1, 2, 'Count'), (2, 4, 'Advance_Presence'), (3, '', 'Presence')])
+    model = _model([(1, 6, 'Presence'), (2, 4, 'Mid'), (3, 8, 'Presence')])
+    out = h.choose_detector_config(book, model, _feedback([(2, 4, 'Mid', 'rejected'), (3, 8, 'Presence', 'rejected')]))
+    assert set(out['source']) == {'workbook'}
+    assert (_row(out, 1)['phase'], _row(out, 1)['function']) == (2.0, 'Count')
+    assert _row(out, 2)['function'] == 'Other'         # the workbook type is not one health knows; the model's is not used
+    assert pd.isna(_row(out, 3)['phase']) and _row(out, 3)['function'] == 'Presence'
 
 
 def test_missing_detectors_are_filled_from_the_model():

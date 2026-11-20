@@ -33,3 +33,5 @@ tests/test_raw_event_fetching.py
 temp_*
 .tmp/
 debug.log
+odot_corridors.py
+tests/test_odot_power_bi.py

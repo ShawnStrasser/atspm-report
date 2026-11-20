@@ -7,7 +7,7 @@ import pandas as pd
 
 from atspm_report import ReportGenerator
 from atspm_report import measure_inputs as mi
-from atspm_report.coordination_check import create_coordination_impact_chart, create_coordination_plots
+from atspm_report.coordination_check import create_coordination_impact_chart
 from atspm_report.impact_chart import impact_data
 
 SIGNALS = pd.DataFrame({'DeviceId': ['A', 'B', 'C', 'D'], 'Name': ['08043-Odd', '08050-Next', '08046-Far', '08055-Far'],
@@ -139,17 +139,3 @@ def test_signal_focus_does_not_read_the_new_alert_types():
     told, _ = collect_problems({'delay_rise': row, 'split_failure_trend': row, 'platoon_ratio_trend': row,
                                 'phase_timing': row.assign(Check='Split failures without max outs')})
     assert told.empty
-
-
-def test_coordination_charts_are_as_before_without_an_impact_chart():
-    alert = schedule_alert().to_dict()
-    alert.update({'Date': pd.Timestamp('2026-11-15'), 'Text': 'x', 'ChartDay': pd.Timestamp('2026-11-15'),
-                  'ChartOwn': [75.0] * 96, 'ChartGroup': {'08050': [75.0] * 96}, 'ChartCalls': None})
-    alerts = pd.DataFrame([alert])
-    generator = ReportGenerator({'verbosity': 0})
-    plain = create_coordination_plots(alerts, SIGNALS, 10)
-    flat = generator._coordination_figures(alerts, SIGNALS, hourly(worse=False))
-    assert [scope for _, scope in flat] == [scope for _, scope in plain]
-    with_impact = generator._coordination_figures(alerts, SIGNALS, hourly())
-    assert [scope for _, scope in with_impact] == ['All Regions', 'All Regions', 'Region 1', 'Region 1']
-    assert len(with_impact[1][0].axes) == 2

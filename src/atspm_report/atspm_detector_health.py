@@ -571,17 +571,19 @@ def signal_wide_rows(rows: pd.DataFrame) -> pd.Series:
     return joined
 
 
-def listed_alerts(alerts: pd.DataFrame, signals: pd.DataFrame, max_rows: int, hidden: dict = None, limits: dict = None) -> pd.DataFrame:
+def listed_alerts(alerts: pd.DataFrame, signals: pd.DataFrame, max_rows: int, hidden: dict = None, limits: dict = None,
+                  data_only_signals: int = 0) -> pd.DataFrame:
     """The alerts the report's tables actually list: per table (vehicle faults, lane closures, timing plans, ped
     faults, ped set-up issues; with the urgency tiers the faults are two tables, those affecting operations and those that are
     data only, vehicle and ped together) the first max_rows of each region and of All Regions,
     or its own limit from limits, in the tables' order (see health_table_order), whole signals kept together as the tables do.
+    The Data Only table also stops at data_only_signals signals (0: no such limit).
     hidden, {report: signals}: the signals a report's Signal Focus lists. Their rows leave that report's tables, and every
     alert of theirs counts as listed, since the section names them all.
     Only these go into the alert history, so an alert cut from every table is not suppressed later."""
-    if alerts is None or alerts.empty or signals is None or signals.empty or max_rows <= 0:
+    if alerts is None or alerts.empty or signals is None or signals.empty or (max_rows <= 0 and not data_only_signals):
         return alerts
-    from .table_generation import head_by_signal   # imports this module: import on use
+    from .table_generation import head_by_signal, head_signals   # imports this module: import on use
     regions = signals[['DeviceId', 'Name', 'Region']].copy()
     regions['DeviceId'] = regions['DeviceId'].astype(str)
     ranked = alerts.assign(DeviceId=alerts['DeviceId'].astype(str)).merge(
@@ -592,23 +594,27 @@ def listed_alerts(alerts: pd.DataFrame, signals: pd.DataFrame, max_rows: int, hi
     together = 'TriageRank' in ranked.columns
     everything = pd.Series(True, index=ranked.index)
     harm = affects_operations(ranked)
-    fault_tables = [((VEHICLE, PED), FAULT_STATUSES, 'detector_faults', harm), ((VEHICLE, PED), FAULT_STATUSES, 'detector_faults', ~harm)] if together else [
-        ((VEHICLE,), FAULT_STATUSES, 'detector_faults', everything), ((PED,), FAULT_STATUSES, 'ped_faults', everything)]
-    tables = fault_tables + [((VEHICLE,), ('lane_closure',), 'lane_closure', everything), ((VEHICLE,), ('timing_plan',), 'timing_plan', everything),
-                             ((PED,), ('config_issue',), 'ped_setup', everything)]
+    # (kinds, statuses, row limit name, rows, signal limit)
+    fault_tables = [((VEHICLE, PED), FAULT_STATUSES, 'detector_faults', harm, 0),
+                    ((VEHICLE, PED), FAULT_STATUSES, 'detector_faults', ~harm, data_only_signals)] if together else [
+        ((VEHICLE,), FAULT_STATUSES, 'detector_faults', everything, 0), ((PED,), FAULT_STATUSES, 'ped_faults', everything, 0)]
+    tables = fault_tables + [((VEHICLE,), ('lane_closure',), 'lane_closure', everything, 0),
+                             ((VEHICLE,), ('timing_plan',), 'timing_plan', everything, 0),
+                             ((PED,), ('config_issue',), 'ped_setup', everything, 0)]
     keep = set(ranked.index[ranked['DeviceId'].isin(set().union(*hidden.values()))]) if hidden else set()
 
-    def listed(rows, report, limit):
+    def listed(rows, report, limit, signal_limit):
         shown = rows[~rows['DeviceId'].isin(hidden.get(report, ()))]
-        kept = head_by_signal(shown.loc[signal_wide_rows(shown).index], limit, key='Name')
+        kept = head_signals(shown.loc[signal_wide_rows(shown).index], signal_limit, key='Name')
+        kept = head_by_signal(kept, limit, key='Name')
         return shown.index[shown['DeviceId'].isin(kept['DeviceId'])]
 
-    for kinds, statuses, name, part in tables:
+    for kinds, statuses, name, part, signal_limit in tables:
         limit = limits.get(name, max_rows)
         table = ranked[ranked['DetectorType'].isin(kinds) & ranked['Status'].isin(statuses) & part]
-        keep.update(listed(table, 'All Regions', limit))
+        keep.update(listed(table, 'All Regions', limit, signal_limit))
         for region, region_rows in table.groupby('Region'):
-            keep.update(listed(region_rows, region, limit))
+            keep.update(listed(region_rows, region, limit, signal_limit))
     id_cols = ['DeviceId', 'DetectorType', 'Detector', 'Issue']
     listed = ranked.loc[sorted(keep), id_cols].drop_duplicates()
     return alerts.assign(DeviceId=alerts['DeviceId'].astype(str)).merge(listed, on=id_cols, how='inner')

@@ -58,6 +58,14 @@ def head_by_signal(result, max_rows, key='Signal'):
     return ordered[ordered['_signal_rank'].isin(keep)].drop(columns=['_signal_rank', '_row'])
 
 
+def head_signals(result, max_signals, key='Signal'):
+    """The rows of the first max_signals signals of an already-sorted table (a signal's place is that of its first row),
+    in their order. 0 or None: no limit. A limit that counts signals, where head_by_signal counts rows."""
+    if not max_signals or max_signals <= 0 or result.empty or key not in result.columns:
+        return result
+    return result[result[key].isin(pd.unique(result[key])[:max_signals])]
+
+
 def _carry_ongoing_column(source_columns, columns):
     """Add the ongoing date to a column subset when the source frame has one."""
     if ONGOING_SINCE_COLUMN in source_columns:
@@ -160,7 +168,8 @@ def prepare_phase_termination_alerts_table(filtered_df, signals_df, max_rows=10)
     
     return result, total_alerts_count
 
-def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, allowed_pairs=None, min_total_skips=0, max_rows=10):
+def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, allowed_pairs=None, min_total_skips=0, max_rows=10,
+                                    max_signals=0):
     """
     Prepare the Phase Skip table showing one row per signal per date with aggregated phases.
 
@@ -171,6 +180,7 @@ def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, al
         allowed_pairs: Optional DataFrame with DeviceId and Phase pairs to filter
         min_total_skips: Minimum total skips threshold (applied after aggregation)
         max_rows: Maximum number of rows to include in the table
+        max_signals: At most this many signals, in the table's order (0: no limit)
 
     Returns:
         Tuple of (Sorted DataFrame with Signal, Date, Phases, Total Skips columns, total_alerts_count)
@@ -244,7 +254,8 @@ def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, al
     )
     aggregated = aggregated[output_columns]
     aggregated = aggregated.sort_values(by=['Total Skips', 'Signal', 'Date'], ascending=[False, True, True])
-    
+    aggregated = head_signals(aggregated, max_signals)
+
     # Limit the number of rows
     if max_rows > 0 and len(aggregated) > max_rows:
         aggregated = head_by_signal(aggregated, max_rows)
@@ -1268,12 +1279,15 @@ def prepare_alarms_table(
     signals_df,
     region=None,
     max_rows=10,
+    max_signals=0,
 ):
     '''Prepare controller alarm rows for a report.
 
     One row per signal and alarm type. Rows are present only for pairs that
     alarmed again on the report day; the count shown covers the trailing six
-    weeks. Sorted by signal, then alarm type.
+    weeks. Signals come by their six-week total (all their rows together), the
+    most first, each signal's alarms the most first; max_signals keeps the first
+    that many signals (0: all).
     '''
     if alarms_df is None or alarms_df.empty:
         return pd.DataFrame(), 0
@@ -1296,7 +1310,9 @@ def prepare_alarms_table(
         return pd.DataFrame(), 0
 
     total_alerts_count = len(result)
-    result = result.sort_values(['Name', 'AlarmType'])
+    result = result.assign(_signal_total=result.groupby('Name')['TotalCount'].transform('sum')).sort_values(
+        ['_signal_total', 'Name', 'TotalCount', 'AlarmType'], ascending=[False, True, False, True], kind='stable')
+    result = head_signals(result, max_signals, key='Name')
     if max_rows > 0:
         result = head_by_signal(result, max_rows, key='Name')
 
@@ -1383,8 +1399,9 @@ def prepare_atspm_detector_health_table(
     ped_hourly_counts=None,
     expected_counts=None,
     impact=None,
+    max_signals=0,
 ):
-    '''Prepare atspm-detector health rows for a report.
+    '''Prepare atspm-detector health rows for a report (max_signals: at most that many signals, in the table's order).
 
     statuses picks the rows: the fault status (bad) for the alert table, or an
     information one (lane closure, timing plan, set-up issue) for the tables below it. Sorted by health_table_order. The story column says in one short narrative what is wrong, how bad
@@ -1429,6 +1446,7 @@ def prepare_atspm_detector_health_table(
     joined_numbers = signal_wide_rows(result)
     result = result.loc[joined_numbers.index]
     total_alerts_count = len(result)
+    result = head_signals(result, max_signals, key='Name')
     if max_rows > 0:
         result = head_by_signal(result, max_rows, key='Name')
 

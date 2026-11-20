@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from atspm_report import ReportGenerator
+from atspm_report import coordination_check as cc
 from atspm_report.coordination_check import (
     ALERT_TYPE,
     attached_to,
@@ -18,12 +19,18 @@ from atspm_report.coordination_check import (
     build_coordination_alerts,
     create_coordination_plots,
     group_of,
+    group_rows,
     listed_alerts,
     plan_findings,
     preempt_clock_offsets,
-    prepare_coordination_table,
     us_clock_changes,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_base_map(monkeypatch):
+    """Maps are drawn without the base map in tests: no network."""
+    monkeypatch.setattr(cc, 'MAP_TILES', None)
 
 REPORT_DAY = pd.Timestamp('2026-11-15')   # a Sunday
 DAYS = pd.date_range(REPORT_DAY - pd.Timedelta(days=41), REPORT_DAY)
@@ -283,14 +290,15 @@ def _timeline(calls):
     })
 
 
-def _generate(config=None, past_alerts=None, coordination=None):
+def _generate(config=None, past_alerts=None, coordination=None, signals=None):
     end = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
     shift = end - REPORT_DAY
     calls = _vehicle_calls(FALL_BACK + pd.Timedelta(hours=1))
     calls['StartTime'] += shift
     settings = {'verbosity': 0, 'signal_focus_signals': 0, **(config or {})}
     with patch('atspm_report.generator.generate_pdf_report', return_value={}) as pdf:
-        result = ReportGenerator(settings).generate(signals=CLOCK_SIGNALS, timeline=_timeline(calls),
+        result = ReportGenerator(settings).generate(signals=CLOCK_SIGNALS if signals is None else signals,
+                                                    timeline=_timeline(calls),
                                                     past_alerts=past_alerts, coordination_agg=coordination)
     return result, pdf.call_args.kwargs
 
@@ -324,19 +332,21 @@ def test_the_plan_check_is_off_by_default():
     assert result['alerts'][ALERT_TYPE].empty
 
 
-def test_table_and_chart_of_a_plan_alert():
+def test_a_plan_alert_is_shown_as_its_group_map_and_a_chart_of_each_day_that_differs():
     def rule(device, day, minute):
         if device == 'B' and day.dayofweek >= 5:
             return (21, 0)
         return _all_together(device, day, minute)
     alerts = build_coordination_alerts(SIGNALS, REPORT_DAY, coordination=_coordination(rule), clock_check=False)['alerts']
-    rows, total = prepare_coordination_table(alerts, SIGNALS, 'R')
-    assert total == 1 and rows.columns.tolist() == ['Signal', 'What Is Wrong']
+    alert = alerts.iloc[0]
+    assert set(alert['ChartMembers']) == {'A', 'C', 'D', 'E'} and len(alert['ChartWeek']) == 7
     figures = create_coordination_plots(alerts, SIGNALS)
     assert [region for _, region in figures] == ['All Regions', 'R']
-    alert = alerts.iloc[0]
-    assert pd.Timestamp(alert['ChartDay']).dayofweek >= 5 and set(alert['ChartGroup']) == {'A', 'C', 'D', 'E'}
-    assert np.nanmax(alert['ChartOwn']) == 0
+    group = figures[0][0]
+    assert group.map is not None and group.title == 'B-Main at 1'
+    # the weekend shows B free against its group; Saturday is the same as Sunday and the weekdays show nothing
+    assert [chart._suptitle.get_text() for chart in group.charts] == ['Cycle length by time of day, Sun 11/15']
+    assert not group.charts[0].axes[0].patches                              # nothing shaded: the lines tell it
 
 
 # ---- Groups by position ---------------------------------------------------------------------------------------------
@@ -357,7 +367,9 @@ def test_a_signal_running_free_in_the_middle_of_a_group_is_in_it():
     assert {'B', 'D'} <= set(group_of(pairs, 'C')) and 'C' not in group_of(pairs, 'B')
     assert attached_to(pairs, 'B') == ['C']
     mine = findings[findings['DeviceId'] == 'C']
-    assert set(mine['DayType']) == {'Weekdays'} and set(mine['Own']) == {0.0} and set(mine['Cons']) == {75.0}
+    # every kind of day: B, free on weekends beside it, is out of step itself and does not excuse it
+    assert set(mine['DayType']) == {'Weekdays', 'Saturdays', 'Sundays'} and set(mine['Own']) == {0.0}
+    assert set(mine['Cons']) == {75.0}
 
 
 def test_a_signal_placed_by_position_does_not_cover_for_its_neighbours():
@@ -406,10 +418,8 @@ def test_a_signal_inside_its_group_is_high_confidence_and_one_at_an_end_is_not()
     """The 2026-11-16 review: every signal inside its group was called a real problem, every end one 'probably'."""
     alerts = build_coordination_alerts(SIGNALS, REPORT_DAY, coordination=_coordination(_inside_and_end), clock_check=False)['alerts']
     assert alerts.set_index('DeviceId')['Confidence'].to_dict() == {'A': CONFIDENCE_CHECK, 'B': CONFIDENCE_HIGH}
-    rows, _ = prepare_coordination_table(alerts, SIGNALS, 'R')
-    assert rows['Signal'].str[0].tolist() == ['B', 'A']                     # high confidence first
-    figures = create_coordination_plots(alerts, SIGNALS, 1)                # one chart each report: the high one
-    assert all(figure.axes[0].get_title().startswith('B ') for figure, _ in figures)
+    figures = create_coordination_plots(alerts, SIGNALS, 1)                # one group, both alerts in it
+    assert [group.devices for group, _ in figures] == [['A', 'B'], ['A', 'B']]
 
 
 def test_a_nearby_signal_outside_the_group_running_the_same_lowers_confidence():
@@ -456,32 +466,205 @@ def test_only_high_confidence_plan_alerts_stay_on_the_ongoing_list():
     assert set(filed.loc[filed['Date'] == filed['Date'].max(), 'DeviceId']) == {'X', 'N1'}   # both stay held back
 
 
-def test_an_alert_the_report_had_no_room_for_is_told_on_the_next_run():
-    """One alert a region each run, with its chart: the one left over is not filed, so it is new again next time."""
+def test_a_group_the_report_had_no_room_for_is_told_on_the_next_run():
+    """One group a report each run, with its map and charts: the one left over is not filed, so it is new again."""
     end = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
-    names = {'A': 'X', 'B': 'N1', 'C': 'N2', 'D': 'N3'}
-    rows = _coordination(lambda d, day, m: _inside_and_end({v: k for k, v in names.items()}[d], day, m),
-                         devices=list(names.values()), days=pd.date_range(end - pd.Timedelta(days=41), end))
+    other = CLOCK_SIGNALS.assign(DeviceId=['P0', 'P1', 'P2', 'P3', 'FAR2'], Longitude=-121.5)
+    other['Name'] = other['DeviceId'] + '-Second St'
+    signals = pd.concat([CLOCK_SIGNALS, other], ignore_index=True)
+    lines = {'X': 'A', 'N1': 'B', 'N2': 'C', 'N3': 'D', 'P0': 'A', 'P1': 'B', 'P2': 'C', 'P3': 'D'}
+
+    def rule(device, day, minute):
+        if device == 'P1':
+            return (21, 0) if day.dayofweek >= 5 else _plan(day, minute)
+        return _inside_and_end(lines[device], day, minute) if device in ('X', 'N1', 'N2', 'N3') else _plan(day, minute)
+    rows = _coordination(rule, devices=list(lines), days=pd.date_range(end - pd.Timedelta(days=41), end))
     config = {'coordination_clock_check_enabled': False, 'coordination_plan_check_enabled': True, 'coordination_figures': 1}
-    first, pdf = _generate(config, coordination=rows)
-    assert first['alerts'][ALERT_TYPE]['DeviceId'].tolist() == ['N1']                     # the high confidence one
-    assert len(pdf['coordination_figures']) == 2                                          # its chart, in both reports
-    assert first['updated_past_alerts'][ALERT_TYPE]['DeviceId'].tolist() == ['N1']        # X is not held back yet
+    first, pdf = _generate(config, coordination=rows, signals=signals)
+    assert sorted(first['alerts'][ALERT_TYPE]['DeviceId']) == ['N1', 'X']                # one group: both its alerts
+    assert len(pdf['coordination_figures']) == 2                                          # in both reports
+    assert sorted(first['updated_past_alerts'][ALERT_TYPE]['DeviceId']) == ['N1', 'X']    # P1 is not held back yet
     past = {ALERT_TYPE: first['updated_past_alerts'][ALERT_TYPE].assign(Date=pd.Timestamp.today().normalize() - pd.Timedelta(days=1))}
-    second, pdf = _generate(config, past_alerts=past, coordination=rows)
-    assert second['alerts'][ALERT_TYPE]['DeviceId'].tolist() == ['X'] and len(pdf['coordination_figures']) == 2
+    second, pdf = _generate(config, past_alerts=past, coordination=rows, signals=signals)
+    assert second['alerts'][ALERT_TYPE]['DeviceId'].tolist() == ['P1'] and len(pdf['coordination_figures']) == 2
 
 
-def test_the_chart_shades_the_hours_the_alert_is_about_and_the_table_counts_the_alerts_waiting():
+def test_a_group_gets_a_chart_for_each_distinct_day_that_shows_a_difference():
+    """B free on weekends, A late on weekdays: Sunday (Saturday was the same) and Friday (the weekdays were the same)."""
     alerts = build_coordination_alerts(SIGNALS, REPORT_DAY, coordination=_coordination(_inside_and_end), clock_check=False)['alerts']
     listed = listed_alerts(alerts, SIGNALS, 1)
-    assert listed['DeviceId'].tolist() == ['B'] and listed['RegionTotal'].tolist() == [2]
-    rows, total = prepare_coordination_table(listed, SIGNALS, 'R')
-    assert len(rows) == 1 and total == 2                                  # "1 of 2": the other waits for a later run
-    figure = create_coordination_plots(listed, SIGNALS)[0][0]
-    ax = figure.axes[0]
-    assert 'Hours it is out of step' in ax.get_legend_handles_labels()[1]
-    spans = [p.get_extents() for p in ax.patches]
-    assert len(spans) == 1                                                # B is free 6:00-20:00 that weekend day
-    shaded = ax.transData.inverted().transform(spans[0])[:, 0]
-    assert shaded.round(2).tolist() == [6.0, 20.0]
+    assert sorted(listed['DeviceId']) == ['A', 'B'] and set(listed['RegionTotal']) == {1} and set(listed['Row']) == {'A'}
+    row = group_rows(listed, SIGNALS)[0]
+    assert [f'{day:%a}' for day in row['days']] == ['Sun', 'Fri'] and row['own'] == []
+    assert sorted(row['parts'][0]) == ['C', 'D', 'E']
+
+
+def test_a_day_with_every_line_together_gets_no_chart():
+    """user, 2026-11-17: a chart where the signal runs with its group shows nothing."""
+    def rule(device, day, minute):
+        if device == 'B' and day.dayofweek >= 5:
+            return (21, 0)
+        return _all_together(device, day, minute)
+    alerts = build_coordination_alerts(SIGNALS, REPORT_DAY, coordination=_coordination(rule), clock_check=False)['alerts']
+    together = {day: dict(lines) for day, lines in alerts.iloc[0]['ChartWeek'].items()}
+    for lines in together.values():
+        lines['B'] = lines['A']                                           # B with its group all week
+    assert group_rows(alerts.assign(ChartWeek=[together]), SIGNALS) == []
+
+
+# ---- Corridors given in the signals table ------------------------------------------------------------------------------
+
+def _free_signal_between_two_corridors(device, day, minute):
+    """C free all day between A-B and D-E; B free on weekends."""
+    if device == 'C' or (device == 'B' and day.dayofweek >= 5):
+        return (21, 0)
+    return _all_together(device, day, minute)
+
+
+def test_corridors_given_in_the_signals_table_are_used_as_they_are():
+    """08108: free on its own between two groups, which nothing in the data could show (user, 2026-11-17)."""
+    rows = _coordination(_free_signal_between_two_corridors)
+    learned = plan_findings(rows, SIGNALS, REPORT_DAY, by_position=True)
+    assert 'C' in set(learned['findings']['DeviceId'])                       # attached by position and told
+    given = SIGNALS.assign(corridor=['West', 'West', 'Solo', 'East', 'East', None])
+    result = plan_findings(rows, given, REPORT_DAY, by_position=True)
+    pairs = result['pairs']
+    assert (pairs['Kind'] != LEARNED).sum() == 0 and group_of(pairs, 'C') == []   # on its own: never judged
+    assert group_of(pairs, 'B') == ['A'] and group_of(pairs, 'D') == ['E']
+    assert set(result['findings']['DeviceId']) == set()                      # two to a group: no consensus to break
+
+
+def test_a_corridor_signal_is_judged_against_its_corridor_whatever_it_runs():
+    """A signal free all day, put in the corridor by the table, is told like any member."""
+    given = SIGNALS.assign(corridor=['Main', 'Main', 'Main', 'Main', ' ', None])
+    result = plan_findings(_coordination(_free_signal_between_two_corridors), given, REPORT_DAY)
+    assert set(group_of(result['pairs'], 'C')) == {'A', 'B', 'D'}
+    mine = result['findings'][result['findings']['DeviceId'] == 'C']
+    assert set(mine['DayType']) == {'Weekdays', 'Saturdays', 'Sundays'} and set(mine['Own']) == {0.0}
+
+
+def test_blank_corridors_are_grouped_from_what_they_run():
+    blank = SIGNALS.assign(corridor=['', ' ', None, '', '', None])
+    rows = _coordination(_free_in_the_middle)
+    plain = plan_findings(rows, SIGNALS, REPORT_DAY, by_position=True)
+    given = plan_findings(rows, blank, REPORT_DAY, by_position=True)
+    assert given['findings'][['DeviceId', 'DayType', 'Start', 'End']].values.tolist() == \
+        plain['findings'][['DeviceId', 'DayType', 'Start', 'End']].values.tolist()
+
+
+# ---- Half a mile ------------------------------------------------------------------------------------------------------
+
+def test_signals_more_than_half_a_mile_from_the_group_are_not_in_it():
+    """user, 2026-11-17: signals over half a mile apart were drawn as one group."""
+    far = _signals(GROUP + ['E'], spacing=0.0087)                           # about 0.6 mi apart
+    pairs = plan_findings(_coordination(_all_together), far, REPORT_DAY)['pairs']
+    assert pairs.empty or (pairs['Kind'] == LEARNED).sum() == 0
+
+
+def test_a_signal_in_the_middle_links_the_group_across_a_longer_gap():
+    """A and C 0.6 mi apart, both within half a mile of B between them, whatever B runs."""
+    spaced = pd.DataFrame([{'DeviceId': d, 'Name': f'{d}-Main', 'Region': 'R', 'Latitude': 45.0 + lat, 'Longitude': -122.0}
+                           for d, lat in [('A', 0.0), ('B', 0.0045), ('C', 0.0087), ('D', 0.0130), ('E', 0.0174)]])
+
+    def rule(device, day, minute):
+        return (21, 0) if device in ('B', 'D') else _plan(day, minute)
+    pairs = plan_findings(_coordination(rule, devices=list('ABCDE')), spaced, REPORT_DAY)['pairs']
+    learned = pairs[pairs['Kind'] == LEARNED]
+    assert sorted(map(sorted, learned[['DeviceId', 'NextDeviceId']].values.tolist())) == [['A', 'C'], ['A', 'E'], ['C', 'E']]
+
+
+# ---- Maps -------------------------------------------------------------------------------------------------------------
+
+def test_a_map_without_its_base_map_is_still_drawn(monkeypatch):
+    monkeypatch.setattr(cc, 'MAP_TILES', 'http://127.0.0.1:9/{z}/{x}/{y}.png')       # nothing answers there
+    monkeypatch.setitem(cc._basemap, 'on', True)
+    monkeypatch.setattr(cc, '_tiles', {})
+    alerts = build_coordination_alerts(SIGNALS, REPORT_DAY, coordination=_coordination(_inside_and_end), clock_check=False)['alerts']
+    group = create_coordination_plots(alerts, SIGNALS)[0][0]
+    assert group.map is not None and cc._basemap['on'] is False and not group.map.axes[0].images
+
+
+def test_without_coordinates_groups_come_from_the_corridors_and_have_no_map():
+    plain = SIGNALS.drop(columns=['Latitude', 'Longitude'])
+    rows = _coordination(_inside_and_end)
+    assert build_coordination_alerts(plain, REPORT_DAY, coordination=rows, clock_check=False)['alerts'].empty
+    given = plain.assign(corridor=['Main'] * 5 + [None])
+    alerts = build_coordination_alerts(given, REPORT_DAY, coordination=rows, clock_check=False)['alerts']
+    assert set(alerts['DeviceId']) == {'A', 'B'}
+    group = create_coordination_plots(alerts, given)[0][0]
+    assert group.map is None and len(group.charts) == 2
+
+
+# ---- Groups have no holes -------------------------------------------------------------------------------------------
+
+LINE = _signals(GROUP + ['E', 'F'], spacing=0.003)        # about a fifth of a mile apart
+
+
+def _part_time_past_a_free_signal(device, day, minute):
+    """E runs free all day; F, past it, runs the group's plan until 9:00 only."""
+    if device == 'E':
+        return (21, 0)
+    if device == 'F':
+        return _plan(day, minute, end=9 * 60)
+    return _all_together(device, day, minute)
+
+
+def test_a_signal_is_not_attached_past_a_signal_outside_the_group():
+    """2B013: attached past 2B012, which ran free and was in no group, left a hole in the group."""
+    rows = _coordination(_part_time_past_a_free_signal, devices=GROUP + ['E', 'F', 'FAR'])
+    pairs = plan_findings(rows, LINE, REPORT_DAY)['pairs']
+    assert (pairs['Kind'] != LEARNED).sum() == 0 and group_of(pairs, 'F') == []
+
+
+def test_with_the_signal_between_them_in_the_group_both_are_attached():
+    rows = _coordination(_part_time_past_a_free_signal, devices=GROUP + ['E', 'F', 'FAR'])
+    result = plan_findings(rows, LINE, REPORT_DAY, by_position=True)
+    pairs = result['pairs']
+    assert set(pairs.loc[pairs['Kind'] == BY_POSITION, 'DeviceId']) == {'E'}
+    assert set(pairs.loc[pairs['Kind'] == PART_TIME, 'DeviceId']) == {'F'}
+    assert {'C', 'D'} <= set(group_of(pairs, 'E')) and {'C', 'D'} <= set(group_of(pairs, 'F'))
+    assert set(result['findings']['DeviceId']) == {'E', 'F'}
+
+
+def test_a_signal_beside_the_road_is_not_in_the_middle_of_the_group():
+    """12051: on a parallel street 0.13 mi off the highway its 'group' was on."""
+    signals = pd.concat([SIGNALS[SIGNALS['DeviceId'] != 'C'], pd.DataFrame([
+        {'DeviceId': 'C', 'Name': 'C-Side St at 2', 'Region': 'R', 'Latitude': 45.008, 'Longitude': -121.9975}])], ignore_index=True)
+
+    def rule(device, day, minute):
+        return (21, 0) if device == 'C' else _all_together(device, day, minute)
+    pairs = plan_findings(_coordination(rule), signals, REPORT_DAY, by_position=True)['pairs']
+    assert 'C' not in set(pairs.loc[pairs['Kind'] != LEARNED, 'DeviceId']) and group_of(pairs, 'C') == []
+
+
+def test_a_signal_of_another_system_is_not_put_in_the_group():
+    """12051, 2B048, 2B080: named by the agency as another system than the signals they sat among."""
+    named = SIGNALS.assign(group_name=['Main', 'Main', 'Cross St', 'Main', 'Main', 'Elsewhere'])
+    rows = _coordination(_free_in_the_middle)
+    assert 'C' in set(plan_findings(rows, SIGNALS, REPORT_DAY, by_position=True)['findings']['DeviceId'])
+    result = plan_findings(rows, named, REPORT_DAY, by_position=True)
+    assert (result['pairs']['Kind'] != LEARNED).sum() == 0 and 'C' not in set(result['findings']['DeviceId'])
+
+
+def test_a_signal_is_not_attached_part_time_past_a_nearer_signal_with_no_data():
+    """2B147: 2B148, right beside it and with no data, may be the one it runs with."""
+    rows = _coordination(_part_time_past_a_free_signal, devices=GROUP + ['F', 'FAR'])       # nothing known of E
+    pairs = plan_findings(rows, LINE, REPORT_DAY, by_position=True)['pairs']
+    assert (pairs['Kind'] != LEARNED).sum() == 0
+
+
+def test_a_neighbour_that_is_itself_out_of_step_does_not_excuse_a_signal():
+    """2B050 beside 2B052: free at hours when 2B052, free all weekend, was the only one sharing it."""
+    def rule(device, day, minute):
+        weekend = day.dayofweek >= 5
+        if device == 'B' and weekend:
+            return (21, 0)                                              # free all weekend
+        if device == 'C' and weekend and not 9 * 60 <= minute < 18 * 60:
+            return (21, 0)                                              # free in the morning and evening, with B
+        return _all_together(device, day, minute)
+    findings = _findings(rule)
+    assert set(findings['DeviceId']) == {'B', 'C'}
+    mine = findings[(findings['DeviceId'] == 'C') & (findings['DayType'] == 'Saturdays')]
+    assert sorted(zip(mine['Start'], mine['End'])) == [(24, 36), (72, 80)] and set(mine['Own']) == {0.0}
+    whole = findings[(findings['DeviceId'] == 'B') & (findings['DayType'] == 'Saturdays')]
+    assert (int(whole['Start'].min()), int(whole['End'].max())) == (24, 80)   # B's hours beside C count again too

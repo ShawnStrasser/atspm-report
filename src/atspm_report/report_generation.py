@@ -35,9 +35,7 @@ from .atspm_detector_health import ALERT_TYPE as ATSPM_DETECTOR_HEALTH, FAULT_ST
 from .preempt_cascade import SECTION_EV, SECTION_RAIL, SECTION_TSP
 from .coordination_check import (
     ALERT_TYPE as COORDINATION_ALERT_TYPE,
-    CHART_HEIGHT_INCHES as COORDINATION_CHART_INCHES,
     SECTION_TITLE as COORDINATION_TITLE,
-    prepare_coordination_table,
 )
 from .signal_focus import SECTION_TITLE as SIGNAL_FOCUS_TITLE
 from . import measure_checks, timing_checks
@@ -54,27 +52,42 @@ ONGOING_TITLE = 'Ongoing Issues'
 # drawn at close to print width so the text keeps its size.
 PREEMPT_CHART_HEIGHT = None
 HEADING_ROOM = 2.0*inch
-COORDINATION_CHART_HEIGHT = COORDINATION_CHART_INCHES*inch
 TIMING_CHART_HEIGHT = timing_checks.CHART_HEIGHT_INCHES*inch
 
 
-def _measure_sections(alerts, ongoing, signals_df, region, max_rows, ongoing_limit, figures, ongoing_figures) -> list:
+def _measure_sections(alerts, ongoing, signals_df, region, max_rows, ongoing_limit, figures, ongoing_figures,
+                      waiting=None) -> list:
     """(title, rows, total, ongoing rows, ongoing total, charts, ongoing charts) of each section of the checks on atspm's
-    per-phase measures, in report order: the phase timing section, then the delay rise and the two trends."""
+    per-phase measures, in report order: the phase timing section, then the delay rise and the two trends. waiting: every
+    ongoing alert, for the ongoing totals when the rotation cut them (see _waiting_total)."""
     alerts, ongoing = alerts or {}, ongoing or {}
     sections = []
     for check in timing_checks.SECTION_TITLES:
         rows, total = timing_checks.prepare_timing_table(alerts.get(timing_checks.ALERT_TYPE), signals_df, region, max_rows, check)
         later, total_later = timing_checks.prepare_timing_table(ongoing.get(timing_checks.ALERT_TYPE), signals_df, region,
                                                                 ongoing_limit, check)
+        total_later = _waiting_total(waiting, timing_checks.ALERT_TYPE, total_later, lambda frame: timing_checks.prepare_timing_table(
+            frame, signals_df, region, 1, check))
         sections.append((timing_checks.SECTION_TITLES[check], rows, total, later, total_later,
                          [fig for fig, reg in timing_checks.section_figures(figures or [], check) if reg == region],
                          [fig for fig, reg in timing_checks.section_figures(ongoing_figures or [], check) if reg == region]))
     for alert_type in (measure_checks.DELAY_RISE, measure_checks.SPLIT_FAIL_TREND, measure_checks.PLATOON_TREND):
         rows, total = measure_checks.prepare_measure_table(alerts.get(alert_type), signals_df, region, max_rows)
         later, total_later = measure_checks.prepare_measure_table(ongoing.get(alert_type), signals_df, region, ongoing_limit)
+        total_later = _waiting_total(waiting, alert_type, total_later, lambda frame: measure_checks.prepare_measure_table(
+            frame, signals_df, region, 1))
         sections.append((measure_checks.SECTION_TITLES[alert_type], rows, total, later, total_later, [], []))
     return sections
+
+
+def _waiting_total(waiting, alert_type, total, table) -> int:
+    """An Ongoing table's total once the rotation chose which alerts it shows: everything the report has of that table,
+    those waiting their turn too ('Showing 15 of 40'). waiting: alert type -> every ongoing alert (None: not rotated, the
+    table's own total stands); table(frame) -> (rows, total) of the same table built from a frame."""
+    frame = (waiting or {}).get(alert_type)
+    if frame is None or frame.empty:
+        return total
+    return table(frame)[1]
 
 
 def _preempt_rows(alerts: Optional[pd.DataFrame], signals_df, region, max_rows, section=None):
@@ -125,13 +138,13 @@ ATSPM_DATA_TABLE = 'Data Only'
 
 
 def _atspm_detector_health_rows(alerts, signals_df, statuses, region, max_rows, story_header, detector_type=VEHICLE,
-                                hourly_counts=None, ped_hourly_counts=None, expected_counts=None, impact=None):
+                                hourly_counts=None, ped_hourly_counts=None, expected_counts=None, impact=None, max_signals=0):
     if alerts is None or alerts.empty or signals_df is None:
         return pd.DataFrame(), 0
     return prepare_atspm_detector_health_table(
         alerts, signals_df, statuses, region=region, max_rows=max_rows,
         story_header=story_header, detector_type=detector_type, hourly_counts=hourly_counts,
-        ped_hourly_counts=ped_hourly_counts, expected_counts=expected_counts, impact=impact,
+        ped_hourly_counts=ped_hourly_counts, expected_counts=expected_counts, impact=impact, max_signals=max_signals,
     )
 
 
@@ -148,6 +161,34 @@ def _chart_flowables(figures: list, height: float = 2.8*inch, width: float = 6.5
         own = getattr(figure, 'report_own_proportions', False)
         elements.append(KeepTogether([MatplotlibFigure(figure, width=width, height=None if own else height)]))
         elements.append(Spacer(1, 0.15*inch))
+    return elements
+
+
+def _coordination_group_flowables(groups: list, styles) -> list:
+    """Coordination groups (coordination_check.CoordinationGroup), each its signals' names, its map and its charts two
+    to a row; no table (user, 2026-11-17)."""
+    elements = []
+    half = 3.6*inch
+    for group in groups:
+        head = [Paragraph(f'<b>{escape(str(group.title))}</b>', styles['Normal']), Spacer(1, 0.06*inch)]
+        if group.map is not None:
+            head.append(MatplotlibFigure(group.map, width=6.5*inch, height=None))
+            head.append(Spacer(1, 0.08*inch))
+        cells = [MatplotlibFigure(chart, width=half, height=None) for chart in group.charts]
+        if len(cells) == 1:         # one chart (a clock alert, or one day): full width under the map
+            grid = [[MatplotlibFigure(group.charts[0], width=6.5*inch, height=None)]]
+            table = Table(grid, colWidths=[2 * half])
+        else:
+            grid = [cells[k:k + 2] + [''] * (2 - len(cells[k:k + 2])) for k in range(0, len(cells), 2)]
+            table = Table(grid, colWidths=[half, half]) if grid else None
+        if table is not None:
+            table.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP'), ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                       ('RIGHTPADDING', (0, 0), (-1, -1), 0), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
+        elements.append(KeepTogether(head + ([table] if table is not None else [])) if len(grid) <= 1
+                        else KeepTogether(head))
+        if table is not None and len(grid) > 1:
+            elements.append(table)
+        elements.append(Spacer(1, 0.25*inch))
     return elements
 
 
@@ -538,9 +579,19 @@ def generate_pdf_report(
         measure_alerts: Optional[Dict[str, pd.DataFrame]] = None,
         timing_figures: Optional[List[tuple[plt.Figure, str]]] = None,
         ongoing_timing_figures: Optional[List[tuple[plt.Figure, str]]] = None,
+        table_signal_limits: Optional[Dict[str, int]] = None,
+        ongoing_rotated: bool = False,
+        ongoing_waiting: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Dict[str, BytesIO]:
     """Generate PDF reports for each region with the plots.
-    
+
+    table_signal_limits: signals a table lists (0 or missing: no limit), keys 'data_only' (Detector Health Data Only, new
+        and ongoing), 'phase_skips' (new and ongoing) and 'alarms' (Controller Alarms, the most alarms first).
+    ongoing_rotated: the ongoing alerts were already cut to what each region's report shows (table_limits.rotate_ongoing),
+        so a region's Ongoing tables list all of theirs; All Regions keeps its row limits over what the regions listed.
+        Coordination and the system outages keep their own limits.
+    ongoing_waiting: with ongoing_rotated, every ongoing alert before the cut: the Ongoing tables' totals count them all.
+
     Args:
         filtered_df_maxouts: DataFrame with phase termination alerts
         filtered_df_missing_data: DataFrame with missing data alerts
@@ -702,6 +753,9 @@ def generate_pdf_report(
     buffer_objects = []
     signal_focus = signal_focus or {}
     table_row_limits = table_row_limits or {}
+    table_signal_limits = table_signal_limits or {}
+    data_only_signals = table_signal_limits.get('data_only', 0)
+    phase_skip_signals = table_signal_limits.get('phase_skips', 0)
     # Each report's tables read their signal names from here, and a table leaves out a signal it has no name for, so
     # a signal in that report's Signal Focus goes from all of them.
     all_signals_df = signals_df
@@ -736,6 +790,10 @@ def generate_pdf_report(
 
         region_focus_rows = signal_focus.get(region, pd.DataFrame())
         ongoing_limit = table_row_limits.get('ongoing', max_table_rows)
+        # Rotated: a region's ongoing alerts are already the ones its report shows, all of them (0 = no row limit).
+        # The rotation already chose each region's ongoing alerts; the row limit still holds, whole signals kept
+        # (a phase skip table of 5 signals ran to 39 rows without it, replay of 2026-11-16).
+        rotated_limit = ongoing_limit
         if not region_focus_rows.empty:
             signals_df = all_signals_df[~all_signals_df['DeviceId'].astype(str).isin(region_focus_rows['DeviceId'])]
         else:
@@ -830,6 +888,7 @@ def generate_pdf_report(
                 signals_df,
                 region=region,
                 max_rows=max_table_rows,
+                max_signals=table_signal_limits.get('alarms', 0),
             )
         else:
             region_alarm_rows = pd.DataFrame()
@@ -866,9 +925,12 @@ def generate_pdf_report(
                     ongoing_alerts['clearance_intervals'],
                     signals_df,
                     region=region,
-                    max_rows=ongoing_limit,
+                    max_rows=rotated_limit,
                 )
             )
+            total_clearance_ongoing = _waiting_total(
+                ongoing_waiting, 'clearance_intervals', total_clearance_ongoing,
+                lambda frame: prepare_clearance_interval_alerts_table(frame, signals_df, region=region, max_rows=1))
         else:
             region_clearance_ongoing_rows = pd.DataFrame()
             total_clearance_ongoing = 0
@@ -926,9 +988,12 @@ def generate_pdf_report(
                     ongoing_alerts['general_phase_conflicts'],
                     signals_df,
                     region=region,
-                    max_rows=ongoing_limit,
+                    max_rows=rotated_limit,
                 )
             )
+            total_general_phase_ongoing = _waiting_total(
+                ongoing_waiting, 'general_phase_conflicts', total_general_phase_ongoing,
+                lambda frame: prepare_signal_conflicts_table(frame, signals_df, region=region, max_rows=1))
         else:
             region_general_phase_ongoing_rows = pd.DataFrame()
             total_general_phase_ongoing = 0
@@ -977,9 +1042,12 @@ def generate_pdf_report(
                     ongoing_alerts['overlap_conflicts'],
                     signals_df,
                     region=region,
-                    max_rows=ongoing_limit,
+                    max_rows=rotated_limit,
                 )
             )
+            total_overlap_conflict_ongoing = _waiting_total(
+                ongoing_waiting, 'overlap_conflicts', total_overlap_conflict_ongoing,
+                lambda frame: prepare_signal_conflicts_table(frame, signals_df, region=region, max_rows=1))
         else:
             region_overlap_conflict_ongoing_rows = pd.DataFrame()
             total_overlap_conflict_ongoing = 0
@@ -1031,8 +1099,11 @@ def generate_pdf_report(
             region_maxout_ongoing_rows, total_maxout_ongoing = prepare_phase_termination_alerts_table(
                 ongoing_alerts['maxout'],
                 region_signals_df,
-                max_rows=ongoing_limit,
+                max_rows=rotated_limit,
             )
+            total_maxout_ongoing = _waiting_total(
+                ongoing_waiting, 'maxout', total_maxout_ongoing,
+                lambda frame: prepare_phase_termination_alerts_table(frame, region_signals_df, max_rows=1))
         else:
             region_maxout_ongoing_rows = pd.DataFrame()
             total_maxout_ongoing = 0
@@ -1086,7 +1157,8 @@ def generate_pdf_report(
                 region=region,
                 allowed_pairs=allowed_phase_skip_pairs,
                 min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0,
-                max_rows=max_table_rows
+                max_rows=max_table_rows,
+                max_signals=phase_skip_signals,
             )
         else:
             region_phase_skip_rows = pd.DataFrame()
@@ -1099,8 +1171,14 @@ def generate_pdf_report(
                 region=region,
                 allowed_pairs=ongoing_phase_skip_pairs,
                 min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0,
-                max_rows=ongoing_limit,
+                max_rows=rotated_limit,
+                max_signals=phase_skip_signals,
             )
+            total_phase_skip_ongoing = _waiting_total(
+                ongoing_waiting, 'phase_skips', total_phase_skip_ongoing,
+                lambda frame: prepare_phase_skip_alerts_table(
+                    phase_skip_rows, signals_df, region=region, allowed_pairs=frame[['DeviceId', 'Phase']].drop_duplicates(),
+                    min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0, max_rows=1))
         else:
             region_phase_skip_ongoing_rows = pd.DataFrame()
             total_phase_skip_ongoing = 0
@@ -1157,19 +1235,28 @@ def generate_pdf_report(
             hourly_counts=atspm_detector_hourly, expected_counts=atspm_detector_expected,
         )
         ongoing_ranked_together = _has_rows(ongoing_atspm_health) and 'TriageRank' in ongoing_atspm_health.columns
+        ongoing_fault_limit = min(fault_limit, rotated_limit) if rotated_limit > 0 else 0
         region_atspm_fault_ongoing_rows, total_atspm_faults_ongoing = _atspm_detector_health_rows(
-            ongoing_atspm_health, signals_df, FAULT_STATUSES, region, min(fault_limit, ongoing_limit), 'What Is Wrong',
+            ongoing_atspm_health, signals_df, FAULT_STATUSES, region, ongoing_fault_limit, 'What Is Wrong',
             None if ongoing_ranked_together else VEHICLE,
             hourly_counts=atspm_detector_hourly, expected_counts=atspm_detector_expected, ped_hourly_counts=atspm_ped_hourly,
         )
+        total_atspm_faults_ongoing = _waiting_total(
+            ongoing_waiting, ATSPM_DETECTOR_HEALTH, total_atspm_faults_ongoing,
+            lambda frame: _atspm_detector_health_rows(frame, signals_df, FAULT_STATUSES, region, 1, 'What Is Wrong',
+                                                      None if ongoing_ranked_together else VEHICLE))
 
-        def fault_parts(alerts, limit):
-            """The faults in two tables, [(title, rows, total)], those affecting operations first."""
+        def fault_parts(alerts, limit, waiting=None):
+            """The faults in two tables, [(title, rows, total)], those affecting operations first; the Data Only table
+            stops at data_only_signals signals. waiting: see _waiting_total."""
             parts = []
             for title, impact in ((ATSPM_HARM_TABLE, True), (ATSPM_DATA_TABLE, False)):
                 rows, total = _atspm_detector_health_rows(
                     alerts, signals_df, FAULT_STATUSES, region, limit, 'What Is Wrong', None, hourly_counts=atspm_detector_hourly,
-                    expected_counts=atspm_detector_expected, ped_hourly_counts=atspm_ped_hourly, impact=impact)
+                    expected_counts=atspm_detector_expected, ped_hourly_counts=atspm_ped_hourly, impact=impact,
+                    max_signals=0 if impact else data_only_signals)
+                total = _waiting_total(waiting, ATSPM_DETECTOR_HEALTH, total, lambda frame: _atspm_detector_health_rows(
+                    frame, signals_df, FAULT_STATUSES, region, 1, 'What Is Wrong', None, impact=impact))
                 parts.append((title, rows, total))
             return parts
 
@@ -1227,7 +1314,7 @@ def generate_pdf_report(
         # Only faults carry on into an Ongoing section: a lane closure or plan
         # change that repeats is not something anyone needs reminding of.
         if ongoing_ranked_together:
-            for position, (title, rows, total) in enumerate(fault_parts(ongoing_atspm_health, min(fault_limit, ongoing_limit))):
+            for position, (title, rows, total) in enumerate(fault_parts(ongoing_atspm_health, ongoing_fault_limit, ongoing_waiting)):
                 ongoing_content.extend(_ongoing_section(
                     f"{ATSPM_DETECTOR_HEALTH_TITLE}: {title}", rows, total, styles, fault_limit,
                     figures=region_ongoing_atspm_health_figures if position == 0 else None,
@@ -1262,9 +1349,14 @@ def generate_pdf_report(
             hourly_counts=atspm_ped_hourly,
         )
         region_ped_fault_ongoing_rows, total_ped_faults_ongoing = (pd.DataFrame(), 0) if ongoing_ranked_together else _atspm_detector_health_rows(
-            ongoing_atspm_health, signals_df, FAULT_STATUSES, region, min(ped_fault_limit, ongoing_limit), 'What Is Wrong', PED,
+            ongoing_atspm_health, signals_df, FAULT_STATUSES, region, min(ped_fault_limit, rotated_limit) if rotated_limit > 0 else 0,
+            'What Is Wrong', PED,
             hourly_counts=atspm_ped_hourly,
         )
+        if not ongoing_ranked_together:
+            total_ped_faults_ongoing = _waiting_total(
+                ongoing_waiting, ATSPM_DETECTOR_HEALTH, total_ped_faults_ongoing,
+                lambda frame: _atspm_detector_health_rows(frame, signals_df, FAULT_STATUSES, region, 1, 'What Is Wrong', PED))
         region_ped_charts = region_atspm_health_figures.get('ped_fault', [])
         if not (region_ped_fault_rows.empty and region_ped_setup_rows.empty and not region_ped_charts):
             content.append(Paragraph(ATSPM_PED_HEALTH_TITLE, styles['SectionHeading']))
@@ -1314,7 +1406,9 @@ def generate_pdf_report(
         for section, heading, ongoing_title, trend_header in PREEMPT_SECTION_TEXT:
             rows, total = _preempt_rows(preempt_alerts_df, signals_df, region, max_table_rows, section)
             ongoing_rows, total_ongoing = _preempt_rows(
-                ongoing_alerts.get('preempts'), signals_df, region, ongoing_limit, section)
+                ongoing_alerts.get('preempts'), signals_df, region, rotated_limit, section)
+            total_ongoing = _waiting_total(ongoing_waiting, 'preempts', total_ongoing,
+                                           lambda frame: _preempt_rows(frame, signals_df, region, 1, section))
             region_preempt_any = region_preempt_any or not rows.empty
             region_preempt_ongoing_any = region_preempt_ongoing_any or not ongoing_rows.empty
             if not rows.empty:
@@ -1342,35 +1436,23 @@ def generate_pdf_report(
                 chart_height=PREEMPT_CHART_HEIGHT,
             ))
 
-        # Section: Coordination Plans and Clocks. Signal Focus does not tell these, so its signals stay in.
-        coordination_rows, total_coordination = prepare_coordination_table(
-            coordination_alerts_df, all_signals_df, region, max_table_rows)
-        coordination_ongoing_rows, total_coordination_ongoing = prepare_coordination_table(
-            ongoing_alerts.get(COORDINATION_ALERT_TYPE), all_signals_df, region, ongoing_limit)
-        if not coordination_rows.empty:
+        # Section: Coordination Plans and Clocks: each group's map and charts, no table (coordination_check). Signal
+        # Focus does not tell these, so its signals stay in.
+        coordination_groups = [group for group, reg in (coordination_figures or []) if reg == region]
+        ongoing_coordination_groups = [group for group, reg in (ongoing_coordination_figures or []) if reg == region]
+        if coordination_groups:
             content.append(Paragraph(COORDINATION_TITLE, styles['SectionHeading']))
             content.append(Spacer(1, 0.1*inch))
-            content.extend(create_reportlab_table(coordination_rows, COORDINATION_TITLE, styles,
-                                                  total_count=total_coordination, max_rows=max_table_rows,
-                                                  include_trend=False))
-            content.append(Spacer(1, 0.3*inch))
-            content.extend(_chart_flowables(
-                [fig for fig, reg in (coordination_figures or []) if reg == region], COORDINATION_CHART_HEIGHT))
-        ongoing_content.extend(_ongoing_section(
-            COORDINATION_TITLE,
-            coordination_ongoing_rows,
-            total_coordination_ongoing,
-            styles,
-            max_table_rows,
-            figures=[fig for fig, reg in (ongoing_coordination_figures or []) if reg == region],
-            chart_height=COORDINATION_CHART_HEIGHT,
-        ))
+            content.extend(_coordination_group_flowables(coordination_groups, styles))
+        if ongoing_coordination_groups:
+            ongoing_content.extend([Paragraph(COORDINATION_TITLE, styles['SubsectionHeading']), Spacer(1, 0.1*inch)]
+                                   + _coordination_group_flowables(ongoing_coordination_groups, styles))
 
         # Sections: checks on atspm's per-phase measures (each off unless switched on). Signal Focus does not tell these.
         measure_any = False
         for title, rows, total, ongoing_rows, total_ongoing, figures, ongoing_figures in _measure_sections(
-                measure_alerts, ongoing_alerts, all_signals_df, region, max_table_rows, ongoing_limit,
-                timing_figures, ongoing_timing_figures):
+                measure_alerts, ongoing_alerts, all_signals_df, region, max_table_rows, rotated_limit,
+                timing_figures, ongoing_timing_figures, waiting=ongoing_waiting):
             if not rows.empty:
                 measure_any = True
                 content.append(Paragraph(title, styles['SectionHeading']))
@@ -1390,9 +1472,12 @@ def generate_pdf_report(
             region_missing_data_ongoing_rows, total_missing_data_ongoing = prepare_missing_data_alerts_table(
                 ongoing_alerts['missing_data'],
                 region_signals_df,
-                max_rows=ongoing_limit,
+                max_rows=rotated_limit,
                 hourly=missing_data_hourly,
             )
+            total_missing_data_ongoing = _waiting_total(
+                ongoing_waiting, 'missing_data', total_missing_data_ongoing,
+                lambda frame: prepare_missing_data_alerts_table(frame, region_signals_df, max_rows=1, hourly=missing_data_hourly))
         else:
             region_missing_data_ongoing_rows = pd.DataFrame()
             total_missing_data_ongoing = 0
@@ -1480,8 +1565,8 @@ def generate_pdf_report(
             not region_general_phase_ongoing_rows.empty,
             not region_overlap_conflict_ongoing_rows.empty,
             region_preempt_ongoing_any,
-            not coordination_rows.empty,
-            not coordination_ongoing_rows.empty,
+            bool(coordination_groups),
+            bool(ongoing_coordination_groups),
             measure_any,
             not region_atspm_fault_ongoing_rows.empty,
             not region_ped_fault_ongoing_rows.empty,
