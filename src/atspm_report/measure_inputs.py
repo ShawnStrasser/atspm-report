@@ -72,18 +72,18 @@ def present(table) -> bool:
 
 def day_kind(day) -> str:
     """'Weekdays', 'Saturdays' or 'Sundays'."""
-    weekday = pd.Timestamp(day).dayofweek
+    weekday = pd.Timestamp(day).day_of_week
     return 'Saturdays' if weekday == 5 else 'Sundays' if weekday == 6 else 'Weekdays'
 
 
 def _nth_weekday(year, month, weekday, n):
     first = pd.Timestamp(year=year, month=month, day=1)
-    return first + pd.Timedelta(days=(weekday - first.dayofweek) % 7 + 7 * (n - 1))
+    return first + pd.Timedelta(days=(weekday - first.day_of_week) % 7 + 7 * (n - 1))
 
 
 def _last_weekday(year, month, weekday):
     last = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
-    return last - pd.Timedelta(days=(last.dayofweek - weekday) % 7)
+    return last - pd.Timedelta(days=(last.day_of_week - weekday) % 7)
 
 
 def holidays(start, end) -> list:
@@ -95,9 +95,9 @@ def holidays(start, end) -> list:
         for month, day in fixed:
             date = pd.Timestamp(year=year, month=month, day=day)
             days.add(date)
-            if date.dayofweek == 5:
+            if date.day_of_week == 5:
                 days.add(date - pd.Timedelta(days=1))
-            elif date.dayofweek == 6:
+            elif date.day_of_week == 6:
                 days.add(date + pd.Timedelta(days=1))
         thanksgiving = _nth_weekday(year, 11, 3, 4)
         days.update({_nth_weekday(year, 1, 0, 3), _nth_weekday(year, 2, 0, 3), _last_weekday(year, 5, 0),

@@ -100,7 +100,7 @@ def test_too_little_history_learns_no_group():
 def test_weekend_schedule_set_wrong_on_a_correct_clock():
     """08043: free all weekend while its group runs 75 s, with them on weekdays."""
     def rule(device, day, minute):
-        if device == 'B' and day.dayofweek >= 5:
+        if device == 'B' and day.day_of_week >= 5:
             return (21, 0)
         return _all_together(device, day, minute)
     findings = _findings(rule)
@@ -113,7 +113,7 @@ def test_weekend_schedule_set_wrong_on_a_correct_clock():
 
 def test_a_steady_late_change_on_weekdays():
     def rule(device, day, minute):
-        if device == 'B' and day.dayofweek < 5:
+        if device == 'B' and day.day_of_week < 5:
             return _plan(day, minute, start=7 * 60)
         return _all_together(device, day, minute)
     findings = _findings(rule)
@@ -135,7 +135,7 @@ def test_a_steady_early_change_of_thirty_minutes():
 
 def test_a_different_plan_on_saturdays():
     def rule(device, day, minute):
-        if device == 'B' and day.dayofweek == 5:
+        if device == 'B' and day.day_of_week == 5:
             return _plan(day, minute, start=10 * 60, end=16 * 60, cycle=120, pattern=3) if 10 * 60 <= minute < 16 * 60 \
                 else _plan(day, minute)
         return _all_together(device, day, minute)
@@ -157,14 +157,14 @@ def test_a_plan_change_lost_in_a_gap_is_not_a_difference():
     """Every weekday B's data stops 5:00-6:15, so its change to 75 s at 6:00 is lost: the record carries free on
     until it next changes (here 8:00, to a new pattern). Those bins are not trusted."""
     def rule(device, day, minute):
-        if device == 'B' and day.dayofweek < 5 and minute < 8 * 60:
+        if device == 'B' and day.day_of_week < 5 and minute < 8 * 60:
             return (21, 0)
-        if device == 'B' and day.dayofweek < 5:
+        if device == 'B' and day.day_of_week < 5:
             return _plan(day, minute, pattern=2)
         return _all_together(device, day, minute)
 
     def gap(device, ts):
-        return device == 'B' and ts.dayofweek < 5 and 5 * 60 <= ts.hour * 60 + ts.minute < 6 * 60 + 15
+        return device == 'B' and ts.day_of_week < 5 and 5 * 60 <= ts.hour * 60 + ts.minute < 6 * 60 + 15
     assert _findings(rule, skip=gap).empty
 
 
@@ -173,7 +173,7 @@ def test_a_sub_system_at_the_edge_of_a_group_is_not_alone():
     signals = _signals(['A', 'B', 'C', 'D', 'E'])
 
     def rule(device, day, minute):
-        if device in ('C', 'D') and day.dayofweek >= 5:
+        if device in ('C', 'D') and day.day_of_week >= 5:
             return (21, 0)
         return _all_together(device, day, minute)
     found = plan_findings(_coordination(rule), signals, REPORT_DAY)['findings']
@@ -183,7 +183,7 @@ def test_a_sub_system_at_the_edge_of_a_group_is_not_alone():
 def test_a_weekday_plan_of_its_own_is_flagged_for_review():
     """Another cycle every weekday 9:00-15:00 may be set up that way or set wrong: it is told, for the review to decide."""
     def rule(device, day, minute):
-        if device == 'B' and day.dayofweek < 5 and 9 * 60 <= minute < 15 * 60:
+        if device == 'B' and day.day_of_week < 5 and 9 * 60 <= minute < 15 * 60:
             return (4, 100)
         return _all_together(device, day, minute)
     findings = _findings(rule)
@@ -211,7 +211,7 @@ def test_one_odd_day_does_not_repeat():
 
 def test_a_difference_that_stopped_is_not_told():
     def rule(device, day, minute):
-        if device == 'B' and day.dayofweek >= 5 and day < REPORT_DAY - pd.Timedelta(days=14):
+        if device == 'B' and day.day_of_week >= 5 and day < REPORT_DAY - pd.Timedelta(days=14):
             return (21, 0)
         return _all_together(device, day, minute)
     assert _findings(rule).empty
@@ -326,7 +326,7 @@ def test_both_switches_off_leave_the_report_as_it_was():
 
 
 def test_the_plan_check_is_off_by_default():
-    rows = _coordination(lambda d, day, m: (21, 0) if d == 'X' and day.dayofweek >= 5 else _plan(day, m),
+    rows = _coordination(lambda d, day, m: (21, 0) if d == 'X' and day.day_of_week >= 5 else _plan(day, m),
                          devices=['X', 'N1', 'N2', 'N3'], days=DAYS[-3:])
     result, _ = _generate({'coordination_clock_check_enabled': False}, coordination=rows)
     assert result['alerts'][ALERT_TYPE].empty
@@ -334,7 +334,7 @@ def test_the_plan_check_is_off_by_default():
 
 def test_a_plan_alert_is_shown_as_its_group_map_and_a_chart_of_each_day_that_differs():
     def rule(device, day, minute):
-        if device == 'B' and day.dayofweek >= 5:
+        if device == 'B' and day.day_of_week >= 5:
             return (21, 0)
         return _all_together(device, day, minute)
     alerts = build_coordination_alerts(SIGNALS, REPORT_DAY, coordination=_coordination(rule), clock_check=False)['alerts']
@@ -353,7 +353,7 @@ def test_a_plan_alert_is_shown_as_its_group_map_and_a_chart_of_each_day_that_dif
 
 def _free_in_the_middle(device, day, minute):
     """C runs free all day between B and D; B runs free on weekends."""
-    if device == 'C' or (device == 'B' and day.dayofweek >= 5):
+    if device == 'C' or (device == 'B' and day.day_of_week >= 5):
         return (21, 0)
     return _all_together(device, day, minute)
 
@@ -407,9 +407,9 @@ def test_signals_in_the_middle_are_left_alone_until_the_position_rule_is_switche
 
 def _inside_and_end(device, day, minute):
     """B, inside the group, runs free on weekends; A, at its end, starts an hour late on weekdays."""
-    if device == 'B' and day.dayofweek >= 5:
+    if device == 'B' and day.day_of_week >= 5:
         return (21, 0)
-    if device == 'A' and day.dayofweek < 5:
+    if device == 'A' and day.day_of_week < 5:
         return _plan(day, minute, start=7 * 60)
     return _all_together(device, day, minute)
 
@@ -430,7 +430,7 @@ def test_a_nearby_signal_outside_the_group_running_the_same_lowers_confidence():
     def rule(device, day, minute):
         if device == 'X':
             return _plan(day, minute, cycle=120, pattern=2)
-        if device == 'B' and day.dayofweek == 5 and 10 * 60 <= minute < 16 * 60:
+        if device == 'B' and day.day_of_week == 5 and 10 * 60 <= minute < 16 * 60:
             return (3, 120)
         return _all_together(device, day, minute)
     alerts = build_coordination_alerts(signals, REPORT_DAY, clock_check=False,
@@ -441,7 +441,7 @@ def test_a_nearby_signal_outside_the_group_running_the_same_lowers_confidence():
 
 def test_a_clock_alert_tells_the_signal_once():
     """2B095: its plans run at the wrong hours because its clock is off; the clock alert is the one told."""
-    rows = _coordination(lambda d, day, m: (21, 0) if d == 'N1' and day.dayofweek >= 5 else _plan(day, m),
+    rows = _coordination(lambda d, day, m: (21, 0) if d == 'N1' and day.day_of_week >= 5 else _plan(day, m),
                          devices=['X', 'N1', 'N2', 'N3'])
     calls = _vehicle_calls(FALL_BACK + pd.Timedelta(hours=1), devices=('N1', 'X', 'N2', 'N3')).replace({'DeviceId': {'X': 'N1', 'N1': 'X'}})
     plan_only = build_coordination_alerts(CLOCK_SIGNALS, REPORT_DAY, coordination=rows, clock_check=False)['alerts']
@@ -476,7 +476,7 @@ def test_a_group_the_report_had_no_room_for_is_told_on_the_next_run():
 
     def rule(device, day, minute):
         if device == 'P1':
-            return (21, 0) if day.dayofweek >= 5 else _plan(day, minute)
+            return (21, 0) if day.day_of_week >= 5 else _plan(day, minute)
         return _inside_and_end(lines[device], day, minute) if device in ('X', 'N1', 'N2', 'N3') else _plan(day, minute)
     rows = _coordination(rule, devices=list(lines), days=pd.date_range(end - pd.Timedelta(days=41), end))
     config = {'coordination_clock_check_enabled': False, 'coordination_plan_check_enabled': True, 'coordination_figures': 1}
@@ -502,7 +502,7 @@ def test_a_group_gets_a_chart_for_each_distinct_day_that_shows_a_difference():
 def test_a_day_with_every_line_together_gets_no_chart():
     """user, 2026-11-17: a chart where the signal runs with its group shows nothing."""
     def rule(device, day, minute):
-        if device == 'B' and day.dayofweek >= 5:
+        if device == 'B' and day.day_of_week >= 5:
             return (21, 0)
         return _all_together(device, day, minute)
     alerts = build_coordination_alerts(SIGNALS, REPORT_DAY, coordination=_coordination(rule), clock_check=False)['alerts']
@@ -516,7 +516,7 @@ def test_a_day_with_every_line_together_gets_no_chart():
 
 def _free_signal_between_two_corridors(device, day, minute):
     """C free all day between A-B and D-E; B free on weekends."""
-    if device == 'C' or (device == 'B' and day.dayofweek >= 5):
+    if device == 'C' or (device == 'B' and day.day_of_week >= 5):
         return (21, 0)
     return _all_together(device, day, minute)
 
@@ -656,7 +656,7 @@ def test_a_signal_is_not_attached_part_time_past_a_nearer_signal_with_no_data():
 def test_a_neighbour_that_is_itself_out_of_step_does_not_excuse_a_signal():
     """2B050 beside 2B052: free at hours when 2B052, free all weekend, was the only one sharing it."""
     def rule(device, day, minute):
-        weekend = day.dayofweek >= 5
+        weekend = day.day_of_week >= 5
         if device == 'B' and weekend:
             return (21, 0)                                              # free all weekend
         if device == 'C' and weekend and not 9 * 60 <= minute < 18 * 60:

@@ -64,6 +64,7 @@
 
 ### Fixed
 
+- **Ongoing table turns on pandas 3**: the first run (nothing shown yet) and the row limit no longer fail; `Timestamp.dayofweek` (deprecated) is now `day_of_week` throughout.
 - Tables with many columns no longer shrink the trend column under its sparkline or run headers into each other: the trend keeps its width, long headers wrap and the signal name gives way first.
 - Clearance intervals no longer fail with "incompatible merge keys ... datetime64[ns] and datetime64[us]" when timeline times are microseconds (as DuckDB returns them) and an end time has to be filled from the duration, or on pandas 3.
 

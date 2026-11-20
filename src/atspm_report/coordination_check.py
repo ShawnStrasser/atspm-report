@@ -236,8 +236,8 @@ def us_clock_changes(start, end) -> list:
     for year in range(pd.Timestamp(start).year, pd.Timestamp(end).year + 1):
         march = pd.Timestamp(year=year, month=3, day=1)
         november = pd.Timestamp(year=year, month=11, day=1)
-        spring = march + pd.Timedelta(days=(6 - march.dayofweek) % 7 + 7, hours=2)
-        fall = november + pd.Timedelta(days=(6 - november.dayofweek) % 7, hours=2)
+        spring = march + pd.Timedelta(days=(6 - march.day_of_week) % 7 + 7, hours=2)
+        fall = november + pd.Timedelta(days=(6 - november.day_of_week) % 7, hours=2)
         changes += [(spring, 1), (fall, -1)]
     return [(when, hours) for when, hours in changes if pd.Timestamp(start) <= when <= pd.Timestamp(end)]
 

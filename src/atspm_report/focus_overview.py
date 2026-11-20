@@ -158,7 +158,7 @@ def normal_range(hourly: pd.Series, start, end) -> pd.DataFrame:
     typical = distance.median()
     if typical > 0:
         days = days[distance <= UNUSUAL_DAY * typical]
-    weekend = pd.Series(days.index.dayofweek >= 5, index=days.index)
+    weekend = pd.Series(days.index.day_of_week >= 5, index=days.index)
     tail = (1 - NORMAL_SHARE) / 2
     bands = {}
     for is_weekend in (False, True):
@@ -168,7 +168,7 @@ def normal_range(hourly: pd.Series, start, end) -> pd.DataFrame:
         if len(group) >= MIN_NORMAL_DAYS:
             bands[is_weekend] = (group.quantile(tail), group.quantile(1 - tail))
     def edge(hour, side):
-        band = bands.get(hour.dayofweek >= 5)
+        band = bands.get(hour.day_of_week >= 5)
         return band[side].get(hour.hour, np.nan) if band is not None else np.nan
     lo = [edge(hour, 0) for hour in hours]
     hi = [edge(hour, 1) for hour in hours]

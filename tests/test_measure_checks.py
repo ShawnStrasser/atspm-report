@@ -78,7 +78,7 @@ def delay_tables(report_day='2026-11-20', rise_hours=range(8, 14), usual=10.0, r
     """15-minute arrival_on_green, approach_delay and platoon_ratio of signal A phase 4 on the weekdays before report_day
     and on it; on the report day delay per vehicle is `risen` in rise_hours."""
     report = pd.Timestamp(report_day)
-    days = days or [d for d in pd.date_range(report - pd.Timedelta(days=14), report) if d.dayofweek < 5]
+    days = days or [d for d in pd.date_range(report - pd.Timedelta(days=14), report) if d.day_of_week < 5]
     rows = []
     for day in days:
         for ts in pd.date_range(day, periods=96, freq='15min'):
@@ -244,7 +244,7 @@ def test_a_steady_climb_is_flagged_and_a_bad_day_does_not_echo():
 def test_weekdays_are_judged_against_weekdays_only():
     # Weekends always fail more: no alert on a weekday, and a weekend day judged against weekend days only.
     table = split_table(days=28, last=0.10, wobble=0)
-    weekend = table['TimeStamp'].dt.dayofweek >= 5
+    weekend = table['TimeStamp'].dt.day_of_week >= 5
     table.loc[weekend, 'Split_Failure'] = 60
     assert mc.trend_alerts(mc.SPLIT_FAIL_TREND, table, '2026-12-10').empty
     assert mc.trend_alerts(mc.SPLIT_FAIL_TREND, table, '2026-12-06', history_days=28).empty

@@ -162,7 +162,9 @@ def rotate_ongoing(ongoing: dict, signals: pd.DataFrame, state: Optional[pd.Data
         last = state[state['AlertType'] == alert_type].set_index('Key')['LastShown']
         since = pd.to_datetime(alerts['OngoingSince']) if 'OngoingSince' in alerts.columns else pd.Series(pd.NaT, index=alerts.index)
         since = since.dt.tz_localize(None).dt.normalize() if since.dt.tz is not None else since.dt.normalize()
-        shown_last = pd.to_datetime(alerts['Key'].map(last)).astype('datetime64[ns]')
+        # reindex, not map: pandas 3 cannot map through an empty datetime Series
+        last = pd.to_datetime(last).astype('datetime64[ns]').groupby(level=0).max()
+        shown_last = pd.Series(last.reindex(alerts['Key']).to_numpy(), index=alerts.index, dtype='datetime64[ns]')
         waiting_from = pd.concat([shown_last, since.astype('datetime64[ns]')], axis=1).max(axis=1)
         alerts['Days'] = (today - waiting_from).dt.days.fillna(1).clip(lower=1)
         alerts['Priority'] = alerts['Weight'] * alerts['Days']
@@ -178,7 +180,7 @@ def rotate_ongoing(ongoing: dict, signals: pd.DataFrame, state: Optional[pd.Data
             # the limit counts the table's rows: signals in turn, each with all its rows, while they fit (the first
             # always does), so a signal with many rows does not make the table longer than before
             group = group[~group['DeviceId'].isin(hidden.get(region, ()))]
-            fits = (group['Rows'].cumsum() <= limit).to_numpy()
+            fits = (group['Rows'].cumsum() <= limit).to_numpy(copy=True)   # pandas 3: to_numpy is read-only
             fits[:1] = True
             chosen.append(group[fits & (fits.cumprod() == 1)])
         chosen = pd.concat(chosen, ignore_index=True)[['Table', 'DeviceId']] if chosen else pd.DataFrame(columns=['Table', 'DeviceId'])

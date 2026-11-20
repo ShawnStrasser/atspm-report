@@ -10,7 +10,13 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import odot_ingest
+import pytest
+
+try:   # ODOT's own ingest script, not in the package
+    import odot_ingest
+except ImportError:
+    odot_ingest = None
+needs_odot = pytest.mark.skipif(odot_ingest is None, reason="ODOT's own script, not in the package")
 from atspm_report.data_processing import process_missing_data
 from atspm_report.generator import _split_system_outages
 from atspm_report.health_story import evidence_text, health_story
@@ -24,12 +30,14 @@ from atspm_report.table_generation import (
 
 # ---- clock change ----
 
+@needs_odot
 def test_clock_change_hour_is_first_sunday_of_november():
     assert odot_ingest.clock_change_hour(2026) == (pd.Timestamp('2026-11-01 01:00'), pd.Timestamp('2026-11-01 02:00'))
     assert odot_ingest.clock_change_hour(2025) == (pd.Timestamp('2025-11-02 01:00'), pd.Timestamp('2025-11-02 02:00'))
     assert odot_ingest.clock_change_hour(2027) == (pd.Timestamp('2027-11-07 01:00'), pd.Timestamp('2027-11-07 02:00'))
 
 
+@needs_odot
 def test_staging_filter_only_for_windows_touching_the_hour():
     assert odot_ingest._clock_change_filter('2026-10-31 21:00', '2026-11-01 00:00') == ('', [])
     assert odot_ingest._clock_change_filter('2026-11-01 02:00', '2026-11-01 05:00') == ('', [])
@@ -39,6 +47,7 @@ def test_staging_filter_only_for_windows_touching_the_hour():
     assert odot_ingest._clock_change_filter(None, '2026-11-02 00:00')[1]
 
 
+@needs_odot
 def test_stored_rows_leave_out_the_hour():
     bins = pd.DataFrame({'TimeStamp': pd.to_datetime(['2026-11-01 00:45', '2026-11-01 01:00', '2026-11-01 01:45',
                                                       '2026-11-01 02:00', '2025-11-02 01:15', '2026-10-31 01:15'])})
@@ -46,6 +55,7 @@ def test_stored_rows_leave_out_the_hour():
     assert list(kept['TimeStamp'].astype(str)) == ['2026-11-01 00:45:00', '2026-11-01 02:00:00', '2026-10-31 01:15:00']
 
 
+@needs_odot
 def test_timeline_rows_crossing_the_hour_go_too():
     rows = pd.DataFrame({
         'StartTime': pd.to_datetime(['2026-11-01 00:59:50', '2026-11-01 01:30:00', '2026-11-01 01:59:50',
@@ -261,7 +271,8 @@ def test_tables_without_a_sentence_are_left_to_reportlab():
 
 def test_new_ped_labels_have_a_category_a_heading_and_plain_evidence():
     from atspm_report.health_story import HEADINGS, evidence_text
-    from odot_power_bi import CATEGORIES, PERIOD_CATEGORY
+    odot_power_bi = pytest.importorskip('odot_power_bi')   # ODOT's own script, not in the package
+    CATEGORIES, PERIOD_CATEGORY = odot_power_bi.CATEGORIES, odot_power_bi.PERIOD_CATEGORY
     for label in ('sustained pressing', 'walks without presses'):
         assert PERIOD_CATEGORY[label] in CATEGORIES and label in HEADINGS
     assert evidence_text('sustained pressing', 'sustained pressing: 2,608 presses on Sun 10-11, 5.7 x its usual ~460 a day, with 14 15-minute periods of 30+ presses at 10+ a walk') == \

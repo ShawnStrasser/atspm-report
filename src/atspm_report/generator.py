@@ -318,7 +318,7 @@ def _usual_by_hour(usual: Optional[pd.DataFrame], devices: list, start, end, sto
     for (device, detector), one in by_hour.groupby(level=['DeviceId', 'Detector']):
         table = one.droplevel(['DeviceId', 'Detector']).to_dict()
         expected[(device, int(detector))] = [
-            float('nan') if stop is not None and hour >= stop else table.get((hour.dayofweek >= 5, hour.hour), float('nan'))
+            float('nan') if stop is not None and hour >= stop else table.get((hour.day_of_week >= 5, hour.hour), float('nan'))
             for hour in hours]
     return expected
 

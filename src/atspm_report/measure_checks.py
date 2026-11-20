@@ -313,7 +313,7 @@ def _daily_platoon(platoon_ratio, start, end, faults, devices) -> pd.DataFrame:
 
 
 def _trend_kind(day) -> str:
-    return WEEKEND if pd.Timestamp(day).dayofweek >= 5 else WEEKDAY
+    return WEEKEND if pd.Timestamp(day).day_of_week >= 5 else WEEKDAY
 
 
 def trend_alerts(kind: str, table, report_day, faults: Optional[pd.DataFrame] = None, thresholds: Optional[dict] = None,

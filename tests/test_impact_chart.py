@@ -14,8 +14,8 @@ SIGNALS = pd.DataFrame({'DeviceId': ['A', 'B', 'C', 'D'], 'Name': ['08043-Odd', 
                         'Region': 'Region 1', 'Latitude': [42.1973, 42.1967, 42.1990, 42.1962],
                         'Longitude': [-122.7135, -122.7139, -122.7163, -122.7107]})
 DAYS = pd.date_range('2026-10-26', '2026-11-15')
-WEEKENDS = [d for d in DAYS if d.dayofweek >= 5]
-WEEKDAYS = [d for d in DAYS if d.dayofweek < 5]
+WEEKENDS = [d for d in DAYS if d.day_of_week >= 5]
+WEEKDAYS = [d for d in DAYS if d.day_of_week < 5]
 
 
 def hourly(worse=True, devices=('A', 'B', 'C', 'D'), vehicles=60.0):
@@ -24,7 +24,7 @@ def hourly(worse=True, devices=('A', 'B', 'C', 'D'), vehicles=60.0):
     for device in devices:
         for day in DAYS:
             for h in range(24):
-                weekend = day.dayofweek >= 5
+                weekend = day.day_of_week >= 5
                 bad = worse and weekend and device in ('A', 'B')
                 aog, delay = (0.30, 20.0) if bad else (0.45, 10.0)
                 rows.append((device, 8, day + pd.Timedelta(hours=h), vehicles, vehicles * aog, vehicles * delay))
