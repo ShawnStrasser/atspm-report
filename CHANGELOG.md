@@ -4,6 +4,7 @@
 
 ### Changed
 
+- **Time axis labels no longer overlap** on the detector and ped health charts and the Signal Focus overview ("18:00Wed 10/14 06:00" on a 3-day chart). The day still sits at midnight, with only as many hours between as fit: every 6 hours over 2 days, every 12 over 3, days alone over a week. New `focus_overview.day_time_ticks`.
 - **New System-Wide Outages has no Ongoing column.** It repeated the Dates (the day the outage began and its length) under a header that belongs to the Ongoing Issues section. `prepare_system_outages_table` adds the column only to rows that carry `OngoingSince` (the Ongoing table), where it is as before.
 - **Health tables merge only the signal name.** A detector's or button's cells stay on its own row: equal neighbouring cells (What Is Wrong, Impact) are no longer one merged cell over the next detector's row, and What Is Wrong is no longer cut to what the row before it does not say. This undoes 2.0.0's "say things once", which showed one detector's text ("Silent 5 h 35 min") across the next detector's row. `health_story.story_difference` is gone.
 - **An old report day gives its alerts.** The alert flagging window (`alert_flagging_days`), alert suppression (`alert_suppression_days`) and phase skip retention count back from the day after the report day (the latest `timeline` day; without a timeline the latest `has_data` day), not from the clock. A daily run reads the same days as before; a re-run of a day more than 7 days old no longer drops every alert.

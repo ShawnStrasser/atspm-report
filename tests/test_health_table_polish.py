@@ -143,3 +143,47 @@ def test_a_long_chart_caption_wraps_instead_of_losing_its_end():
     renderer = fig.canvas.get_renderer()
     width = fig.get_window_extent(renderer).width
     assert all(text.get_window_extent(renderer).x1 <= width for text in fig.texts)
+
+
+def _tick_labels_overlap(fig, ax):
+    """True when two of the axis's shown x tick labels touch; also returns the labels."""
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    shown = [label for label in ax.get_xticklabels() if label.get_visible() and label.get_text()]
+    boxes = sorted((label.get_window_extent(renderer) for label in shown), key=lambda box: box.x0)
+    return any(a.x1 > b.x0 for a, b in zip(boxes, boxes[1:])), [label.get_text() for label in shown]
+
+
+def test_detector_chart_day_labels_do_not_overlap_the_hours():
+    import pytest
+    for days in (1, 2, 3, 7, 14):
+        end = pd.Timestamp('2026-10-21')
+        start = end - pd.Timedelta(days=days)
+        findings = _findings()
+        alerts, _ = build_atspm_detector_health_alerts(findings, report_date='2026-10-20', info=CONFIG)
+        faults = alerts[alerts['Status'] == 'bad']
+        times = pd.date_range(start, end, freq='15min', inclusive='left')
+        counts = pd.DataFrame([{'TimeStamp': t, 'DeviceId': 'dev-a', 'Detector': d, 'Total': 3} for t in times for d in (1, 2, 3)])
+        figures = create_atspm_detector_health_plots(faults, SIGNALS, 3, counts, detector_info(CONFIG), window=(start, end))[0]
+        if not figures:
+            pytest.fail(f'no chart for {days} days')
+        fig = figures[0]
+        strip = fig.axes[-1]
+        overlap, labels = _tick_labels_overlap(fig, strip)
+        assert not overlap, (days, labels)
+        assert len(labels) >= 3, (days, labels)
+        if days > 1:
+            assert any('/' in label for label in labels), (days, labels)   # the days are still named
+
+
+def test_signal_focus_overview_time_labels_do_not_overlap():
+    from atspm_report.focus_overview import create_focus_overview
+    for days in (1, 2, 3, 7):
+        start = pd.Timestamp('2026-10-12')
+        end = start + pd.Timedelta(days=days)
+        hours = pd.date_range(start, end, freq='h', inclusive='left')
+        panel = {'kind': 'maxout', 'title': 'Percent Max Out', 'series': pd.Series(0.2, index=hours),
+                 'band': pd.DataFrame({'lo': 0.1, 'hi': 0.3}, index=hours)}
+        fig = create_focus_overview('Alpha', (start, end), panels=[panel])
+        overlap, labels = _tick_labels_overlap(fig, fig.axes[-1])
+        assert not overlap and len(labels) >= 3, (days, labels)

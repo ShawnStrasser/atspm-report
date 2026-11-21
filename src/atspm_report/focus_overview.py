@@ -333,10 +333,31 @@ FAULT_ROW_H, PANEL_H, TICK_ROW_H, TITLE_H, GAP_H, AXIS_H = 0.2, 0.95, 0.2, 0.22,
 WIDTH, LEFT, RIGHT = 7.5, 0.13, 0.975
 
 
-def _time_axis(ax, start, end, labels):
+# Time axis labels: the day ("Wed 10/14") at midnight and hours ("12:00") between, only as many hours as fit without two
+# labels touching. Label widths are estimated from the font size: a character is at most about 0.65 em wide (DejaVu Sans
+# digits are 0.64 em), and labels keep TICK_LABEL_GAP inches apart.
+TICK_CHAR_EM, TICK_LABEL_GAP = 0.65, 0.1
+HOUR_LABEL_CHARS, DAY_LABEL_CHARS = 5, 9
+
+
+def day_time_ticks(ax, start, end, fontsize: float) -> None:
+    """Ticks and labels of a time axis over [start, end) that do not overlap at this font size on this axis's width."""
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
     one_day = end - start <= pd.Timedelta(days=1)
-    ax.set_xlim(start, end)
-    ax.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, 3) if one_day else [0, 6, 12, 18]))
+    width = ax.get_position().width * ax.get_figure().get_figwidth()
+    per_hour = width / max((end - start) / pd.Timedelta(hours=1), 1.0)
+    char = TICK_CHAR_EM * fontsize / 72
+    hour_w, day_w = HOUR_LABEL_CHARS * char, DAY_LABEL_CHARS * char
+    if one_day:
+        step = next((h for h in (3, 6, 12) if h * per_hour >= hour_w + TICK_LABEL_GAP), 24)
+        ax.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, step)))
+    else:
+        step = next((h for h in (6, 12) if h * per_hour >= (day_w + hour_w) / 2 + TICK_LABEL_GAP), None)
+        if step is not None:
+            ax.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, step)))
+        else:   # days only, every so many days when one a day does not fit
+            every = next(k for k in range(1, 1000) if 24 * k * per_hour >= day_w + TICK_LABEL_GAP)
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=every))
 
     def tick(value, _):
         moment = mdates.num2date(value).replace(tzinfo=None)
@@ -347,6 +368,11 @@ def _time_axis(ax, start, end, labels):
         return f"{moment:%a} {moment.month}/{moment.day}" if moment.hour == 0 else moment.strftime('%H:%M')
 
     ax.xaxis.set_major_formatter(FuncFormatter(tick))
+
+
+def _time_axis(ax, start, end, labels):
+    ax.set_xlim(start, end)
+    day_time_ticks(ax, start, end, 8.5)
     ax.tick_params(axis='x', labelsize=8.5, labelbottom=labels, length=3 if labels else 0)
     for day in pd.date_range(start, end, freq='D')[1:-1]:
         ax.axvline(day, color='#999999', linewidth=0.8, zorder=1)

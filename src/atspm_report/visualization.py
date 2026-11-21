@@ -12,7 +12,7 @@ import math
 import textwrap
 import re
 
-from .focus_overview import _centred, walk_share
+from .focus_overview import _centred, day_time_ticks, walk_share
 from .preempt_cascade import DIRECTION_FALSE_CALLS, bus_calls_text
 
 warnings.filterwarnings('ignore', message='More than.*figures have been opened') # default is 20 and thats too low
@@ -1202,14 +1202,6 @@ def create_atspm_detector_health_plots(alerts: 'pd.DataFrame', signals_df: 'pd.D
 
     one_day = window_end - window_start <= pd.Timedelta(days=1)
 
-    def tick_label(value, _):
-        moment = mdates.num2date(value).replace(tzinfo=None)
-        if moment >= window_end - pd.Timedelta(minutes=1):
-            return ''
-        if one_day:
-            return moment.strftime('%H:%M')
-        return f"{moment:%a} {moment.month}/{moment.day}" if moment.hour == 0 else moment.strftime('%H:%M')
-
     figures = []
     # A phase's chart is the same in its region's report and in All Regions.
     drawn = {}
@@ -1438,12 +1430,9 @@ def create_atspm_detector_health_plots(alerts: 'pd.DataFrame', signals_df: 'pd.D
             for axis in (ax, strip) if ax_walks is None else (ax, ax_walks, strip):
                 for day in days:
                     axis.axvline(day, color='#999999', linewidth=0.8, zorder=1)
+            day_time_ticks(strip, window_start, window_end, 9.5)
             if one_day:
-                strip.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, 3)))
                 strip.set_xlabel(window_start.strftime('%A %b %d'), fontsize=10)
-            else:
-                strip.xaxis.set_major_locator(mdates.HourLocator(byhour=[0, 6, 12, 18]))
-            strip.xaxis.set_major_formatter(FuncFormatter(tick_label))
             ax.legend(loc='lower left', bbox_to_anchor=(0, 1), borderaxespad=0.2, fontsize=9, frameon=False,
                       ncol=math.ceil(len(legend_labels) / legend_rows))
             figures.append((fig, region))
