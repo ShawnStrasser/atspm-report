@@ -11,7 +11,7 @@ from .alarm_processing import ALARM_EVENT_CLASSES, ALARM_HISTORY_DAYS, FLASH_EVE
 from .preempt_processing import PREEMPT_HISTORY_DAYS
 from .atspm_detector_health import run_atspm_detector_findings
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __all__ = [
     "ReportGenerator",
     "ALARM_EVENT_CLASSES",
