@@ -584,6 +584,59 @@ def test_a_map_without_its_base_map_is_still_drawn(monkeypatch):
     assert group.map is not None and cc._basemap['on'] is False and not group.map.axes[0].images
 
 
+class _TileServer:
+    """A base-map server on 127.0.0.1 that answers every tile with a grey PNG."""
+
+    def __enter__(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from io import BytesIO
+        from PIL import Image
+        buffer = BytesIO()
+        Image.new('RGB', (256, 256), (200, 200, 200)).save(buffer, format='PNG')
+        png = buffer.getvalue()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/png')
+                self.send_header('Content-Length', str(len(png)))
+                self.end_headers()
+                self.wfile.write(png)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return f'http://127.0.0.1:{self.server.server_address[1]}/{{z}}/{{x}}/{{y}}.png'
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_a_failed_base_map_is_tried_again_in_the_next_report_and_logged(monkeypatch, caplog):
+    import logging
+    monkeypatch.setitem(cc._basemap, 'on', True)
+    monkeypatch.setattr(cc, '_tiles', {})
+    alerts = build_coordination_alerts(SIGNALS, REPORT_DAY, coordination=_coordination(_inside_and_end), clock_check=False)['alerts']
+    # A report with the network blocked: drawn without a base map, and the host's logs say so.
+    monkeypatch.setattr(cc, 'MAP_TILES', 'http://127.0.0.1:9/{z}/{x}/{y}.png')
+    with caplog.at_level(logging.WARNING, logger='atspm_report.coordination_check'):
+        blocked = create_coordination_plots(alerts, SIGNALS)[0][0]
+    assert not blocked.map.axes[0].images
+    warnings = [r for r in caplog.records if r.name == 'atspm_report.coordination_check' and r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and 'no base map' in warnings[0].getMessage()
+    # The next report, in the same process, with the network back: generate() tries again and the map has its base.
+    ReportGenerator({'verbosity': 0}).generate(signals=SIGNALS)
+    assert cc._basemap['on'] is True
+    with _TileServer() as tiles:
+        monkeypatch.setattr(cc, 'MAP_TILES', tiles)
+        unblocked = create_coordination_plots(alerts, SIGNALS)[0][0]
+    assert unblocked.map.axes[0].images
+
+
 def test_without_coordinates_groups_come_from_the_corridors_and_have_no_map():
     plain = SIGNALS.drop(columns=['Latitude', 'Longitude'])
     rows = _coordination(_inside_and_end)

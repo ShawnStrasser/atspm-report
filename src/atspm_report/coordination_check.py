@@ -60,6 +60,7 @@ Both run as set-based SQL on one in-memory DuckDB connection; Python only words 
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from typing import Optional
@@ -71,6 +72,8 @@ import pandas as pd
 from .duckdb_utils import to_pandas
 from .preempt_cascade import CLASS_RAIL, TSP_CLASSES, signal_neighbours
 from .utils import log_message
+
+logger = logging.getLogger(__name__)
 
 ALERT_TYPE = 'coordination'
 CAUSE_SCHEDULE, CAUSE_CLOCK = 'Schedule', 'Clock'
@@ -1488,7 +1491,14 @@ def _day_chart(day, coloured: list, parts: list, week: dict, number):
 
 
 _tiles = {}
+# Off once a tile request fails, for the rest of that report (each failure would wait MAP_TILE_SECONDS); generate() turns
+# it back on at the start of every report (reset_base_map), so a passing network failure costs only that report its maps.
 _basemap = {'on': True}
+
+
+def reset_base_map() -> None:
+    """Try the base map again: called at the start of each report."""
+    _basemap['on'] = True
 
 
 def _world_px(lat, lon, z):
@@ -1497,7 +1507,7 @@ def _world_px(lat, lon, z):
 
 
 def _tile(z, x, y):
-    """One base-map tile, or None once a request has failed this run (the maps are then drawn without one)."""
+    """One base-map tile, or None once a request has failed in this report (the maps are then drawn without one)."""
     if not _basemap['on'] or not MAP_TILES:
         return None
     if (z, x, y) not in _tiles:
@@ -1513,7 +1523,7 @@ def _tile(z, x, y):
         except Exception as error:      # no base map: the map is drawn without one
             if _basemap['on']:
                 _basemap['on'] = False
-                log_message(f"Coordination maps: no base map ({type(error).__name__}: {error}); drawn without it.", 1, 1)
+                logger.warning("Coordination maps: no base map (%s: %s); drawn without it.", type(error).__name__, error)
             return None
     return _tiles[(z, x, y)]
 

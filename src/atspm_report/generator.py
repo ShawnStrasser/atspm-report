@@ -122,6 +122,7 @@ from .coordination_check import (
     build_coordination_alerts,
     listed_alerts,
     create_coordination_plots,
+    reset_base_map,
 )
 from . import measure_inputs
 from .measure_checks import (
@@ -892,6 +893,7 @@ class ReportGenerator:
             timeline, timeline_latest, report_day = _split_timeline_days(_to_pandas(timeline))
         device_days = _to_pandas(device_days) if not _is_empty(device_days) else None
         today = self.report_today = _report_today(report_day, has_data)
+        reset_base_map()   # a base map that failed in an earlier report is tried again
         
         verbosity = self.config['verbosity']
         log_message("Starting signal analysis...", 1, verbosity)

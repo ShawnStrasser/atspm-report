@@ -4,6 +4,7 @@
 
 ### Changed
 
+- **A failed base map costs only that report its maps.** After a tile request fails, the coordination maps of that report are drawn without a base map as before, but the next report tries again (`generate()` calls the new `coordination_check.reset_base_map`), instead of leaving base maps off until the process restarts. The failure is a `logging` warning (logger `atspm_report.coordination_check`) instead of a print, so a host app's logs show it.
 - **Time axis labels no longer overlap** on the detector and ped health charts and the Signal Focus overview ("18:00Wed 10/14 06:00" on a 3-day chart). The day still sits at midnight, with only as many hours between as fit: every 6 hours over 2 days, every 12 over 3, days alone over a week. New `focus_overview.day_time_ticks`.
 - **New System-Wide Outages has no Ongoing column.** It repeated the Dates (the day the outage began and its length) under a header that belongs to the Ongoing Issues section. `prepare_system_outages_table` adds the column only to rows that carry `OngoingSince` (the Ongoing table), where it is as before.
 - **Health tables merge only the signal name.** A detector's or button's cells stay on its own row: equal neighbouring cells (What Is Wrong, Impact) are no longer one merged cell over the next detector's row, and What Is Wrong is no longer cut to what the row before it does not say. This undoes 2.0.0's "say things once", which showed one detector's text ("Silent 5 h 35 min") across the next detector's row. `health_story.story_difference` is gone.
