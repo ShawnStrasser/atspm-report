@@ -104,6 +104,13 @@ def test_outage_table_has_one_row_per_real_outage():
     assert list(table['Regions']) == ['All 5 regions', 'All 5 regions']
     assert list(table['Days']) == [1, 2]
     assert list(table['Missing Data %']) == [0.6, 1.0]
+    # New outages: Dates say when and how long; an Ongoing column belongs to the Ongoing table only.
+    assert 'Ongoing' not in table.columns
+
+
+def test_ongoing_outage_table_has_the_ongoing_column():
+    days = _real_days().assign(OngoingSince=pd.Timestamp('2026-10-29'))
+    table, _ = prepare_system_outages_table(days, all_regions=FIVE)
     assert list(table['Ongoing']) == ['11/1/26 (1d)', 'Ended 10/30/26']
 
 
@@ -119,6 +126,7 @@ def test_old_unrelated_outages_do_not_make_a_new_one_ongoing():
     days = _real_days()
     new, ongoing = _split_system_outages(days, days, past)
     assert len(new) == len(days) and ongoing.empty
+    assert 'Ongoing' not in prepare_system_outages_table(new, all_regions=FIVE)[0].columns   # the New table
 
 
 def test_outage_reported_before_is_ongoing_from_the_day_it_began():

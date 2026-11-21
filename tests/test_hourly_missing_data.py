@@ -66,6 +66,6 @@ def test_system_outage_gives_its_hours():
                          + [bins(device, '2026-11-03 16:00', '2026-11-04') for device in 'AB'])
     hourly = region_missing_by_hour(has_data, SIGNALS)
     table, total = prepare_system_outages_table(days, hourly=hourly)
-    assert total == 1 and list(table.columns) == ['Dates', 'Regions', 'When', 'Hours Out', 'Ongoing']
+    assert total == 1 and list(table.columns) == ['Dates', 'Regions', 'When', 'Hours Out']
     assert table.iloc[0]['When'] == 'Tue 11/3 06:00-16:00' and table.iloc[0]['Hours Out'] == 10
     assert 'Missing Data %' in prepare_system_outages_table(days)[0].columns

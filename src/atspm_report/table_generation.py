@@ -918,9 +918,10 @@ def prepare_system_outages_table(system_outages_df, max_rows=10, all_regions=Non
     The input holds one row per region and day at 30% missing data or more. Days in a
     row are one outage, a day that recovered ends it, and regions out on the same days
     are one outage too. Missing Data % is the outage's worst day, the average over its
-    regions. Ongoing says the day it began and how many days it has lasted while it is
-    still out on the latest day of data (LatestDataDay), else the day it ended; rows
-    without LatestDataDay have no Ongoing column.
+    regions. Only the Ongoing table's rows (they carry OngoingSince, from the generator's
+    suppression) get an Ongoing column: the day the outage began and how many days it has
+    lasted while it is still out on the latest day of data (LatestDataDay), else the day it
+    ended. A new outage has none: its Dates already say when it began and how long it lasted.
 
     With hourly (Region, TimeStamp = the hour, MissingData; data_processing.region_missing_by_hour) the outage is placed in
     time instead: When gives the runs of hours its regions averaged OUTAGE_HOUR_SHARE missing or more, and Hours Out how
@@ -928,6 +929,7 @@ def prepare_system_outages_table(system_outages_df, max_rows=10, all_regions=Non
 
     Args:
         system_outages_df: DataFrame of Date, Region, MissingData and optionally LatestDataDay
+            and OngoingSince
         max_rows: Maximum number of rows to include in the table
         all_regions: Every region of the report, to say 'All 5 regions'
         hourly: Optional share of missing records per region and hour
@@ -944,7 +946,8 @@ def prepare_system_outages_table(system_outages_df, max_rows=10, all_regions=Non
         Regions=('Region', list), Worst=('MissingData', 'mean')
     ).reset_index().sort_values('Date')
     by_day['Outage'] = (by_day['Date'].diff() != pd.Timedelta(days=1)).cumsum()
-    latest = pd.to_datetime(days['LatestDataDay']).max() if 'LatestDataDay' in days.columns else None
+    latest = (pd.to_datetime(days['LatestDataDay']).max()
+              if {'LatestDataDay', ONGOING_SINCE_COLUMN} <= set(days.columns) else None)
 
     by_hour = hourly is not None and not hourly.empty
     if by_hour:
