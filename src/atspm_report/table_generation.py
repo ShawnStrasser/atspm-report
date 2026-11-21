@@ -9,7 +9,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from .atspm_detector_health import PED, VEHICLE, affects_operations, health_table_order, signal_wide_rows
 from .preempt_cascade import bus_calls_text
-from .health_story import detector_label, health_story, story_difference
+from .health_story import detector_label, health_story
 
 # Ongoing-issue rows arrive carrying the date their current run of repeats started.
 # Every prepare_* function passes that column through untouched and renders it as
@@ -515,35 +515,6 @@ def _contiguous_runs(values):
     return runs
 
 
-def _merge_repeats(cells, span_style, df_display, header, story_name, story_style, block_start, block_length, trend_index):
-    """Say things once within a block of a signal's rows (table rows from block_start). A column's equal neighbours become one merged
-    cell; in the story, a detector keeps only what the story before it does not say, and one that adds nothing joins it."""
-    rows = range(block_start, block_start + block_length)
-    for index, name in enumerate(header):
-        if index == 0 or index == trend_index or name not in df_display.columns:
-            continue
-        values = [df_display[name].iloc[row - 1] for row in rows]
-        if name == story_name:
-            values = [values[0]] + [story_difference(values[position - 1], values[position]) for position in range(1, len(values))]
-            for position, value in enumerate(values[1:], start=1):
-                if value:
-                    cells[block_start + position][index] = Paragraph(value, story_style)
-            runs, position = [], 0
-            while position < len(values):
-                end = position
-                while end + 1 < len(values) and not values[end + 1]:
-                    end += 1
-                runs.append((position, end - position + 1))
-                position = end + 1
-        else:
-            runs = _contiguous_runs(values)
-        for run_start, run_length in runs:
-            if run_length > 1:
-                span_style.add('SPAN', (index, block_start + run_start), (index, block_start + run_start + run_length - 1))
-                for offset in range(1, run_length):
-                    cells[block_start + run_start + offset][index] = ''
-
-
 def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, include_trend=True, trend_header='Trend'):
     """Create a ReportLab table from a pandas DataFrame
     
@@ -711,23 +682,12 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
                 table._cellvalues[row_index][-1] = sparkline
 
     if group_runs is not None:
-        # Merge each signal's repeated cells into one, centered across its rows.
+        # Merge each signal's name into one cell, centered across its rows. Only the name:
+        # a detector's details are its own, so every other cell stays on its row.
         # Measuring first, with every label still in place, gives an upper bound
         # on the row heights, so a merge placed here is certain to fit its page.
         table.wrap(TABLE_AVAILABLE_WIDTH, TABLE_AVAILABLE_HEIGHT)
         row_heights = list(table._rowHeights or [])
-        story_name = next((name for name in header if name in STORY_COLUMNS), None)
-        if story_name is not None:
-            # Blocks are measured as they will read, with what is said once left out, so a signal is not split for text it will not show.
-            quiet = [list(row) for row in table._cellvalues]
-            quiet_spans = TableStyle([])
-            for start, length in group_runs:
-                _merge_repeats(quiet, quiet_spans, df_display, header, story_name, story_style, start + 1, length,
-                               len(header) - 1 if include_trend else None)
-            measured = Table(quiet, colWidths=colWidths)
-            measured.setStyle(table_style)
-            measured.wrap(TABLE_AVAILABLE_WIDTH, TABLE_AVAILABLE_HEIGHT)
-            row_heights = list(measured._rowHeights or row_heights)
         header_height = row_heights[0] if row_heights else 0.0
         span_budget = TABLE_AVAILABLE_HEIGHT - header_height
         if IMPACT_COLUMN in df_display.columns:
@@ -750,10 +710,6 @@ def create_reportlab_table(df, title, styles, total_count=None, max_rows=10, inc
                 # which is what the reader needs anyway.
                 for offset in range(1, block_length):
                     cells[block_start + offset][0] = ""
-                if story_name is not None:
-                    # A table only breaks between blocks, so each one opens with its first detector's whole story.
-                    _merge_repeats(cells, span_style, df_display, header, story_name, story_style, block_start, block_length,
-                                   len(header) - 1 if include_trend else None)
         # Fresh, since a measured table keeps the heights of what it held.
         start_height = table.start_height
         table = Table(cells, colWidths=colWidths)

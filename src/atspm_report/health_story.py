@@ -335,37 +335,6 @@ def detector_label(number, reason, item: str = 'Det') -> str:
     return f"{item} {number}, {text}" if text else f"{item} {number}"
 
 
-_HEADING = re.compile(r'^(<b>.*?</b>)\s*(.*)$')
-
-
-def _story_sentences(text: str) -> list:
-    """[(heading or the whole sentence, its clauses)] of a story, without the sentences' full stops."""
-    sentences = []
-    for sentence in re.split(r'(?<=\.)\s+', str(text).strip()):
-        sentence = sentence.rstrip('.')
-        heading = _HEADING.match(sentence)
-        if heading:
-            sentences.append((heading.group(1), [clause for clause in re.split(r', |: |; ', heading.group(2)) if clause]))
-        elif sentence:
-            sentences.append((sentence, []))
-    return sentences
-
-
-def story_difference(previous: str, current: str) -> str:
-    """What a story says that the one before it does not, for the next detector of a signal: a finding the one before had keeps only
-    its own times and numbers, a new finding stays whole. Empty when it says nothing more."""
-    before = dict(_story_sentences(previous))
-    parts = []
-    for heading, clauses in _story_sentences(current):
-        if heading not in before:
-            parts.append(f"{heading} {', '.join(clauses)}".strip())
-            continue
-        own = [clause for clause in clauses if clause not in before[heading]]
-        if own:
-            parts.append(', '.join(own))
-    return ' '.join(f"{part}." for part in parts)
-
-
 def health_story(reason, periods=None, evidence=None, bold: bool = True, name_detector: bool = True) -> str:
     """The row's narrative as reportlab markup, or plain text with bold=False.
 

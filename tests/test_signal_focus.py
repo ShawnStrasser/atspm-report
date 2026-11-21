@@ -11,7 +11,6 @@ from atspm_report.signal_focus import (
 )
 from atspm_report.data_processing import detect_feed_stop, mark_open_periods, process_missing_data, trim_findings_to_stop
 from atspm_report.generator import _usual_by_hour
-from atspm_report.health_story import story_difference
 from atspm_report.report_generation import generate_pdf_report
 from atspm_report.table_generation import create_reportlab_table, create_sparkline, prepare_atspm_detector_health_table
 from reportlab.lib.styles import getSampleStyleSheet
@@ -482,21 +481,21 @@ def test_report_says_when_the_data_stopped_at_its_top():
     assert text.index('Data stopped updating at Tue 11/3/2026 18:15.') < text.index('Detector Health')
 
 
-def test_repeats_in_a_signal_s_health_rows_are_said_once():
-    first = '<b>Counts fell</b> 3 h, Wed 11/4 09:00-12:00: to 5% of normal. Ph8 Advance.'
-    assert story_difference(first, first) == ''
-    assert story_difference(first, '<b>Counts fell</b> 3 h, Wed 11/4 09:00-12:00: to 8% of normal. Ph8 Advance.') == 'to 8% of normal.'
-    assert story_difference(first, '<b>Held ON</b> 2 h, Wed 11/4 01:00-03:00.') == '<b>Held ON</b> 2 h, Wed 11/4 01:00-03:00.'
+def test_only_the_signal_name_is_merged_in_a_health_table():
+    """A detector's details are its own: equal text on the next detector's row stays on that row, never one cell over both."""
+    first = '<b>Silent</b> 5 h 35 min, Wed 11/4 09:00-14:35.'
     styles = getSampleStyleSheet()
     impact = '<b>Other phases</b> wait 27 s longer'
-    rows = pd.DataFrame({'Signal': ['Alpha'] * 3 + ['Bravo'], 'Det': ['Det 1', 'Det 2', 'Det 3', 'Det 1'], 'Impact': [impact] * 3 + ['None'],
-                         'What Is Wrong': [first, first, first.replace('5%', '8%'), first]})
+    rows = pd.DataFrame({'Signal': ['Alpha'] * 3 + ['Bravo'], 'Det': ['Det 22', 'Det 23', 'Det 24', 'Det 1'],
+                         'Impact': [impact] * 3 + ['None'],
+                         'What Is Wrong': [first, first, first.replace('5 h 35 min', '2 h'), first]})
     table = create_reportlab_table(rows, 'Health', styles, include_trend=False)[-1]
     spans = {(cmd[1], cmd[2]) for cmd in table._spanCmds}
-    assert ((2, 1), (2, 3)) in spans                       # one Impact cell for Alpha's three detectors
-    assert ((3, 1), (3, 2)) in spans                       # detector 2's story is detector 1's
-    assert table._cellvalues[3][3][0].text.strip() == 'to 8% of normal.'
-    assert 'Counts fell' in table._cellvalues[4][3][0].text      # another signal starts whole
+    assert spans == {((0, 1), (0, 3))}                     # Alpha's name, and nothing else
+    stories = [table._cellvalues[row][3][0].text.strip() for row in range(1, 5)]
+    assert stories[0] == stories[1] == first
+    assert stories[2] == '<b>Silent</b> 2 h, Wed 11/4 09:00-14:35.'
+    assert all('Other phases' in table._cellvalues[row][2][0].text for row in range(1, 4))
 
 
 def test_health_rows_that_continue_on_a_new_block_start_whole():
