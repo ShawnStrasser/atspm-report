@@ -791,9 +791,12 @@ class ReportGenerator:
                 - arrival_on_green: TimeStamp, DeviceId, Phase, Total_Actuations (vehicles
                   from the advance zones reaching the stop bar), Percent_AOG (0-1).
                 - approach_delay: TimeStamp, DeviceId, Phase, Delay_Seconds (measured),
-                  Queued_Delay_Seconds (estimated), seconds summed over the bin's vehicles.
-                  With arrival_on_green: delay per vehicle = (SUM(Delay_Seconds) +
-                  SUM(Queued_Delay_Seconds)) / SUM(Total_Actuations), bins joined first. Told
+                  Queued_Delay_Seconds (estimated) and optionally Queue_Delay_Seconds (the
+                  whole delay by atspm 3.1's Queue Model, queue_model=True), seconds summed
+                  over the bin's vehicles. The delay is Queue_Delay_Seconds where present,
+                  else (also on a row where it is NULL) Delay_Seconds + Queued_Delay_Seconds.
+                  With arrival_on_green: delay per vehicle = SUM(delay) /
+                  SUM(Total_Actuations), bins joined first. Told
                   in the detector triage's Impact (wait_days before its window), drawn on
                   the coordination impact charts (as many days as given, three weeks is
                   enough) and judged by the delay rise check (STEP_LOOKBACK_DAYS).

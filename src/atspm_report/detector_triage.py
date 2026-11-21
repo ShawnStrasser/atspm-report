@@ -714,11 +714,10 @@ def _delays(con, wanted: pd.DataFrame, approach_delay, arrival_on_green, faults,
         "SELECT DISTINCT m.DeviceId FROM fr r JOIN dmap m USING (did) WHERE r.rid IN (SELECT rid FROM wanted_in)").fetchall()]
     start = pd.Timestamp(wait_start)
     bins = mi.rows(arrival_on_green, 'DeviceId, Phase, TimeStamp, Total_Actuations', start, window_end, devices).merge(
-        mi.rows(approach_delay, 'DeviceId, Phase, TimeStamp, Delay_Seconds, Queued_Delay_Seconds', start, window_end, devices),
-        on=['DeviceId', 'Phase', 'TimeStamp'])
+        mi.delay_rows(approach_delay, start, window_end, devices), on=['DeviceId', 'Phase', 'TimeStamp'])
     bins = pd.DataFrame({'DeviceId': bins['DeviceId'].astype(str), 'Phase': bins['Phase'].astype('int64'),
                          'ts': pd.to_datetime(bins['TimeStamp']).astype('datetime64[us]'),
-                         'dsum': (bins['Delay_Seconds'] + bins['Queued_Delay_Seconds']).astype(float),
+                         'dsum': bins['Delay'].astype(float),
                          'veh': bins['Total_Actuations'].astype(float)})
     bins = mi.unmasked(bins, faults, mi.ADVANCE, '15 MINUTE', 'ts')
     con.register('dl_in', bins)

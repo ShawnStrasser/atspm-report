@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.0
+
+### Changed
+
+- **Delay from atspm's Queue Model.** When `approach_delay` has `Queue_Delay_Seconds` (atspm 3.1 with `queue_model=True`), delay per vehicle is `SUM(Queue_Delay_Seconds) / SUM(Total_Actuations)`: the Sudden Rise in Delay check, the detector triage's Impact and the coordination impact chart. A row where it is NULL, or a table without it, takes `Delay_Seconds + Queued_Delay_Seconds` as before.
+
 ## 2.0.0 (2026-11-19)
 
 ### Breaking

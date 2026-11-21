@@ -50,6 +50,29 @@ def test_delay_per_vehicle_joins_the_bins_before_summing():
     assert mi.hourly_delay(None, aog, '2026-11-12', '2026-11-13').empty
 
 
+def test_delay_comes_from_the_queue_model_when_approach_delay_has_it():
+    ts = pd.date_range('2026-11-12 08:00', periods=3, freq='15min')
+    aog = pd.DataFrame({'TimeStamp': ts, 'DeviceId': 'A', 'Phase': 4, 'Total_Actuations': 10, 'Percent_AOG': 0.5})
+    ad = pd.DataFrame({'TimeStamp': ts, 'DeviceId': 'A', 'Phase': 4, 'Delay_Seconds': 100.0, 'Queued_Delay_Seconds': 20.0})
+    # Without the column: measured plus queued, 120 s a bin.
+    assert mi.hourly_delay(ad, aog, '2026-11-12', '2026-11-13')['dsum'].iloc[0] == pytest.approx(360.0)
+    # With it: the Queue Model's delay is the whole delay, not added to the other two; a NULL row (a day before the
+    # Queue Model was on) takes measured plus queued.
+    queued = ad.assign(Queue_Delay_Seconds=[300.0, 250.0, None])
+    expected = 300.0 + 250.0 + 120.0
+    assert mi.hourly_delay(queued, aog, '2026-11-12', '2026-11-13')['dsum'].iloc[0] == pytest.approx(expected)
+    con = duckdb.connect()
+    same = mi.hourly_delay(con.from_df(queued), con.from_df(aog), '2026-11-12', '2026-11-13', devices=['A'])
+    assert same['dsum'].iloc[0] == pytest.approx(expected)
+    other = duckdb.connect()   # relations of two connections are read and joined here
+    apart = mi.hourly_delay(con.from_df(queued), other.from_df(aog), '2026-11-12', '2026-11-13', devices=['A'])
+    assert apart['dsum'].iloc[0] == pytest.approx(expected)
+    # The generator's DeviceId cast keeps the column on a relation.
+    from atspm_report.generator import _normalize_deviceid
+    assert mi.has_queue_delay(_normalize_deviceid(con.from_df(queued)))
+    assert not mi.has_queue_delay(_normalize_deviceid(con.from_df(ad))) and not mi.has_queue_delay(None)
+
+
 def test_platoon_ratio_is_summed_then_divided_once():
     ts = pd.date_range('2026-11-12 08:00', periods=2, freq='15min')
     pr = pd.DataFrame({'TimeStamp': ts, 'DeviceId': 'A', 'Phase': 2, 'Total_Actuations': [100, 10],

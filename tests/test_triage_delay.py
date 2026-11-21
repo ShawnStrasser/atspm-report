@@ -40,6 +40,18 @@ def test_relations_give_the_same_words():
     assert told.ImpactText.startswith('Delay per vehicle on other phases up 15 s')
 
 
+def test_harm_is_told_from_the_queue_model_delay_when_there_is_one():
+    ad, aog = measures()
+    # The Queue Model's delay: 15 s a vehicle, 30 in the fault, the whole delay (not added to the other two).
+    bins = pd.to_datetime(ad['TimeStamp'])
+    ad = ad.assign(Queue_Delay_Seconds=[20 * (30.0 if in_fault(ts) else 15.0) for ts in bins])
+    told = rank([FAULT], WAIT_UP, approach_delay=ad, arrival_on_green=aog).iloc[0]
+    assert told.ImpactText == 'Delay per vehicle on other phases up 15 s on average over 4 h: Ph4 15 to 30 s'
+    con = duckdb.connect()
+    on_relations = rank([FAULT], WAIT_UP, approach_delay=con.from_df(ad), arrival_on_green=con.from_df(aog)).iloc[0]
+    assert on_relations.ImpactText == told.ImpactText
+
+
 def test_without_the_tables_or_with_too_few_arrivals_the_phase_wait_wording_stays():
     assert rank([FAULT], WAIT_UP, approach_delay=None, arrival_on_green=None).iloc[0].ImpactText == PHASE_WAIT_TEXT
     ad, aog = measures(vehicles=5)          # 20 an hour: under DELAY_MIN_VEHICLES_PER_HOUR

@@ -5,8 +5,10 @@ never averaged over bins; the raw columns are summed and divided once.
 
 - arrivals on green = SUM(Percent_AOG * Total_Actuations) / SUM(Total_Actuations), from arrival_on_green
 - platoon ratio = SUM(Green_Actuations) / SUM(Total_Actuations) / (SUM(Green_Seconds) / (bins * 900)), from platoon_ratio
-- delay per vehicle = (SUM(Delay_Seconds) + SUM(Queued_Delay_Seconds)) / SUM(arrival_on_green.Total_Actuations), the two
-  tables joined bin by bin first (approach_delay can end a bin earlier than arrival_on_green)
+- delay per vehicle = SUM(delay) / SUM(arrival_on_green.Total_Actuations), the two tables joined bin by bin first
+  (approach_delay can end a bin earlier than arrival_on_green). The delay is Queue_Delay_Seconds, the whole delay by
+  atspm's Queue Model (atspm 3.1, queue_model=True), when approach_delay has that column; a row where it is NULL (a day
+  from before the Queue Model was on), or a table without it, takes Delay_Seconds + Queued_Delay_Seconds instead
 - split failure share = SUM(Split_Failure) / SUM(Cycles)
 
 No measure from a detector while it is faulting (the user's rule, 2026-11-16). Split failures come from a phase's stop-bar
@@ -218,32 +220,53 @@ def _rollup(table, select: str, group: str, start, end, devices=None, days=None)
 
 
 HOUR = "time_bucket(INTERVAL 1 HOUR, TimeStamp)"
+QUEUE_DELAY = 'Queue_Delay_Seconds'
+
+
+def has_queue_delay(approach_delay) -> bool:
+    """True when approach_delay has atspm's Queue Model delay (Queue_Delay_Seconds, atspm 3.1 with queue_model=True)."""
+    return approach_delay is not None and QUEUE_DELAY in approach_delay.columns
+
+
+def delay_sql(approach_delay, alias: str = '') -> str:
+    """The SQL of one approach_delay row's delay in seconds: the Queue Model's whole delay where approach_delay has it, else
+    (and on a row where it is NULL) the measured plus the estimated queued delay."""
+    a = f"{alias}." if alias else ''
+    measured = f"({a}Delay_Seconds + {a}Queued_Delay_Seconds)"
+    return f"COALESCE({a}{QUEUE_DELAY}, {measured})" if has_queue_delay(approach_delay) else measured
+
+
+def delay_rows(approach_delay, start, end, devices=None, days=None) -> pd.DataFrame:
+    """DeviceId, Phase, TimeStamp and Delay (seconds, delay_sql) of the approach_delay rows of [start, end)."""
+    return rows(approach_delay, f"DeviceId, Phase, TimeStamp, {delay_sql(approach_delay)}::DOUBLE AS Delay", start, end, devices, days)
 
 
 def hourly_delay(approach_delay, arrival_on_green, start, end, devices=None, days=None) -> pd.DataFrame:
     """Per DeviceId, Phase and hour (hr): veh (arrivals, from arrival_on_green), gre (of them on green), dsum (seconds of
-    delay, measured plus estimated) and bins (15-minute bins with both). Bins are joined before summing."""
+    delay, delay_sql: the Queue Model's where there is one, else measured plus estimated) and bins (15-minute bins with
+    both). Bins are joined before summing."""
     columns = ['DeviceId', 'Phase', 'hr', 'veh', 'gre', 'dsum', 'bins']
     if not (present(approach_delay) and present(arrival_on_green)):
         return _typed_empty(columns)
     where = _where(start, end, devices, days)
-    select = (f"CAST(g.DeviceId AS VARCHAR) AS DeviceId, CAST(g.Phase AS INTEGER) AS Phase, "
-              f"time_bucket(INTERVAL 1 HOUR, g.TimeStamp) AS hr, sum(g.Total_Actuations)::DOUBLE AS veh, "
-              f"sum(g.Percent_AOG * g.Total_Actuations)::DOUBLE AS gre, "
-              f"sum(a.Delay_Seconds + a.Queued_Delay_Seconds)::DOUBLE AS dsum, count(*) AS bins")
+
+    def select(delay: str) -> str:
+        return (f"CAST(g.DeviceId AS VARCHAR) AS DeviceId, CAST(g.Phase AS INTEGER) AS Phase, "
+                f"time_bucket(INTERVAL 1 HOUR, g.TimeStamp) AS hr, sum(g.Total_Actuations)::DOUBLE AS veh, "
+                f"sum(g.Percent_AOG * g.Total_Actuations)::DOUBLE AS gre, sum({delay})::DOUBLE AS dsum, count(*) AS bins")
     if is_relation(approach_delay) and is_relation(arrival_on_green):
         try:
             g = arrival_on_green.filter(where).set_alias('g')
             a = approach_delay.filter(where).set_alias('a')
             joined = g.join(a, 'g.DeviceId = a.DeviceId AND g.Phase = a.Phase AND g.TimeStamp = a.TimeStamp')
-            return joined.aggregate(select, '1, 2, 3').df()[columns]
+            return joined.aggregate(select(delay_sql(approach_delay, 'a')), '1, 2, 3').df()[columns]
         except duckdb.Error:
             pass   # relations of different connections: read the window and join here
     con = connect()
     try:
         con.register('g_in', rows(arrival_on_green, 'DeviceId, Phase, TimeStamp, Total_Actuations, Percent_AOG', start, end, devices, days))
-        con.register('a_in', rows(approach_delay, 'DeviceId, Phase, TimeStamp, Delay_Seconds, Queued_Delay_Seconds', start, end, devices, days))
-        return con.execute(f"SELECT {select} FROM g_in g JOIN a_in a ON g.DeviceId = a.DeviceId AND g.Phase = a.Phase "
+        con.register('a_in', delay_rows(approach_delay, start, end, devices, days))
+        return con.execute(f"SELECT {select('a.Delay')} FROM g_in g JOIN a_in a ON g.DeviceId = a.DeviceId AND g.Phase = a.Phase "
                            f"AND g.TimeStamp = a.TimeStamp GROUP BY 1, 2, 3").df()[columns]
     finally:
         con.close()
