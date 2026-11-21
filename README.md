@@ -255,7 +255,7 @@ Pass a plain dict; every key has a default.
 |---|---|---|
 | `alert_suppression_days` | `21` | A matching alert this recent in history is held back as ongoing, not reported as new |
 | `alert_retention_weeks` | `104` | How long `updated_past_alerts` keeps history |
-| `alert_flagging_days` | `7` | Maximum age of a reportable alert |
+| `alert_flagging_days` | `7` | Maximum age of a reportable alert, counted back from the day after the report day (the latest `timeline` day), so re-running an old day flags what its own run did. The suppression and phase-skip windows count from that day too |
 | `include_ongoing_issues` | `False` | Add an "Ongoing Issues" section at the end of the report, after every new alert, with one subsection per check in the checks' order |
 | `phase_skip_alert_threshold` | `1` | Aggregated skips must exceed this |
 | `phase_skip_retention_days` | `14` | Trailing days of phase-skip data kept |

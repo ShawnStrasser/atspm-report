@@ -159,3 +159,36 @@ def test_ongoing_since_restarts_after_a_quiet_gap():
     ongoing = result['ongoing_alerts']['clearance_intervals']
     assert len(ongoing) == 1
     assert ongoing.iloc[0]['OngoingSince'] == pd.Timestamp(returned_on).normalize()
+
+
+# ---- An old report day is judged from that day, not from the clock ----
+
+OLD_DAY = datetime(2026, 10, 14, 12, 0)   # more than alert_flagging_days before any run of these tests
+
+
+def test_rerun_of_an_old_report_day_still_flags_its_alerts():
+    result = _generate(_clearance_config(), _short_yellow_timeline(OLD_DAY), {})
+    alerts = result['alerts']['clearance_intervals']
+    assert len(alerts) == 1 and alerts.iloc[0]['EventValue'] == 8
+
+
+def test_rerun_of_an_old_report_day_is_suppressed_by_the_history_before_it():
+    # Told 19 days before the report day, 20 before the morning after it: inside the 21 suppression days a daily run
+    # that morning reads, and long before the clock's.
+    past_alerts = {'clearance_intervals': pd.DataFrame([
+        {'DeviceId': 'signal-1', 'EventClass': 'Yellow', 'EventValue': 8, 'Date': OLD_DAY - timedelta(days=19)}])}
+    result = _generate(_clearance_config(include_ongoing_issues=True), _short_yellow_timeline(OLD_DAY), past_alerts)
+    assert result['alerts']['clearance_intervals'].empty
+    assert len(result['ongoing_alerts']['clearance_intervals']) == 1
+    # 21 days before that morning is outside them.
+    past_alerts['clearance_intervals']['Date'] = OLD_DAY - timedelta(days=20)
+    result = _generate(_clearance_config(), _short_yellow_timeline(OLD_DAY), past_alerts)
+    assert len(result['alerts']['clearance_intervals']) == 1
+
+
+def test_report_today_is_the_day_after_the_report_day():
+    from atspm_report.generator import _report_today
+    assert _report_today(pd.Timestamp('2026-10-14 00:00'), None) == pd.Timestamp('2026-10-15')
+    has_data = pd.DataFrame({'DeviceId': ['a', 'a'], 'TimeStamp': pd.to_datetime(['2026-10-13 08:00', '2026-10-14 23:45'])})
+    assert _report_today(None, has_data) == pd.Timestamp('2026-10-15')
+    assert _report_today(None, None) == pd.Timestamp(datetime.now().date())

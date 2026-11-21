@@ -4,6 +4,7 @@
 
 ### Changed
 
+- **An old report day gives its alerts.** The alert flagging window (`alert_flagging_days`), alert suppression (`alert_suppression_days`) and phase skip retention count back from the day after the report day (the latest `timeline` day; without a timeline the latest `has_data` day), not from the clock. A daily run reads the same days as before; a re-run of a day more than 7 days old no longer drops every alert.
 - **Delay from atspm's Queue Model.** When `approach_delay` has `Queue_Delay_Seconds` (atspm 3.1 with `queue_model=True`), delay per vehicle is `SUM(Queue_Delay_Seconds) / SUM(Total_Actuations)`: the Sudden Rise in Delay check, the detector triage's Impact and the coordination impact chart. A row where it is NULL, or a table without it, takes `Delay_Seconds + Queued_Delay_Seconds` as before.
 
 ## 2.0.0 (2026-11-19)

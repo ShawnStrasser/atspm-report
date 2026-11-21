@@ -246,6 +246,20 @@ def _normalize_deviceid(data: Optional[TableLike]) -> Optional[TableLike]:
     return data
 
 
+def _report_today(report_day, has_data: Optional[TableLike]) -> pd.Timestamp:
+    """Midnight after the report day: the 'today' the windows that count back from the report count from (alert flagging,
+    suppression, phase skip retention), so a re-run of an old day is judged as it was on its day. In a daily run, whose
+    report day is yesterday, this is today. Without a timeline, the day after the latest has_data day; without either,
+    today."""
+    if report_day is not None:
+        return pd.Timestamp(report_day).normalize() + pd.Timedelta(days=1)
+    if not _is_empty(has_data):
+        latest = run_sql("SELECT MAX(TimeStamp) AS Latest FROM t", t=has_data)['Latest'].iloc[0]
+        if pd.notna(latest):
+            return pd.Timestamp(latest).normalize() + pd.Timedelta(days=1)
+    return pd.Timestamp(datetime.now().date())
+
+
 def _reported_days(has_data: Optional[TableLike]) -> Optional[pd.DataFrame]:
     """The days each signal reported data (DeviceId, Date), or None without has_data."""
     if _is_empty(has_data):
@@ -477,7 +491,8 @@ class ReportGenerator:
         
         Config keys (all optional with defaults):
             - historical_window_days (int): Days of data to analyze. Default: 21
-            - alert_flagging_days (int): Max age for new alerts. Default: 7
+            - alert_flagging_days (int): Max age for new alerts, counted from the report day, not
+              the clock (as are alert_suppression_days and phase_skip_retention_days). Default: 7
             - suppress_repeated_alerts (bool): Enable alert suppression. Default: True
             - alert_suppression_days (int): Days to suppress repeat alerts. Default: 21
             - include_ongoing_issues (bool): Add an 'Ongoing Issues' section at the end of the
@@ -876,6 +891,7 @@ class ReportGenerator:
         if not _is_empty(timeline):
             timeline, timeline_latest, report_day = _split_timeline_days(_to_pandas(timeline))
         device_days = _to_pandas(device_days) if not _is_empty(device_days) else None
+        today = self.report_today = _report_today(report_day, has_data)
         
         verbosity = self.config['verbosity']
         log_message("Starting signal analysis...", 1, verbosity)
@@ -991,9 +1007,7 @@ class ReportGenerator:
             
             # Apply retention to phase skip alert rows
             if self.config['phase_skip_retention_days'] > 0 and 'Date' in phase_skip_alert_rows_pd.columns:
-                cutoff_datetime = (
-                    datetime.now() - timedelta(days=self.config['phase_skip_retention_days'])
-                ).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+                cutoff_datetime = (today - pd.Timedelta(days=self.config['phase_skip_retention_days'])).to_pydatetime()
                 # Coerce to pandas datetime for robust comparisons, including empty frames.
                 phase_skip_dates = pd.to_datetime(phase_skip_alert_rows_pd['Date'], errors='coerce').dt.tz_localize(None)
                 phase_skip_alert_rows_pd = phase_skip_alert_rows_pd[phase_skip_dates >= cutoff_datetime]
@@ -1247,9 +1261,8 @@ class ReportGenerator:
 
         # Filter new alerts to only recent ones (alert_flagging_days)
         log_message(f"Filtering newly generated alerts to the last {self.config['alert_flagging_days']} days...", 1, verbosity)
-        flagging_cutoff_date = datetime.now() - timedelta(days=self.config['alert_flagging_days'])
-        # Normalize to beginning of day for proper comparison with date-only columns
-        flagging_cutoff_date_naive = flagging_cutoff_date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+        # Counted from the report day, not the clock, so a re-run of an old day flags what its own run flagged.
+        flagging_cutoff_date_naive = (today - pd.Timedelta(days=self.config['alert_flagging_days'])).to_pydatetime()
         
         recent_new_alerts = {}
         for alert_type, df in new_alerts.items():
@@ -1292,7 +1305,8 @@ class ReportGenerator:
                         past_alerts.get(alert_type, pd.DataFrame()),
                         self.config['alert_suppression_days'],
                         ALERT_CONFIG[alert_type]['id_cols'],
-                        verbosity
+                        verbosity,
+                        today,
                     )
                     final_alerts[alert_type] = pd.concat(
                         [f for f in (kept, closures) if not f.empty] or [closures], ignore_index=True)
@@ -1309,7 +1323,8 @@ class ReportGenerator:
                         past_alerts.get(alert_type, pd.DataFrame()),
                         self.config['alert_suppression_days'],
                         ALERT_CONFIG[alert_type]['id_cols'],
-                        verbosity
+                        verbosity,
+                        today,
                     )
                 else:
                     final_alerts[alert_type] = recent_new_alerts.get(alert_type, pd.DataFrame())
@@ -1463,7 +1478,7 @@ class ReportGenerator:
         overview_devices = sorted(set(ped_devices).union(*focus_hidden.values()))
         term_hourly, ped_cycles = None, None
         if overview_devices and not _is_empty(terminations):
-            reach_end = atspm_window[1] if atspm_window is not None else pd.Timestamp(datetime.now().date())
+            reach_end = atspm_window[1] if atspm_window is not None else today
             reach_start = (atspm_window[0] if atspm_window is not None else reach_end - pd.Timedelta(days=1)) - pd.Timedelta(days=OVERVIEW_BASELINE_DAYS)
             term_hourly = hourly_terminations(terminations, overview_devices, reach_start, reach_end)
             if atspm_window is not None:
@@ -1701,7 +1716,7 @@ class ReportGenerator:
             for _, row in rows.iterrows():
                 wanted[row['DeviceId']] = row
         if window is None:
-            end = pd.Timestamp(datetime.now().date())
+            end = getattr(self, 'report_today', None) or pd.Timestamp(datetime.now().date())
             window = (end - pd.Timedelta(days=1), end)
         start, end = pd.Timestamp(window[0]), pd.Timestamp(window[1])
         waits = self.phase_skip_waits if self.phase_skip_waits is not None else pd.DataFrame()
@@ -1933,7 +1948,7 @@ class ReportGenerator:
         )
 
     def _suppress_alerts(self, new_alerts_df: pd.DataFrame, past_alerts_df: pd.DataFrame,
-                         suppression_days: int, id_cols: list, verbosity: int) -> tuple:
+                         suppression_days: int, id_cols: list, verbosity: int, today=None) -> tuple:
         """Filters new alerts based on recent past alerts.
 
         Returns (surviving alerts, suppressed alerts). The suppressed frame carries
@@ -1943,14 +1958,10 @@ class ReportGenerator:
         if past_alerts_df.empty:
             return new_alerts_df, new_alerts_df.head(0)
 
-        cutoff_date = datetime.now() - timedelta(days=suppression_days)
-
-        # Ensure dates are comparable (naive)
-        past_dates_naive = pd.to_datetime(past_alerts_df['Date']).dt.tz_localize(None)
-        cutoff_date_naive = cutoff_date.replace(tzinfo=None)
-
-        # Filter past alerts to find recent ones
-        recent_past_alerts = past_alerts_df[past_dates_naive >= cutoff_date_naive]
+        # The suppression_days days before today (_report_today: the day after the report day), as a daily run reads them.
+        today = pd.Timestamp(datetime.now().date()) if today is None else pd.Timestamp(today).normalize()
+        past_dates_naive = pd.to_datetime(past_alerts_df['Date']).dt.tz_localize(None).dt.normalize()
+        recent_past_alerts = past_alerts_df[past_dates_naive > today - pd.Timedelta(days=suppression_days)]
 
         if recent_past_alerts.empty:
             return new_alerts_df, new_alerts_df.head(0)
