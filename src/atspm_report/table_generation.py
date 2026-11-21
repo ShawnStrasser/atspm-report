@@ -1,3 +1,6 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import pandas as pd
 from .visualization import new_figure
 from io import BytesIO
@@ -18,12 +21,28 @@ from .health_story import detector_label, health_story
 ONGOING_SINCE_COLUMN = 'OngoingSince'
 ONGOING_DISPLAY_COLUMN = 'Ongoing'
 
+# The day the Ongoing day counts count to: the day after the report day (generator._report_today), set for one report by
+# ongoing_counted_to, so a re-run of an old day counts as its own run did. Unset, today.
+_ONGOING_TODAY = ContextVar('ongoing_today', default=None)
+
+
+@contextmanager
+def ongoing_counted_to(today):
+    """Count the Ongoing columns' days to today (None: the clock's today) inside the with block."""
+    token = _ONGOING_TODAY.set(None if today is None else pd.Timestamp(today).normalize())
+    try:
+        yield
+    finally:
+        _ONGOING_TODAY.reset(token)
+
+
 def _format_ongoing_since(value):
-    """Render an ongoing-since date as 'M/D/YY (Nd)'."""
+    """Render an ongoing-since date as 'M/D/YY (Nd)', the days counted to the report's today (ongoing_counted_to)."""
     timestamp = pd.to_datetime(value, errors='coerce')
     if pd.isna(timestamp):
         return ''
-    days = (pd.Timestamp.today().normalize() - timestamp.normalize()).days
+    today = _ONGOING_TODAY.get()
+    days = ((today if today is not None else pd.Timestamp.today().normalize()) - timestamp.normalize()).days
     return f"{timestamp.month}/{timestamp.day}/{timestamp:%y} ({days}d)"
 
 

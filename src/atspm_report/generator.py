@@ -1538,6 +1538,7 @@ class ReportGenerator:
         # Generate PDF reports
         log_message("Generating PDF reports...", 1, verbosity)
         reports = generate_pdf_report(
+            report_today=today,
             filtered_df_maxouts=final_alerts['maxout'],
             filtered_df_missing_data=final_alerts['missing_data'],
             system_outages_df=final_alerts['system_outages'],

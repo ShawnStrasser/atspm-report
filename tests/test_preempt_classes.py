@@ -336,7 +336,7 @@ def test_report_has_three_preempt_sections_in_order_at_the_end():
 def test_preempt_sections_come_after_detector_health_and_before_missing_data():
     import inspect
     from atspm_report import report_generation
-    source = inspect.getsource(report_generation.generate_pdf_report)
+    source = inspect.getsource(report_generation._generate_pdf_report)
     order = [source.find(marker) for marker in (
         '# Section: Detector Health', '# Section: Pedestrian Button Health', 'PREEMPT_SECTION_TEXT',
         '# Section: Missing Data')]

@@ -192,3 +192,33 @@ def test_report_today_is_the_day_after_the_report_day():
     has_data = pd.DataFrame({'DeviceId': ['a', 'a'], 'TimeStamp': pd.to_datetime(['2026-10-13 08:00', '2026-10-14 23:45'])})
     assert _report_today(None, has_data) == pd.Timestamp('2026-10-15')
     assert _report_today(None, None) == pd.Timestamp(datetime.now().date())
+
+
+
+def test_ongoing_day_counts_count_to_the_report_day():
+    from atspm_report.table_generation import _ONGOING_TODAY, _format_ongoing_since, ongoing_counted_to
+    with ongoing_counted_to(pd.Timestamp('2026-10-15')):
+        assert _format_ongoing_since(pd.Timestamp('2026-10-10')) == '10/10/26 (5d)'
+    assert _ONGOING_TODAY.get() is None
+    today = pd.Timestamp(datetime.now().date())
+    assert _format_ongoing_since(today - timedelta(days=3)).endswith('(3d)')   # unset: the clock's today
+
+
+def test_old_rerun_report_counts_ongoing_days_to_its_report_day():
+    from atspm_report import report_generation
+    from atspm_report.table_generation import _format_ongoing_since
+    past_alerts = {'clearance_intervals': pd.DataFrame([
+        {'DeviceId': 'signal-1', 'EventClass': 'Yellow', 'EventValue': 8, 'Date': OLD_DAY - timedelta(days=4)}])}
+    told = {}
+
+    def render(*args, **kwargs):   # inside the report, as its tables format the Ongoing column
+        since = kwargs['ongoing_alerts']['clearance_intervals']['OngoingSince'].min()
+        told['text'] = _format_ongoing_since(since)
+        return {}
+
+    with patch.object(report_generation, '_generate_pdf_report', side_effect=render):
+        result = ReportGenerator(_clearance_config(include_ongoing_issues=True)).generate(
+            signals=pd.DataFrame([{'DeviceId': 'signal-1', 'Name': 'Signal 1', 'Region': 'Region 1'}]),
+            timeline=_short_yellow_timeline(OLD_DAY), past_alerts=past_alerts)
+    assert len(result['ongoing_alerts']['clearance_intervals']) == 1
+    assert told['text'] == '10/10/26 (5d)'   # since 10/10, counted to the morning after 10/14, not to today

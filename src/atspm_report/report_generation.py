@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional
 from .table_generation import (
+    ongoing_counted_to,
     prepare_phase_termination_alerts_table,
     prepare_phase_skip_alerts_table,
     prepare_missing_data_alerts_table,
@@ -532,7 +533,17 @@ def draw_page_footer(canvas, page_num, num_pages, region=None):
     canvas.restoreState()
 
 
-def generate_pdf_report(
+def generate_pdf_report(*args, report_today=None, **kwargs) -> Dict[str, BytesIO]:
+    """Generate PDF reports for each region with the plots (_generate_pdf_report has the arguments).
+
+    report_today: the day the Ongoing columns' day counts count to, the day after the report day (generator._report_today);
+        None counts to today.
+    """
+    with ongoing_counted_to(report_today):
+        return _generate_pdf_report(*args, **kwargs)
+
+
+def _generate_pdf_report(
         filtered_df_maxouts: pd.DataFrame,
         filtered_df_missing_data: pd.DataFrame,
         system_outages_df: pd.DataFrame,
