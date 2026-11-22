@@ -876,6 +876,8 @@ class ReportGenerator:
                 - 'alarms': pd.DataFrame - controller alarms listed this run
                 - 'data_stopped_at': pd.Timestamp or None - when the data stopped for the whole network, if it did
                 - 'signal_focus': Dict[str, pd.DataFrame] - report (region or 'All Regions') -> its Signal Focus rows
+                - 'signal_problems': pd.DataFrame - every signal's problems, one row per area (signal_focus.PROBLEM_COLUMNS:
+                    Category, Points = its severity counting new alerts only, Lines = what to tell), new and held back alike
                 - 'silent_ped_phases': pd.DataFrame - with the detector triage, ped phases with no press at all that normally
                     get many: for review, not alerts, as a button with no press is not on the ped health list
                 - 'hourly_data': Dict[str, pd.DataFrame] - intermediate hourly aggregates
@@ -1388,26 +1390,27 @@ class ReportGenerator:
         final_alerts[timing_insights.ALERT_TYPE] = timing_insights.listed_alerts(
             final_alerts.get(timing_insights.ALERT_TYPE), signals, self.config[timing_insights.ROWS_CONFIG])
 
-        # Signal Focus: each report's worst signals across the checks, which then leave its other tables and charts.
+        # Each signal's problems, returned as 'signal_problems' (a per-signal status) with or without a Signal Focus section,
+        # and Signal Focus: each report's worst signals across the checks, which then leave its other tables and charts.
         signal_focus = {}
+        # Counts of the signals with vehicle faults, so 'all detectors down' can tell spare channels from dead detectors.
+        focus_counts = None
+        fault_frames = [frame for frame in (final_alerts.get(ATSPM_DETECTOR_HEALTH), suppressed_alerts.get(ATSPM_DETECTOR_HEALTH))
+                        if frame is not None and not frame.empty and 'DetectorType' in frame]
+        if fault_frames and atspm_window is not None and not _is_empty(detector_counts):
+            fault_devices = sorted(pd.concat([frame.loc[frame['DetectorType'] == ATSPM_VEHICLE, 'DeviceId']
+                                              for frame in fault_frames]).astype(str).unique())
+            if fault_devices:
+                focus_counts = _window_counts(detector_counts, fault_devices, *atspm_window)
+        # The phases each signal with a fault ran, so a rise on every one of them reads 'all phases'.
+        runs = {}
+        if fault_frames and atspm_window is not None and not _is_empty(terminations):
+            runs = signal_phases(terminations, sorted(pd.concat([frame['DeviceId'] for frame in fault_frames]).astype(str).unique()),
+                                 *atspm_window)
+        problems, problem_information = collect_problems(
+            final_alerts, suppressed_alerts, alarm_alerts, atspm_info, self.config['phase_skip_retention_days'],
+            detector_counts=focus_counts, signal_phases=runs)
         if self.config['signal_focus_signals'] > 0:
-            # Counts of the signals with vehicle faults, so 'all detectors down' can tell spare channels from dead detectors.
-            focus_counts = None
-            fault_frames = [frame for frame in (final_alerts.get(ATSPM_DETECTOR_HEALTH), suppressed_alerts.get(ATSPM_DETECTOR_HEALTH))
-                            if frame is not None and not frame.empty and 'DetectorType' in frame]
-            if fault_frames and atspm_window is not None and not _is_empty(detector_counts):
-                fault_devices = sorted(pd.concat([frame.loc[frame['DetectorType'] == ATSPM_VEHICLE, 'DeviceId']
-                                                  for frame in fault_frames]).astype(str).unique())
-                if fault_devices:
-                    focus_counts = _window_counts(detector_counts, fault_devices, *atspm_window)
-            # The phases each signal with a fault ran, so a rise on every one of them reads 'all phases'.
-            runs = {}
-            if fault_frames and atspm_window is not None and not _is_empty(terminations):
-                runs = signal_phases(terminations, sorted(pd.concat([frame['DeviceId'] for frame in fault_frames]).astype(str).unique()),
-                                     *atspm_window)
-            problems, problem_information = collect_problems(
-                final_alerts, suppressed_alerts, alarm_alerts, atspm_info, self.config['phase_skip_retention_days'],
-                detector_counts=focus_counts, signal_phases=runs)
             signal_focus = build_signal_focus(problems, signals, problem_information, self.config['signal_focus_signals'],
                                               related_only=self.config['signal_focus_related_only'])
         focus_hidden = hidden_signals(signal_focus)
@@ -1710,6 +1713,7 @@ class ReportGenerator:
             'overruled_preempt_alerts': overruled_preempt_alerts,
             'alarms': alarm_alerts,
             'signal_focus': signal_focus,
+            'signal_problems': problems,
             'data_stopped_at': data_stopped_at,
             'silent_ped_phases': silent_phases,
             'hourly_data': hourly_data

@@ -420,6 +420,12 @@ def test_generate_builds_the_section_and_leaves_the_alerts_whole():
     assert off['signal_focus'] == {}
     text = _pdf_text(off['reports']['Region 1'])
     assert 'Signal Focus' not in text and text.count('Alpha') == 2      # back in its detector and alarm tables
+    # Every signal's problems come back with or without the section, for a per-signal status
+    for run in (unrelated, off):
+        problems = run['signal_problems']
+        assert set(problems['DeviceId']) == {'A', 'B'}
+        assert set(problems.loc[problems['DeviceId'] == 'A', 'Category']) == {'Alarms', 'Detectors'}
+        assert (problems['Points'] > 0).all() and problems['Lines'].map(len).gt(0).all()
 
 
 def _feed(devices=8, day=DAY, last_bin='23:45', overrides=None):
