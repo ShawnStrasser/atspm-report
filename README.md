@@ -41,6 +41,7 @@ It does **not** fetch data, read or write files, send email, or schedule anythin
 | Phases ending green too early | `split_failures` + `terminations` | Split failures without max outs: queues left at 15 %+ of greens that gapped out, 2+ hours, on 2 of the last 3 days of the kind (opt-in) |
 | Sudden rise in delay | `approach_delay` + `arrival_on_green` (+ `platoon_ratio`) | Delay per vehicle up 5 s and 50 % over the same hours of earlier days of the kind, 3 sd, 4+ hours (opt-in) |
 | Rising split failures / falling platoon ratio | `split_failures` / `platoon_ratio` | The max-out method on each phase's daily value; silent until 18 days exist (opt-in) |
+| Timing Insights | `split_failures` + `terminations` (+ `pedestrian`, `coordination_agg`, `actuations`) | How each phase uses its green over the last six weekdays: premature gap-outs, max-outs with low demand, max recall despite detection, needs more green, max capacity, downstream bottleneck (opt-in, see below) |
 
 Pass only the inputs you have; every argument except `signals` is optional and a missing input just leaves its section out.
 
@@ -72,6 +73,23 @@ One section, **Coordination Plans and Clocks**, after the rail section, with no 
   - **Shown.** Alerts of one group are shown together: a map of the signals around it (the group by what it ran: black when it ran as one, else Group A, B... in colours; the alerted signals outlined in their line's colour; other signals grey, hollow without data; a plain light-grey road map underneath, left out when it cannot be fetched, and no map without coordinates) and a chart of cycle length by time of day for each of the last 7 days that differs from the days after it, most recent first, only days on which a signal drawn on its own runs something else than its group for 30 minutes or more. The alerted signals and any group signal that ran with no other are drawn on their own; nothing is shaded. A run shows `coordination_figures` groups a report, clock alerts and High first; a group not shown is not filed as told, so it comes up on a later run.
 
 The impact chart (`create_coordination_impact_chart`: arrivals on green and delay per vehicle by hour on the days a signal was out of step against the days it was not) is no longer drawn in the report; the function is kept for your own use.
+
+## Timing Insights
+
+With `timing_insights_enabled`, the report ends (before Ongoing Issues) with a **Timing Insights** section: one table per check, each under a line saying what it means, every row with its chart, the worst first, `timing_insights_rows` (5) rows a report. Alerts a table leaves out are not filed as told, so they come up on later runs; the rest are held back as repeats like any alert. Signal Focus does not tell these.
+
+Everything is judged from the 15-minute tables, by hour from 7:00 to 19:00 on the last six weekdays (holidays left out). Hours with a known fault on the phase's stop-bar zone, or with green occupancy never under 97% (a zone held on), are left out. Nothing is read from controller settings: a phase is on recall when it ran to its limit (max-out or force-off) on 98% of its greens with ped service on under half of them. Phases 2 and 6 are coordinated while a pattern with a cycle length runs, and standard ring and barrier phasing is assumed (2 and 6, 4 and 8 end at the barrier together). A phase is listed when it is in the state 2 hours a day or more on 3 of the 6 days.
+
+| Table | Listed when |
+|---|---|
+| Premature Gap-Out | 5% of its gap-outs end in a split failure, overall and on 3 of the days (20+ gap-outs each). In each bin the split failures, at most its gap-outs, count as at a gap-out in the share the gap-outs have of its greens |
+| Max-Out, Low Demand | Not coordinated or on recall, no ped service, runs to its limit on half its greens, occupancy under 40%, split failures under 2%; its barrier partner under the same limits |
+| Max Recall despite Detection | On recall, not coordinated, occupancy above 0 and under 40%, split failures under 2%, its partner under the same limits. A signal whose every measured phase is on recall (fixed time with detection) goes last |
+| Needs More Green | Runs to its limit on half its greens with 20% split failures while a phase with spare (split failures under 2%, occupancy under 50%) can give it time: its own ring and side, any phase in a single ring, or across the barrier when every ring serving that side has one. The table names them |
+| Max Capacity | One row per signal: a phase short of green, no measured phase with spare, and 3 in 4 of the phases it serves with 10% split failures. Not listed with a Downstream Bottleneck |
+| Downstream Bottleneck | Stop-bar count zones (`Function` 'Count' in `atspm_detector_config`, with `lanes`): a bin with occupancy 85%+, split failures on 20% of cycles and fewer than half the vehicles the green carries at the phase's usual best is blocked; listed when blocked an hour a day on 3 of the days, and in under half its bins at that occupancy |
+
+The charts show by hour, one line per phase with the phase in question thick: percent max-out/force-off, percent split failures and green occupancy ratio with its ideal range (40% to 70%: below 40% split failures stay under 1% of cycles, from 70% they pass 5%). Premature Gap-Out shows split failures with those at a gap-out dashed, and Downstream Bottleneck adds volume (vehicles per hour of green per lane) against occupancy, the blocked bins red.
 
 ## Signal Focus
 
@@ -151,7 +169,8 @@ All inputs except `signals` come straight from atspm's output tables. `DeviceId`
 | `preempt_events` | raw events 102, 104, 105 (and 112 where logged) | The days of the stored preempt calls (42); classes bus calls |
 | `arrival_on_green`, `approach_delay` | `arrival_on_green`, `approach_delay` | ~21 days (triage wording, impact charts); 36 for the delay rise check |
 | `platoon_ratio` | `platoon_ratio` | ~21 days for its trend, 36 for the delay rise check; else not needed |
-| `split_failures` | `split_failures` | ~21 days for its trend and the phase timing check; else not needed |
+| `split_failures` | `split_failures` | ~21 days for its trend and the phase timing check; the last six weekdays, with `Green_Time`, for Timing Insights; else not needed |
+| `actuations` | `actuations` (15-minute counts) | The last six weekdays for Timing Insights' Downstream Bottleneck; only the count zones are read |
 
 The four measure tables are optional, and a DuckDB relation is filtered to the signals and days needed before anything is read. They are never averaged over bins: platoon ratio is `SUM(Green_Actuations) / SUM(Total_Actuations) / (SUM(Green_Seconds) / (bins x 900))`, delay per vehicle `SUM(delay) / SUM(arrival_on_green.Total_Actuations)` with the bins joined first. The delay is atspm's Queue Model delay, `Queue_Delay_Seconds` (atspm 3.1 with `queue_model=True`), when `approach_delay` has that column, else `Delay_Seconds + Queued_Delay_Seconds`; a row where `Queue_Delay_Seconds` is NULL (a day from before the Queue Model was on) takes the latter too. A baseline that spans the day the Queue Model was turned on mixes the two, and the Queue Model's delay is usually the larger. No measure is used from a detector while it is faulting: split failures come from a phase's stop-bar zones and the other three from its advance zones, and hours in which one of them had a fault (health findings, timeline Stuck On and Erratic, and days in `atspm_detector_minutes`) are left out.
 
@@ -281,6 +300,7 @@ Pass a plain dict; every key has a default.
 | `split_failures_no_maxout_check_enabled` | `False` | Phases ending green too early (split failures without max outs) |
 | `delay_rise_check_enabled` | `False` | Sudden rise in delay per vehicle |
 | `split_failure_trend_enabled` / `platoon_ratio_trend_enabled` | `False` | Rising split failures, falling platoon ratio |
+| `timing_insights_enabled` / `timing_insights_rows` | `False` / `5` | The Timing Insights section and its rows (each with a chart) per table and report |
 | `preempt_rail_numbers` | `None` | Preempt inputs that are rail (the Rail section, longer stuck-on limit); `None` holds every preempt to the rail limit |
 | `custom_logo_path` | `None` | Logo for the PDF header |
 | `verbosity` | `1` | `0` silent, `1` info, `2` debug |

@@ -2,6 +2,10 @@
 
 ## 2.1.0 (2026-11-20)
 
+### Added
+
+- **Timing Insights** (`timing_insights_enabled`, off by default): a section at the end of the report, before Ongoing Issues, on how each phase uses its green over the last six weekdays, from the 15-minute tables only (no controller settings): Premature Gap-Out, Max-Out with Low Demand, Max Recall despite Detection, Needs More Green (naming the phases that can give time), Max Capacity (per signal) and Downstream Bottleneck. Each table opens with a line saying what it means, lists `timing_insights_rows` (5) rows a report with a chart each, and goes through alert suppression and the Ongoing Issues like other checks; rows left out are not filed. New module `timing_insights`, alert type `timing_insights`, and `generate(actuations=...)` (15-minute counts, for the count zones of Downstream Bottleneck). It needs `split_failures` with `Green_Time`.
+
 ### Changed
 
 - **A failed base map costs only that report its maps.** After a tile request fails, the coordination maps of that report are drawn without a base map as before, but the next report tries again (`generate()` calls the new `coordination_check.reset_base_map`), instead of leaving base maps off until the process restarts. The failure is a `logging` warning (logger `atspm_report.coordination_check`) instead of a print, so a host app's logs show it.

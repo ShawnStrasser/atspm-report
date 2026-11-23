@@ -130,6 +130,7 @@ from .measure_checks import (
     STEP_LOOKBACK_DAYS as DELAY_RISE_LOOKBACK_DAYS,
 )
 from . import timing_checks
+from . import timing_insights
 from . import table_limits
 from .utils import log_message
 from . import duckdb_utils
@@ -438,6 +439,8 @@ ALERT_CONFIG = {
     SPLIT_FAIL_TREND: {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'split_failure_trend_alerts'},
     PLATOON_TREND: {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'platoon_ratio_trend_alerts'},
     timing_checks.ALERT_TYPE: {'id_cols': timing_checks.ID_COLUMNS, 'file_suffix': 'phase_timing_alerts'},
+    # Timing Insights (timing_insights): how each phase uses its green; Phase 0 for Max Capacity (the whole signal).
+    timing_insights.ALERT_TYPE: {'id_cols': timing_insights.ID_COLUMNS, 'file_suffix': 'timing_insight_alerts'},
 }
 
 # A detector's usual count needs this many samples of a typical quarter hour before a sparkline shows it.
@@ -578,6 +581,13 @@ class ReportGenerator:
               a Friday run judges Friday to Sunday. Without that history, all of them. Default: 3
             - split_failures_no_maxout_check_enabled (bool): Phases ending green too early: split failures without max
               outs, from split_failures and terminations (timing_checks). Default: False
+            - timing_insights_enabled (bool): The Timing Insights section at the end of the report (timing_insights):
+              Premature Gap-Out, Max-Out with Low Demand, Max Recall despite Detection, Needs More Green, Max Capacity
+              and Downstream Bottleneck, judged over the last six weekdays; needs split_failures (with Green_Time) and
+              terminations over those days, and uses pedestrian and coordination_agg, and actuations with the detector
+              table's count zones for Downstream Bottleneck. Default: False
+            - timing_insights_rows (int): Rows (each with its chart) per Timing Insights table in each report, new and
+              ongoing; new alerts left out are not filed, so they come up on a later run. 0: no limit. Default: 5
             - joke_index (int): Specific joke index. Default: None (auto-cycle by date)
             - custom_logo_path (str): Path to custom logo. Default: None (use ODOT logo)
         """
@@ -670,6 +680,9 @@ class ReportGenerator:
             'platoon_ratio_trend_enabled': False,
             'measure_check_days': 3,
             **{switch: False for switch in timing_checks.CONFIG_SWITCHES.values()},
+            # Timing Insights: off until approved.
+            timing_insights.CONFIG_SWITCH: False,
+            timing_insights.ROWS_CONFIG: 5,
         }
         return {**defaults, **config}
     
@@ -701,6 +714,7 @@ class ReportGenerator:
         platoon_ratio: Optional[TableLike] = None,
         approach_delay: Optional[TableLike] = None,
         ongoing_last_shown: Optional[pd.DataFrame] = None,
+        actuations: Optional[TableLike] = None,
     ) -> dict:
         """
         Generate reports from provided pandas DataFrames or DuckDB relations.
@@ -829,6 +843,8 @@ class ReportGenerator:
             ongoing_last_shown: When each ongoing alert was last shown in an Ongoing table (AlertType, Key = its id
                 columns joined by '|', LastShown), for the rotation (ongoing_rotation_enabled); returned updated as
                 'updated_ongoing_last_shown'. None: nothing shown yet.
+            actuations: 15-minute detector counts (TimeStamp, DeviceId, Detector, Total) over the Timing Insights'
+                weekdays, for Downstream Bottleneck; only the detector table's count zones (Function 'Count') are read.
 
         Returns:
             dict with keys:
@@ -1191,7 +1207,7 @@ class ReportGenerator:
 
         # Checks on atspm's per-phase measures, each behind its own switch; none takes part in Signal Focus.
         measure_devices = signals['DeviceId'].astype(str).unique().tolist()
-        for alert_type in (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND, timing_checks.ALERT_TYPE):
+        for alert_type in (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND, timing_checks.ALERT_TYPE, timing_insights.ALERT_TYPE):
             new_alerts[alert_type] = pd.DataFrame()
         if report_day is not None:
             # The report day and the earlier days the last report did not cover (a Monday run judges Friday to Sunday).
@@ -1217,6 +1233,12 @@ class ReportGenerator:
                 new_alerts[timing_checks.ALERT_TYPE] = timing_checks.build_timing_alerts(
                     split_failures, terminations, phase_wait, coordination_agg, measure_faults, report_day, timing,
                     signals=signals)
+            if self.config[timing_insights.CONFIG_SWITCH] and split_failures is not None and not _is_empty(terminations):
+                log_message("Checking timing insights (green use by phase)...", 1, verbosity)
+                new_alerts[timing_insights.ALERT_TYPE] = timing_insights.build_insight_alerts(
+                    split_failures, terminations, report_day, signals=signals, pedestrian=pedestrian,
+                    coordination_agg=coordination_agg, actuations=actuations, detectors=atspm_info,
+                    faults=measure_faults, verbosity=verbosity)
 
         # The overlap dual indication and signal conflict checks read the report
         # day's clean indications, which are built once for all of them. The dual
@@ -1353,6 +1375,11 @@ class ReportGenerator:
             final_alerts[COORDINATION] = listed_alerts(final_alerts[COORDINATION], signals,
                                                        self.config['coordination_figures'])
 
+        # Timing Insights: each table lists a few rows per report; the ones left over are not filed as told and come up later.
+        insight_waiting = final_alerts.get(timing_insights.ALERT_TYPE)    # every new one, for the tables' totals
+        final_alerts[timing_insights.ALERT_TYPE] = timing_insights.listed_alerts(
+            final_alerts.get(timing_insights.ALERT_TYPE), signals, self.config[timing_insights.ROWS_CONFIG])
+
         # Signal Focus: each report's worst signals across the checks, which then leave its other tables and charts.
         signal_focus = {}
         if self.config['signal_focus_signals'] > 0:
@@ -1433,6 +1460,10 @@ class ReportGenerator:
             final_alerts.get(timing_checks.ALERT_TYPE), signals, num_figures)
         ongoing_timing_figures = timing_checks.create_timing_plots(
             ongoing_alerts.get(timing_checks.ALERT_TYPE), signals, num_figures)
+        insight_rows = self.config[timing_insights.ROWS_CONFIG]
+        insight_figures = timing_insights.create_insight_plots(final_alerts.get(timing_insights.ALERT_TYPE), signals, insight_rows)
+        ongoing_insight_figures = timing_insights.create_insight_plots(ongoing_alerts.get(timing_insights.ALERT_TYPE), signals,
+                                                                       self._ongoing_limits().get(timing_insights.ALERT_TYPE, insight_rows))
 
         # Detector health (atspm-detector): one chart per signal phase for the faults, the lane
         # closures and the timing plans, from the 15-minute actuations in
@@ -1588,6 +1619,11 @@ class ReportGenerator:
                             (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND, timing_checks.ALERT_TYPE)},
             timing_figures=timing_figures,
             ongoing_timing_figures=ongoing_timing_figures,
+            insight_alerts=final_alerts.get(timing_insights.ALERT_TYPE),
+            insight_waiting=insight_waiting,
+            insight_figures=insight_figures,
+            ongoing_insight_figures=ongoing_insight_figures,
+            insight_rows=insight_rows,
             table_signal_limits={'data_only': self.config['data_only_table_signals'],
                                  'phase_skips': self.config['phase_skip_table_signals'],
                                  'alarms': self.config['alarm_table_signals']},
@@ -1692,6 +1728,7 @@ class ReportGenerator:
         limits[ATSPM_DETECTOR_HEALTH] = lowest(ongoing, faults)
         limits[(ATSPM_DETECTOR_HEALTH, table_limits.DATA_ONLY_TABLE)] = lowest(ongoing, faults, self.config['data_only_table_signals'])
         limits[(ATSPM_DETECTOR_HEALTH, ATSPM_PED)] = lowest(ongoing, rows.get('ped_faults', default))
+        limits[timing_insights.ALERT_TYPE] = lowest(ongoing, self.config[timing_insights.ROWS_CONFIG])
         return limits
 
     def _maxout_thresholds(self) -> dict:

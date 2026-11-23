@@ -39,7 +39,7 @@ from .coordination_check import (
     SECTION_TITLE as COORDINATION_TITLE,
 )
 from .signal_focus import SECTION_TITLE as SIGNAL_FOCUS_TITLE
-from . import measure_checks, timing_checks
+from . import measure_checks, timing_checks, timing_insights
 from .utils import log_message
 
 # Repeat alerts are normally held back so they do not crowd out new ones. When the
@@ -79,6 +79,39 @@ def _measure_sections(alerts, ongoing, signals_df, region, max_rows, ongoing_lim
             frame, signals_df, region, 1))
         sections.append((measure_checks.SECTION_TITLES[alert_type], rows, total, later, total_later, [], []))
     return sections
+
+
+def _insight_sections(alerts, ongoing, signals_df, region, rows, figures, ongoing_figures, styles, waiting,
+                      ongoing_content: list, new_waiting=None) -> tuple:
+    """(flowables of the Timing Insights section, whether the region has any, new or ongoing). Its ongoing tables go on
+    ongoing_content, one per check. new_waiting: every new alert before the reports chose theirs, for the totals."""
+    content, found = [], False
+    for check in timing_insights.CHECKS:
+        table_rows, total = timing_insights.prepare_insight_table(alerts, signals_df, region, rows, check)
+        if new_waiting is not None and not table_rows.empty:
+            total = max(total, timing_insights.prepare_insight_table(new_waiting, signals_df, region, 1, check)[1])
+        later, total_later = timing_insights.prepare_insight_table(ongoing, signals_df, region, rows, check)
+        total_later = _waiting_total(waiting, timing_insights.ALERT_TYPE, total_later,
+                                     lambda frame: timing_insights.prepare_insight_table(frame, signals_df, region, 1, check))
+        height = timing_insights.chart_height_inches(check)*inch
+        mine = [fig for fig, reg, chk in (figures or []) if reg == region and chk == check]
+        if not table_rows.empty:
+            if not found:
+                content.extend([Paragraph(timing_insights.SECTION_TITLE, styles['SectionHeading']), Spacer(1, 0.1*inch)])
+            found = True
+            content.append(Paragraph(check, styles['SubsectionHeading']))
+            content.append(Spacer(1, 0.05*inch))
+            content.append(Paragraph(escape(timing_insights.NOTES[check]), styles['Normal']))
+            content.append(Spacer(1, 0.12*inch))
+            content.extend(create_reportlab_table(table_rows, check, styles, total_count=total, max_rows=rows, include_trend=False))
+            content.append(Spacer(1, 0.3*inch))
+            content.extend(_chart_flowables(mine[:len(table_rows)], height))
+        if not later.empty:
+            found = True
+            theirs = [fig for fig, reg, chk in (ongoing_figures or []) if reg == region and chk == check]
+            ongoing_content.extend(_ongoing_section(f'{timing_insights.SECTION_TITLE}: {check}', later, total_later, styles, rows,
+                                                    figures=theirs[:len(later)], chart_height=height))
+    return content, found
 
 
 def _waiting_total(waiting, alert_type, total, table) -> int:
@@ -593,8 +626,17 @@ def _generate_pdf_report(
         table_signal_limits: Optional[Dict[str, int]] = None,
         ongoing_rotated: bool = False,
         ongoing_waiting: Optional[Dict[str, pd.DataFrame]] = None,
+        insight_alerts: Optional[pd.DataFrame] = None,
+        insight_figures: Optional[list] = None,
+        ongoing_insight_figures: Optional[list] = None,
+        insight_rows: int = 5,
+        insight_waiting: Optional[pd.DataFrame] = None,
 ) -> Dict[str, BytesIO]:
     """Generate PDF reports for each region with the plots.
+
+    insight_alerts / insight_figures / ongoing_insight_figures: the Timing Insights (timing_insights) and their charts as
+        (figure, region, check); insight_rows rows per table. The section goes last, before the Ongoing Issues.
+        insight_waiting: every new Timing Insight before the reports chose theirs, for the tables' totals.
 
     table_signal_limits: signals a table lists (0 or missing: no limit), keys 'data_only' (Detector Health Data Only, new
         and ongoing), 'phase_skips' (new and ongoing) and 'alarms' (Controller Alarms, the most alarms first).
@@ -1619,6 +1661,14 @@ def _generate_pdf_report(
             styles,
             max_table_rows,
         ))
+
+        # Section: Timing Insights, last before the Ongoing Issues: one table per check, each under the user's note, every
+        # row with its chart. Signal Focus does not tell these.
+        insight_content, insight_any = _insight_sections(
+            insight_alerts, ongoing_alerts.get(timing_insights.ALERT_TYPE), all_signals_df, region, insight_rows,
+            insight_figures, ongoing_insight_figures, styles, ongoing_waiting, ongoing_content, new_waiting=insight_waiting)
+        content.extend(insight_content)
+        region_has_alerts = region_has_alerts or insight_any
 
         # Every check's ongoing issues, together after all the new alerts.
         content.extend(_ongoing_issues(ongoing_content, styles))
