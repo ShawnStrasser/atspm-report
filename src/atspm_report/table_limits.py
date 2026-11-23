@@ -19,7 +19,7 @@ import pandas as pd
 from .atspm_detector_health import ALERT_TYPE as DETECTOR_HEALTH, FAULT_STATUSES, affects_operations
 from .preempt_cascade import SECTION_EV
 from .measure_checks import DELAY_RISE, PLATOON_TREND, SPLIT_FAIL_TREND
-from . import timing_checks, timing_insights
+from . import timing_insights
 
 STATE_COLUMNS = ['AlertType', 'Key', 'LastShown']
 
@@ -34,7 +34,6 @@ SEVERITY = {
     'overlap_conflicts': ('DurationSeconds', True),
     'preempts': ('Score', True),                      # the preempt check's own score, the table's order
     DETECTOR_HEALTH: ('Score', False),                # detector health score: lower is worse
-    timing_checks.ALERT_TYPE: ('DaysSeen', True),     # days the phase showed it
     timing_insights.ALERT_TYPE: ('Severity', True),   # hours a day in the state (gap-outs a day for Premature Gap-Out)
     # The measure checks have no one measure of how bad: every alert weighs 1.
     DELAY_RISE: None,
@@ -95,7 +94,7 @@ def table_of(alert_type: str, frame: pd.DataFrame) -> pd.Series:
     if alert_type == 'preempts':
         classes = frame['Class'] if 'Class' in frame.columns else pd.Series(None, index=frame.index, dtype=object)
         return classes.astype(object).where(classes.notna(), SECTION_EV)
-    if alert_type in (timing_checks.ALERT_TYPE, timing_insights.ALERT_TYPE) and 'Check' in frame.columns:
+    if alert_type == timing_insights.ALERT_TYPE and 'Check' in frame.columns:
         return frame['Check'].astype(object)
     return pd.Series(ONE_TABLE, index=frame.index, dtype=object)
 

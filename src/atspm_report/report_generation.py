@@ -20,6 +20,7 @@ from .table_generation import (
     ongoing_counted_to,
     prepare_phase_termination_alerts_table,
     prepare_phase_skip_alerts_table,
+    prepare_phase_skip_signal_table,
     prepare_missing_data_alerts_table,
     prepare_system_outages_table,
     prepare_clearance_interval_alerts_table,
@@ -38,8 +39,9 @@ from .coordination_check import (
     ALERT_TYPE as COORDINATION_ALERT_TYPE,
     SECTION_TITLE as COORDINATION_TITLE,
 )
-from .signal_focus import SECTION_TITLE as SIGNAL_FOCUS_TITLE
-from . import measure_checks, timing_checks, timing_insights
+from .signal_focus import SECTION_TITLE as SIGNAL_FOCUS_TITLE, SERVICE_ROW as FOCUS_SERVICE_ROW
+from .detector_triage import URGENT_COLOUR
+from . import measure_checks, timing_insights
 from .utils import log_message
 
 # Repeat alerts are normally held back so they do not crowd out new ones. When the
@@ -53,31 +55,20 @@ ONGOING_TITLE = 'Ongoing Issues'
 # drawn at close to print width so the text keeps its size.
 PREEMPT_CHART_HEIGHT = None
 HEADING_ROOM = 2.0*inch
-TIMING_CHART_HEIGHT = timing_checks.CHART_HEIGHT_INCHES*inch
 
 
-def _measure_sections(alerts, ongoing, signals_df, region, max_rows, ongoing_limit, figures, ongoing_figures,
-                      waiting=None) -> list:
-    """(title, rows, total, ongoing rows, ongoing total, charts, ongoing charts) of each section of the checks on atspm's
-    per-phase measures, in report order: the phase timing section, then the delay rise and the two trends. waiting: every
-    ongoing alert, for the ongoing totals when the rotation cut them (see _waiting_total)."""
+def _measure_sections(alerts, ongoing, signals_df, region, max_rows, ongoing_limit, waiting=None) -> list:
+    """(title, rows, total, ongoing rows, ongoing total) of each section of the checks on atspm's per-phase measures, in
+    report order: the delay rise and the two trends. waiting: every ongoing alert, for the ongoing totals when the
+    rotation cut them (see _waiting_total)."""
     alerts, ongoing = alerts or {}, ongoing or {}
     sections = []
-    for check in timing_checks.SECTION_TITLES:
-        rows, total = timing_checks.prepare_timing_table(alerts.get(timing_checks.ALERT_TYPE), signals_df, region, max_rows, check)
-        later, total_later = timing_checks.prepare_timing_table(ongoing.get(timing_checks.ALERT_TYPE), signals_df, region,
-                                                                ongoing_limit, check)
-        total_later = _waiting_total(waiting, timing_checks.ALERT_TYPE, total_later, lambda frame: timing_checks.prepare_timing_table(
-            frame, signals_df, region, 1, check))
-        sections.append((timing_checks.SECTION_TITLES[check], rows, total, later, total_later,
-                         [fig for fig, reg in timing_checks.section_figures(figures or [], check) if reg == region],
-                         [fig for fig, reg in timing_checks.section_figures(ongoing_figures or [], check) if reg == region]))
     for alert_type in (measure_checks.DELAY_RISE, measure_checks.SPLIT_FAIL_TREND, measure_checks.PLATOON_TREND):
         rows, total = measure_checks.prepare_measure_table(alerts.get(alert_type), signals_df, region, max_rows)
         later, total_later = measure_checks.prepare_measure_table(ongoing.get(alert_type), signals_df, region, ongoing_limit)
         total_later = _waiting_total(waiting, alert_type, total_later, lambda frame: measure_checks.prepare_measure_table(
             frame, signals_df, region, 1))
-        sections.append((measure_checks.SECTION_TITLES[alert_type], rows, total, later, total_later, [], []))
+        sections.append((measure_checks.SECTION_TITLES[alert_type], rows, total, later, total_later))
     return sections
 
 
@@ -168,7 +159,7 @@ ATSPM_PED_HEALTH_TITLE = 'Pedestrian Button Health'
 # With the urgency tiers the faults are two tables: those measured to cost a phase its service or to delay other phases, the
 # most costly first, with their charts; then those with no measured effect, which still need fixing for the data.
 ATSPM_HARM_TABLE = 'Affecting Operations'
-ATSPM_DATA_TABLE = 'Data Only'
+ATSPM_DATA_TABLE = 'Data Only - not Affecting Operations'
 
 
 def _atspm_detector_health_rows(alerts, signals_df, statuses, region, max_rows, story_header, detector_type=VEHICLE,
@@ -237,9 +228,10 @@ def _ongoing_section(
         trend_header: str = 'Trend',
         chart_height: float = 2.8*inch,
         chart_width: float = 6.5*inch,
-        keep_start: bool = False,
+        keep_start: bool = True,
 ) -> list:
-    """Build one check's subsection of the Ongoing Issues section, or nothing when there is nothing ongoing."""
+    """Build one check's subsection of the Ongoing Issues section, or nothing when there is nothing ongoing. keep_start: its
+    heading and table header go to the next page unless the table's first rows fit under them."""
     if not _has_rows(rows_df):
         return []
 
@@ -275,10 +267,30 @@ def _ongoing_issues(subsections: list, styles) -> list:
     ]
 
 
+def _flowable_height(item) -> float:
+    """A flowable's height at the page width, before layout (a KeepTogether is measured by its parts)."""
+    if isinstance(item, KeepTogether):
+        return sum(_flowable_height(part) for part in item._content)
+    return item.wrap(7.5*inch, 9.5*inch)[1]
+
+
+def _heading_room(content: list, start: int) -> float:
+    """Room a heading needs under it on the page: HEADING_ROOM, or, when the first block after it (past spacers and short
+    paragraphs) is a chart or a kept-together group rather than a table, that block's height too (at most a page)."""
+    for item in content[start:start + 6]:
+        if isinstance(item, (Spacer, Paragraph, CondPageBreak)):
+            continue
+        if isinstance(item, (KeepTogether, MatplotlibFigure)):
+            height = _flowable_height(item)
+            return max(HEADING_ROOM, min(height + 0.6*inch, 9.0*inch))
+        return HEADING_ROOM
+    return HEADING_ROOM
+
+
 def _keep_with_table_start(table: list, heading_height: float = 0.7*inch) -> CondPageBreak:
     """Goes to the next page unless this heading and the table's first signal fit on this one, so a heading and a table header
     are not left alone at the foot of a page."""
-    return CondPageBreak(heading_height + getattr(table[-1], 'start_height', 0.0))
+    return CondPageBreak(heading_height + (getattr(table[-1], 'start_height', 0.0) if table else 0.0))
 
 
 def _focus_table(told: list, drawn: set, styles) -> Table:
@@ -289,7 +301,10 @@ def _focus_table(told: list, drawn: set, styles) -> Table:
     table = [[Paragraph('Problem type', head), Paragraph('Problems', head)]]
     for row in told:
         charted = [] if row.get('no_chart') else [line for line in row['lines'] if line['chart'] in drawn]
-        kind = f"<b>{escape(row['type'])}</b>" + ('' if charted else '<br/><i>No chart</i>')
+        kind = f"<b>{escape(row['type'])}</b>"
+        if row['type'] == FOCUS_SERVICE_ROW:     # the most urgent problem the report tells
+            kind = f"<font color='{URGENT_COLOUR}'>{kind}</font>"
+        kind += '' if charted else '<br/><i>No chart</i>'
         lines = [escape(line['text'] if line['chart'] in drawn else line.get('detail', line['text']))
                  + (' <i>(no chart)</i>' if charted and line['chart'] not in drawn else '') for line in row['lines']]
         table.append([Paragraph(kind, body), Paragraph('<br/>'.join(lines), body)])
@@ -621,8 +636,6 @@ def _generate_pdf_report(
         coordination_figures: Optional[List[tuple[plt.Figure, str]]] = None,
         ongoing_coordination_figures: Optional[List[tuple[plt.Figure, str]]] = None,
         measure_alerts: Optional[Dict[str, pd.DataFrame]] = None,
-        timing_figures: Optional[List[tuple[plt.Figure, str]]] = None,
-        ongoing_timing_figures: Optional[List[tuple[plt.Figure, str]]] = None,
         table_signal_limits: Optional[Dict[str, int]] = None,
         ongoing_rotated: bool = False,
         ongoing_waiting: Optional[Dict[str, pd.DataFrame]] = None,
@@ -699,9 +712,8 @@ def _generate_pdf_report(
         coordination_figures: (figure, region) charts of the new coordination alerts, one per alert
         ongoing_coordination_figures: The same for the ongoing ones
         measure_alerts: Alerts of the checks on atspm's per-phase measures after suppression, by alert type
-            (measure_checks: delay_rise, split_failure_trend, platoon_ratio_trend; timing_checks: phase_timing), each
-            in its own section after the coordination one; their held-back repeats come in ongoing_alerts
-        timing_figures / ongoing_timing_figures: (figure, region) charts of the phase timing alerts
+            (measure_checks: delay_rise, split_failure_trend, platoon_ratio_trend), each in its own section after the
+            coordination one; their held-back repeats come in ongoing_alerts
 
     Returns:
         Dict mapping region name to BytesIO containing PDF bytes
@@ -1218,18 +1230,18 @@ def _generate_pdf_report(
             total_phase_skip_alerts = 0
 
         if _has_rows(ongoing_phase_skip_rows) and signals_df is not None:
-            region_phase_skip_ongoing_rows, total_phase_skip_ongoing = prepare_phase_skip_alerts_table(
+            # one row per signal, with its skips per day (not a row a day)
+            region_phase_skip_ongoing_rows, total_phase_skip_ongoing = prepare_phase_skip_signal_table(
                 ongoing_phase_skip_rows,
                 signals_df,
                 region=region,
                 allowed_pairs=ongoing_phase_skip_pairs,
                 min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0,
-                max_rows=rotated_limit,
-                max_signals=phase_skip_signals,
+                max_rows=min(rotated_limit, phase_skip_signals) if phase_skip_signals else rotated_limit,
             )
             total_phase_skip_ongoing = _waiting_total(
                 ongoing_waiting, 'phase_skips', total_phase_skip_ongoing,
-                lambda frame: prepare_phase_skip_alerts_table(
+                lambda frame: prepare_phase_skip_signal_table(
                     phase_skip_rows, signals_df, region=region, allowed_pairs=frame[['DeviceId', 'Phase']].drop_duplicates(),
                     min_total_skips=phase_skip_threshold if phase_skip_threshold is not None else 0, max_rows=1))
         else:
@@ -1264,6 +1276,8 @@ def _generate_pdf_report(
             styles,
             max_table_rows,
             figures=region_ongoing_phase_skip_figures,
+            include_trend=True,
+            trend_header='Skips/Day',
         ))
 
         # Section: Detector Health, from atspm-detector. Faults first, then the
@@ -1503,9 +1517,9 @@ def _generate_pdf_report(
 
         # Sections: checks on atspm's per-phase measures (each off unless switched on). Signal Focus does not tell these.
         measure_any = False
-        for title, rows, total, ongoing_rows, total_ongoing, figures, ongoing_figures in _measure_sections(
+        for title, rows, total, ongoing_rows, total_ongoing in _measure_sections(
                 measure_alerts, ongoing_alerts, all_signals_df, region, max_table_rows, rotated_limit,
-                timing_figures, ongoing_timing_figures, waiting=ongoing_waiting):
+                waiting=ongoing_waiting):
             if not rows.empty:
                 measure_any = True
                 content.append(Paragraph(title, styles['SectionHeading']))
@@ -1513,11 +1527,9 @@ def _generate_pdf_report(
                 content.extend(create_reportlab_table(rows, title, styles, total_count=total, max_rows=max_table_rows,
                                                       include_trend=False))
                 content.append(Spacer(1, 0.3*inch))
-                content.extend(_chart_flowables(figures, TIMING_CHART_HEIGHT))
             if not ongoing_rows.empty:
                 measure_any = True
-            ongoing_content.extend(_ongoing_section(title, ongoing_rows, total_ongoing, styles, max_table_rows,
-                                                    figures=ongoing_figures, chart_height=TIMING_CHART_HEIGHT))
+            ongoing_content.extend(_ongoing_section(title, ongoing_rows, total_ongoing, styles, max_table_rows))
 
         # Section: Missing Data - Changed to a single header
         missing_trend_header = MISSING_HOURLY_HEADER if _has_rows(missing_data_hourly) else 'Missing (7d)'
@@ -1673,11 +1685,12 @@ def _generate_pdf_report(
         # Every check's ongoing issues, together after all the new alerts.
         content.extend(_ongoing_issues(ongoing_content, styles))
 
-        # A heading goes to the next page unless the start of its table fits under it.
+        # A heading goes to the next page unless the start of its table fits under it, or, where a chart or map comes
+        # first (no table), that chart.
         for position in range(len(content) - 1, 0, -1):
             item = content[position]
             if isinstance(item, Paragraph) and item.style.name in ('SectionHeading', 'SubsectionHeading'):
-                content.insert(position, CondPageBreak(HEADING_ROOM))
+                content.insert(position, CondPageBreak(_heading_room(content, position + 1)))
 
         # Build the PDF with custom canvas for proper page numbering; a region
         # with nothing to report gets no PDF, so it is not laid out either.

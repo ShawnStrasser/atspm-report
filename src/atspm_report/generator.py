@@ -129,7 +129,6 @@ from .measure_checks import (
     DELAY_RISE, PLATOON_TREND, SPLIT_FAIL_TREND, delay_rise_alerts, trend_alerts,
     STEP_LOOKBACK_DAYS as DELAY_RISE_LOOKBACK_DAYS,
 )
-from . import timing_checks
 from . import timing_insights
 from . import table_limits
 from .utils import log_message
@@ -434,11 +433,10 @@ ALERT_CONFIG = {
     },
     # Coordination plans set wrong (Cause 'Schedule') and controller clocks off (Cause 'Clock'), see coordination_check.
     COORDINATION: {'id_cols': ['DeviceId', 'Cause'], 'file_suffix': 'coordination_alerts'},
-    # Checks on atspm's per-phase measures (measure_checks, timing_checks), each behind its own switch, off by default.
+    # Checks on atspm's per-phase measures (measure_checks), each behind its own switch, off by default.
     DELAY_RISE: {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'delay_rise_alerts'},
     SPLIT_FAIL_TREND: {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'split_failure_trend_alerts'},
     PLATOON_TREND: {'id_cols': ['DeviceId', 'Phase'], 'file_suffix': 'platoon_ratio_trend_alerts'},
-    timing_checks.ALERT_TYPE: {'id_cols': timing_checks.ID_COLUMNS, 'file_suffix': 'phase_timing_alerts'},
     # Timing Insights (timing_insights): how each phase uses its green; Phase 0 for Max Capacity (the whole signal).
     timing_insights.ALERT_TYPE: {'id_cols': timing_insights.ID_COLUMNS, 'file_suffix': 'timing_insight_alerts'},
 }
@@ -512,6 +510,8 @@ class ReportGenerator:
             - maxout_drain_per_hour / maxout_drain_threshold: Defaults: 0.1, 1.0
             - alert_retention_weeks (int): Weeks to retain alert history. Default: 104
             - figures_per_device (int): Plots per device in report. Default: 3
+            - ongoing_figures (int): Charts per Ongoing Issues table and report, for its first rows. Default: None
+              (figures_per_device)
             - verbosity (int): 0=silent, 1=info, 2=debug. Default: 1
             - phase_skip_alert_threshold (int): Min skips to trigger alert. Default: 1
             - phase_skip_retention_days (int): Days to retain phase skip data. Default: 14
@@ -579,15 +579,13 @@ class ReportGenerator:
             - measure_check_days (int): Most days those three checks judge in one run: the report day and the earlier
               days the last report did not cover (by the detector health history, as its window), so a Monday run after
               a Friday run judges Friday to Sunday. Without that history, all of them. Default: 3
-            - split_failures_no_maxout_check_enabled (bool): Phases ending green too early: split failures without max
-              outs, from split_failures and terminations (timing_checks). Default: False
             - timing_insights_enabled (bool): The Timing Insights section at the end of the report (timing_insights):
-              Premature Gap-Out, Max-Out with Low Demand, Max Recall despite Detection, Needs More Green, Max Capacity
+              Premature Gap-Out, Maxing Out despite Low Demand, Max Recall despite Detection, Needs More Green, Max Capacity
               and Downstream Bottleneck, judged over the last six weekdays; needs split_failures (with Green_Time) and
               terminations over those days, and uses pedestrian and coordination_agg, and actuations with the detector
               table's count zones for Downstream Bottleneck. Default: False
             - timing_insights_rows (int): Rows (each with its chart) per Timing Insights table in each report, new and
-              ongoing; new alerts left out are not filed, so they come up on a later run. 0: no limit. Default: 5
+              ongoing; new alerts left out are not filed, so they come up on a later run. 0: no limit. Default: 3
             - joke_index (int): Specific joke index. Default: None (auto-cycle by date)
             - custom_logo_path (str): Path to custom logo. Default: None (use ODOT logo)
         """
@@ -605,6 +603,8 @@ class ReportGenerator:
             **MAXOUT_DRAIN_DEFAULTS,
             'alert_retention_weeks': 104,
             'figures_per_device': 3,
+            # Charts per Ongoing Issues table and report; None: figures_per_device.
+            'ongoing_figures': None,
             'verbosity': 1,
             'phase_skip_alert_threshold': 1,
             'phase_skip_retention_days': 14,
@@ -679,10 +679,9 @@ class ReportGenerator:
             'split_failure_trend_enabled': False,
             'platoon_ratio_trend_enabled': False,
             'measure_check_days': 3,
-            **{switch: False for switch in timing_checks.CONFIG_SWITCHES.values()},
             # Timing Insights: off until approved.
             timing_insights.CONFIG_SWITCH: False,
-            timing_insights.ROWS_CONFIG: 5,
+            timing_insights.ROWS_CONFIG: 3,
         }
         return {**defaults, **config}
     
@@ -1207,7 +1206,7 @@ class ReportGenerator:
 
         # Checks on atspm's per-phase measures, each behind its own switch; none takes part in Signal Focus.
         measure_devices = signals['DeviceId'].astype(str).unique().tolist()
-        for alert_type in (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND, timing_checks.ALERT_TYPE, timing_insights.ALERT_TYPE):
+        for alert_type in (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND, timing_insights.ALERT_TYPE):
             new_alerts[alert_type] = pd.DataFrame()
         if report_day is not None:
             # The report day and the earlier days the last report did not cover (a Monday run judges Friday to Sunday).
@@ -1227,12 +1226,6 @@ class ReportGenerator:
                                                           history_days=self.config['historical_window_days'],
                                                           recency_days=self.config['alert_recency_days'],
                                                           devices=measure_devices, check_days=check_days)
-            timing = {check for check, switch in timing_checks.CONFIG_SWITCHES.items() if self.config[switch]}
-            if timing and split_failures is not None and not _is_empty(terminations):
-                log_message("Checking phase timing from split failures and max outs...", 1, verbosity)
-                new_alerts[timing_checks.ALERT_TYPE] = timing_checks.build_timing_alerts(
-                    split_failures, terminations, phase_wait, coordination_agg, measure_faults, report_day, timing,
-                    signals=signals)
             if self.config[timing_insights.CONFIG_SWITCH] and split_failures is not None and not _is_empty(terminations):
                 log_message("Checking timing insights (green use by phase)...", 1, verbosity)
                 # the measure faults with the count zones too (Downstream Bottleneck reads them)
@@ -1434,9 +1427,11 @@ class ReportGenerator:
         missing_data_figures = create_device_plots(final_alerts['missing_data'], signals, num_figures, missing_hourly, exclude=focus_hidden)
 
         # Ongoing issues get their own charts, drawn the same way and capped the same.
-        ongoing_phase_figures = create_device_plots(ongoing_alerts['maxout'], signals, num_figures,
+        # Ongoing Issues draw fewer charts (ongoing_figures), the first rows of each table.
+        ongoing_charts = self.config['ongoing_figures'] or num_figures
+        ongoing_phase_figures = create_device_plots(ongoing_alerts['maxout'], signals, ongoing_charts,
                                                    hourly_data.get('maxout_hourly', pd.DataFrame()), exclude=focus_hidden)
-        ongoing_missing_data_figures = create_device_plots(ongoing_alerts['missing_data'], signals, num_figures,
+        ongoing_missing_data_figures = create_device_plots(ongoing_alerts['missing_data'], signals, ongoing_charts,
                                                           missing_hourly, exclude=focus_hidden)
 
         # Phase skip visualizations
@@ -1446,7 +1441,7 @@ class ReportGenerator:
             days_plotted=self.config['phase_skip_new_chart_days'], exclude=focus_hidden,
         )
         ongoing_phase_skip_figures = self._create_phase_skip_figures(
-            ongoing_alerts['phase_skips'], signals, num_figures,
+            ongoing_alerts['phase_skips'], signals, ongoing_charts,
             days_plotted=self.config['phase_skip_ongoing_chart_days'], exclude=focus_hidden,
         )
         
@@ -1454,21 +1449,18 @@ class ReportGenerator:
             final_alerts['preempts'], updated_preempt_calls, updated_preempt_history, signals, exclude=focus_hidden
         )
         ongoing_preempt_figures = self._create_preempt_figures(
-            ongoing_alerts['preempts'], updated_preempt_calls, updated_preempt_history, signals, exclude=focus_hidden
+            ongoing_alerts['preempts'], updated_preempt_calls, updated_preempt_history, signals, exclude=focus_hidden,
+            num_figures=min(self.config['preempt_figures'], ongoing_charts),
         )
         # Coordination: each listed group's map and charts (coordination_check.create_coordination_plots), no table.
         coordination_figures = create_coordination_plots(final_alerts.get(COORDINATION), signals,
                                                          self.config['coordination_figures'])
         ongoing_coordination_figures = create_coordination_plots(ongoing_alerts.get(COORDINATION), signals,
                                                                  self.config['coordination_figures'])
-        timing_figures = timing_checks.create_timing_plots(
-            final_alerts.get(timing_checks.ALERT_TYPE), signals, num_figures)
-        ongoing_timing_figures = timing_checks.create_timing_plots(
-            ongoing_alerts.get(timing_checks.ALERT_TYPE), signals, num_figures)
         insight_rows = self.config[timing_insights.ROWS_CONFIG]
         insight_figures = timing_insights.create_insight_plots(final_alerts.get(timing_insights.ALERT_TYPE), signals, insight_rows)
         ongoing_insight_figures = timing_insights.create_insight_plots(ongoing_alerts.get(timing_insights.ALERT_TYPE), signals,
-                                                                       self._ongoing_limits().get(timing_insights.ALERT_TYPE, insight_rows))
+                                                                       min(ongoing_charts, self._ongoing_limits().get(timing_insights.ALERT_TYPE) or insight_rows))
 
         # Detector health (atspm-detector): one chart per signal phase for the faults, the lane
         # closures and the timing plans, from the 15-minute actuations in
@@ -1545,14 +1537,14 @@ class ReportGenerator:
             counts = chart_counts[chart_counts['DeviceId'].isin(devices)]
             return create_atspm_detector_health_plots(chosen, signals, figures or num_figures, counts, atspm_info,
                                                       window=atspm_window, kind=kind, exclude=focus_hidden)
-        def ped_figures_for(key):
+        def ped_figures_for(key, figures=None):
             chosen = operational(ped_charted[key])
             if chosen is None or _is_empty(ped_press_counts):
                 return []
             devices = chosen['DeviceId'].astype(str).unique().tolist()
             presses = _window_counts(ped_press_counts, devices, *atspm_window)
             # Fewer than the detectors': one chart per signal, and two panels each.
-            return create_atspm_detector_health_plots(chosen, signals, max(num_figures - 1, 1), presses, window=atspm_window,
+            return create_atspm_detector_health_plots(chosen, signals, figures or max(num_figures - 1, 1), presses, window=atspm_window,
                                                       kind='ped', exclude=focus_hidden, ped_services=ped_services,
                                                       ped_inputs=ped_inputs_table, ped_cycles=ped_cycles)
         atspm_detector_health_figures = {
@@ -1562,8 +1554,8 @@ class ReportGenerator:
             'plan': atspm_figures('plan', 'closure', max(num_figures - 1, 1)),
             'ped_fault': ped_figures_for('ped_fault'),
         }
-        ongoing_atspm_detector_health_figures = atspm_figures('ongoing', 'fault')
-        ongoing_atspm_ped_figures = ped_figures_for('ped_ongoing')
+        ongoing_atspm_detector_health_figures = atspm_figures('ongoing', 'fault', ongoing_charts)
+        ongoing_atspm_ped_figures = ped_figures_for('ped_ongoing', ongoing_charts)
 
         signal_focus_figures = self._signal_focus_figures(
             signal_focus, final_alerts, suppressed_alerts, signals, hourly_data, updated_preempt_calls,
@@ -1621,9 +1613,7 @@ class ReportGenerator:
             coordination_figures=coordination_figures,
             ongoing_coordination_figures=ongoing_coordination_figures,
             measure_alerts={alert_type: final_alerts.get(alert_type) for alert_type in
-                            (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND, timing_checks.ALERT_TYPE)},
-            timing_figures=timing_figures,
-            ongoing_timing_figures=ongoing_timing_figures,
+                            (DELAY_RISE, SPLIT_FAIL_TREND, PLATOON_TREND)},
             insight_alerts=final_alerts.get(timing_insights.ALERT_TYPE),
             insight_waiting=insight_waiting,
             insight_figures=insight_figures,
@@ -1911,7 +1901,7 @@ class ReportGenerator:
                         told['no_chart'] = True
         return figures
 
-    def _create_preempt_figures(self, alerts_df, calls, history, signals, exclude=None) -> dict:
+    def _create_preempt_figures(self, alerts_df, calls, history, signals, exclude=None, num_figures=None) -> dict:
         """{section: (figure, region) charts} for preempt alerts: stacked daily-count and call-duration charts, each section
         drawing only its own calls. The TSP charts count bus calls (bursts of pulses), split into those that ran as
         preempts and normal TSP requests, over the length of each pulse."""
@@ -1949,7 +1939,7 @@ class ReportGenerator:
                 section_calls,
                 section_history,
                 signals,
-                num_figures=self.config['preempt_figures'],
+                num_figures=num_figures or self.config['preempt_figures'],
                 rail_preempts=rail,
                 exclude=exclude,
                 **extra,

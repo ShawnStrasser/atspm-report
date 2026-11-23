@@ -282,6 +282,41 @@ def prepare_phase_skip_alerts_table(phase_skip_rows, signals_df, region=None, al
     return aggregated, total_alerts_count
 
 
+def prepare_phase_skip_signal_table(phase_skip_rows, signals_df, region=None, allowed_pairs=None, min_total_skips=0,
+                                    max_rows=10):
+    """The phase skip table one row per signal (the Ongoing Issues one): Signal, Phases, Total Skips and a sparkline of
+    its skips per day over the days phase_skip_rows covers, the most skips first. (rows, total signals)."""
+    if phase_skip_rows is None or phase_skip_rows.empty or signals_df is None:
+        return pd.DataFrame(), 0
+    df = phase_skip_rows.assign(DeviceId=phase_skip_rows['DeviceId'].astype(str),
+                                Date=pd.to_datetime(phase_skip_rows['Date']).dt.normalize())
+    days = pd.date_range(df['Date'].min(), df['Date'].max(), freq='D')
+    if allowed_pairs is not None and not allowed_pairs.empty:
+        allowed = allowed_pairs[['DeviceId', 'Phase']].drop_duplicates().astype({'DeviceId': str, 'Phase': int})
+        df = df.merge(allowed, on=['DeviceId', 'Phase'], how='inner')
+    info = signals_df.assign(DeviceId=signals_df['DeviceId'].astype(str))[['DeviceId', 'Name', 'Region']].drop_duplicates('DeviceId')
+    df = df.merge(info, on='DeviceId', how='inner')
+    if region and region != 'All Regions':
+        df = df[df['Region'] == region]
+    if df.empty:
+        return pd.DataFrame(), 0
+    rows = df.groupby('Name', as_index=False).agg(
+        Phases=('Phase', lambda x: ', '.join(sorted({str(int(p)) for p in x}, key=int))),
+        TotalSkips=('TotalSkips', 'sum'), **_ongoing_aggregation(df.columns))
+    rows = rows[rows['TotalSkips'] >= (min_total_skips or 0)]
+    if rows.empty:
+        return pd.DataFrame(), 0
+    daily = df.groupby(['Name', 'Date'])['TotalSkips'].sum()
+    rows['Sparkline_Data'] = [daily.loc[name].reindex(days, fill_value=0).astype(float).tolist() for name in rows['Name']]
+    total = len(rows)
+    rows = rows.rename(columns={'Name': 'Signal', 'TotalSkips': 'Total Skips'}).sort_values(['Total Skips', 'Signal'],
+                                                                                           ascending=[False, True])
+    if max_rows > 0:
+        rows = rows.head(max_rows)
+    rows, columns = _add_ongoing_column(rows, ['Signal', 'Phases', 'Total Skips', 'Sparkline_Data'])
+    return rows[columns].reset_index(drop=True), total
+
+
 # Sparkline PNGs by their data: a row shows in its region's report and in All
 # Regions, and the same series often shows in several tables.
 _SPARKLINE_PNGS = {}

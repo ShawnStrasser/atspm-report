@@ -114,6 +114,9 @@ SILENT_EXPECTED_PRESSES = 30.0
 SILENT_MIN_DAY_BINS = 80
 
 SERVICE_LOST, OTHER_PHASES, DATA_ONLY, NOT_MEASURED = 'Service lost', 'Harm to other phases', 'Data only', 'Not measured'
+# How the report says it: a phase that stopped being served is the most urgent problem it tells (user, 2026-11-23).
+SERVICE_LOST_WORDS = 'Phase stopped serving'
+URGENT_COLOUR = '#c4302b'
 TIER_ORDER = {SERVICE_LOST: 1, OTHER_PHASES: 2, DATA_ONLY: 3, NOT_MEASURED: 3}
 
 VEHICLE, PED = 'Vehicle', 'Ped'
@@ -894,6 +897,8 @@ def impact_label(row) -> str:
         return 'Not measured'
     if tier == NOT_MEASURED:
         return text
+    if tier == SERVICE_LOST:   # the most urgent: the phase is not being served
+        return f"<font color='{URGENT_COLOUR}'><b>{SERVICE_LOST_WORDS}.</b></font> {text}"
     return f"<b>{tier}.</b> {text}"
 
 

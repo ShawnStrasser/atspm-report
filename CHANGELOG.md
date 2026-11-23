@@ -4,7 +4,16 @@
 
 ### Added
 
-- **Timing Insights** (`timing_insights_enabled`, off by default): a section at the end of the report, before Ongoing Issues, on how each phase uses its green over the last six weekdays, from the 15-minute tables only (no controller settings): Premature Gap-Out, Max-Out with Low Demand, Max Recall despite Detection, Needs More Green (naming the phases that can give time), Max Capacity (per signal) and Downstream Bottleneck. Each table opens with a line saying what it means, lists `timing_insights_rows` (5) rows a report with a chart each, and goes through alert suppression and the Ongoing Issues like other checks; rows left out are not filed. New module `timing_insights`, alert type `timing_insights`, and `generate(actuations=...)` (15-minute counts, for the count zones of Downstream Bottleneck). It needs `split_failures` with `Green_Time`.
+- **Timing Insights** (`timing_insights_enabled`, off by default): a section at the end of the report, before Ongoing Issues, on how each phase uses its green over the last six weekdays, from the 15-minute tables only (no controller settings): Premature Gap-Out, Maxing Out despite Low Demand, Max Recall despite Detection, Needs More Green (naming the phases that can give time), Max Capacity (per signal) and Downstream Bottleneck. Each table opens with a line saying what it means, lists `timing_insights_rows` (3) rows a report with a chart each, and goes through alert suppression and the Ongoing Issues like other checks; rows left out are not filed. New module `timing_insights`, alert type `timing_insights`, and `generate(actuations=...)` (15-minute counts, for the count zones of Downstream Bottleneck). It needs `split_failures` with `Green_Time`.
+
+- **A phase that stopped being served is told first.** A detector fault that cost its phase its greens (triage tier Service lost) puts the signal in Signal Focus by itself, ahead of the others, under a red "PHASE STOPPED SERVING" row; the Detector Health Impact column says "Phase stopped serving." in red. Ped walks lost are as before.
+- **Shorter Ongoing Issues.** New `ongoing_figures` (charts per Ongoing table and report; default `figures_per_device`). The Ongoing phase skip table is one row per signal with a sparkline of skips per day (new `prepare_phase_skip_signal_table`), not a row a day.
+- **Data Only - not Affecting Operations** is the second Detector Health table's new title.
+- **Headings stay with what follows them**: a heading goes to the next page unless the first rows of its table, or the chart or map that comes first, fit under it.
+
+### Removed
+
+- **Phases Ending Green Too Early** (`split_failures_no_maxout_check_enabled`, module `timing_checks`, alert type `phase_timing`): Timing Insights' Premature Gap-Out covers it. The switch is ignored if still passed.
 
 ### Changed
 

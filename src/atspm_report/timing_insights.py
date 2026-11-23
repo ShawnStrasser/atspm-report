@@ -7,8 +7,9 @@ Six checks, each its own table at the bottom of the report:
                               working. In each 15-minute bin, the bin's split failures (at most its gap-outs) count as at
                               a gap-out in the share its gap-outs have of its greens; a bin of gap-outs only counts them
                               all. Listed when PREMATURE_SHARE of its gap-outs end in a split failure over the judged days
-                              and on PREMATURE_DAYS of them (each with PREMATURE_MIN_GAPOUTS gap-outs or more).
-  Max-Out, Low Demand         the phase runs to its limit without the traffic for it.
+                              and on PREMATURE_DAYS of them (each with PREMATURE_MIN_GAPOUTS gap-outs or more), and
+                              PREMATURE_PER_DAY or more of them a day.
+  Maxing Out despite Low Demand  the phase runs to its limit without the traffic for it.
   Max Recall despite Detection  the phase is on max recall although its detection works and the traffic is light.
   Needs More Green            the phase runs to its limit with split failures while phases that can give it time have
                               time to spare.
@@ -21,7 +22,7 @@ phase in that state STATE_HOURS hours a day or more on STATE_DAYS of the days:
   on recall     the phase ran to its limit on RECALL_LIMIT of its greens with ped service on under half of them. Data
                 only: the controllers' recall settings are never read.
   coordinated   phases 2 and 6 while the signal runs a pattern with a cycle length. A coordinated phase is held to its
-                force-off by design, so Max-Out, Low Demand and Max Recall leave it out (Premature Gap-Out does not).
+                force-off by design, so Maxing Out despite Low Demand and Max Recall leave it out (Premature Gap-Out does not).
   barrier partner  phases 2 and 6, 4 and 8 end at the barrier together (standard ring and barrier phasing: ring 1 is
                 phases 1 to 4, ring 2 is 5 to 8; 1, 2, 5, 6 one side of the barrier, 3, 4, 7, 8 the other). A phase
                 held by a busier partner is not running long by itself, so both must meet the low-demand limits.
@@ -71,7 +72,7 @@ ROWS_CONFIG = 'timing_insights_rows'
 SECTION_TITLE = 'Timing Insights'
 
 PREMATURE = 'Premature Gap-Out'
-MAXOUT_LOW = 'Max-Out, Low Demand'
+MAXOUT_LOW = 'Maxing Out despite Low Demand'
 MAX_RECALL = 'Max Recall despite Detection'
 NEEDS_GREEN = 'Needs More Green'
 CAPACITY = 'Max Capacity'
@@ -81,14 +82,14 @@ CHECKS = (PREMATURE, MAXOUT_LOW, MAX_RECALL, NEEDS_GREEN, CAPACITY, BOTTLENECK)
 # The user's own words for each table (2026-11-23).
 NOTES = {
     PREMATURE: 'If a gap-out happens with a split failure, the phase gapped out despite demand. Either the gap timing is '
-               'too aggressive or the detection is not working. For radar, check the configuration first.',
+               'too aggressive or the detection is not working.',
     MAXOUT_LOW: 'The phase is extending despite a lack of demand, shown by high max-outs with low split failures and low '
                 'green occupancy. The gap timing is too lenient, or the detection is malfunctioning or misconfigured.',
     MAX_RECALL: 'The phase is on max recall despite working detection and a lack of demand. Check the timing for max recall '
                 '(is it intentional?). If it is not the timing, a broken detector is forcing the phase into recall while '
                 "the phase's other detection still works.",
     NEEDS_GREEN: 'Phases that need more green time AND have potential donor phases with time to spare.',
-    CAPACITY: 'Signals that are at capacity on all phases. This situation is hopeless; nothing can be done.',
+    CAPACITY: 'Signals that are at capacity on all phases.',
     BOTTLENECK: 'Phases that are getting backed up by a downstream bottleneck. They are wasting green time by giving it to '
                 'vehicles that have nowhere to go.',
 }
@@ -110,7 +111,11 @@ SPARE_OCCUPANCY = 0.50
 TIGHT_SPLIT_FAIL, TIGHT_SHARE = 0.10, 0.75
 DONOR_SHARE = 0.25                   # a set of donor phases named when it gave time in this share of the hours
 ALL_RECALL_SHARE = 0.5               # a signal whose every measured phase is on recall this share of hours goes last
-PREMATURE_SHARE = 0.05
+# Study of 2026-11-23 (weekdays 11-13 to 11-20): 5 % flagged 545 phases, a sixth of those measured (the median phase ends
+# 1 % of its gap-outs in a split failure). 15 % and 20 a day flags 78 (2.3 %); 83 % of those flagged on three of the days
+# were flagged again on the other three.
+PREMATURE_SHARE = 0.15
+PREMATURE_PER_DAY = 20
 PREMATURE_DAYS = 3
 PREMATURE_MIN_GAPOUTS = 20
 START_UP_LOSS, HEADWAY = 5.0, 2.0
@@ -130,7 +135,6 @@ PHASE_COLOURS = {1: '#0072B2', 2: '#E69F00', 3: '#009E73', 4: '#D55E00', 5: '#CC
                  8: '#555555'}
 INK, MUTED, BLUE, RED, BAND = '#222222', '#666666', '#2a78d6', '#d04a3c', '#3a9d5d'
 MAXOUT_TITLE, SPLIT_TITLE, GOR_TITLE = 'Percent MaxOut/ForceOff', 'Percent Split Failures', 'Green Occupancy Ratio'
-PANEL_HEIGHT = 2.7
 CHART_WIDTH = 7.5
 
 
@@ -330,7 +334,7 @@ def build_insight_alerts(split_failures, terminations, report_day, signals: Opti
             SELECT DeviceId, Phase, count(*) FILTER (WHERE n >= {PREMATURE_MIN_GAPOUTS} AND k / n >= {PREMATURE_SHARE}) AS days_seen,
                    sum(k) AS k, sum(n) AS n
             FROM d GROUP BY ALL
-            HAVING sum(k) / nullif(sum(n), 0) >= {PREMATURE_SHARE}
+            HAVING sum(k) / nullif(sum(n), 0) >= {PREMATURE_SHARE} AND sum(k) >= {PREMATURE_PER_DAY * len(days)}
                AND count(*) FILTER (WHERE n >= {PREMATURE_MIN_GAPOUTS} AND k / n >= {PREMATURE_SHARE}) >= {PREMATURE_DAYS}""").df()
         donors = con.execute("SELECT DeviceId, Phase, donors FROM s2 WHERE needs_green").df()
         # the hours a day the whole signal was at capacity (any phase), on its days with STATE_HOURS of them
@@ -520,31 +524,46 @@ def prepare_insight_table(alerts: Optional[pd.DataFrame], signals_df: Optional[p
     return rows[out_columns].reset_index(drop=True), total
 
 
-def _panel(ax, title: str, series: dict, me: int, scale: str, dashed: Optional[dict] = None):
-    if scale == 'gor':
-        ax.axhspan(*IDEAL_OCCUPANCY, color=BAND, alpha=0.13, lw=0, zorder=1)
-    for k, block in enumerate([series] + ([dashed] if dashed else [])):
-        for ph, values in block.items():
-            focus = me is None or ph == me
-            lw = 1.5 if me is None else (3.0 if ph == me else 1.1)
-            ax.plot(range(HOUR_FROM, HOUR_TO), [np.nan if v is None else v for v in values], color=PHASE_COLOURS.get(ph, '#999999'),
-                    lw=lw * (0.85 if k else 1), ls='--' if k else '-', alpha=1.0 if focus else 0.8, zorder=3 if ph == me else 2)
-    ax.set_xticks([7, 9, 11, 13, 15, 17])
-    ax.set_xlim(HOUR_FROM - 0.3, HOUR_TO - 0.7)
-    ax.set_title(title, fontsize=8.5, loc='left', color=INK)
-    ax.set_xlabel('Hour of day', fontsize=7.5, color=MUTED)
-    ax.set_ylabel('%', fontsize=7.5, color=MUTED)
-    ax.tick_params(labelsize=7.5)
+LEGEND_ROW = 0.3        # inches per legend row above the panels
+TITLE_H = 0.62          # title and detail line
+PANEL_TITLE_H = 0.3     # room for the panels' own titles under the legend
+PANEL_H = 1.65          # one row of panels
+AXIS_H = 0.45           # x labels under a row
+
+
+def _style(ax, title: str, xlabel: str, ylabel: str):
+    """The report's chart look: light grey plot area, dashed grid, titles and labels as the detector charts have them."""
+    ax.set_facecolor('#fafafa')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_title(title, fontsize=10, loc='left', color=INK)
+    ax.set_xlabel(xlabel, fontsize=9.5)
+    ax.set_ylabel(ylabel, fontsize=9.5)
+    ax.tick_params(labelsize=9)
     for side in ('top', 'right'):
         ax.spines[side].set_visible(False)
 
 
+def _panel(ax, title: str, series: dict, me, scale: str, dashed: Optional[dict] = None):
+    if scale == 'gor':
+        ax.axhspan(*IDEAL_OCCUPANCY, color=BAND, alpha=0.15, lw=0, zorder=1)
+    for k, block in enumerate([series] + ([dashed] if dashed else [])):
+        for ph, values in block.items():
+            focus = me is None or ph == me
+            lw = 1.6 if me is None else (3.0 if ph == me else 1.2)
+            ax.plot(range(HOUR_FROM, HOUR_TO), [np.nan if v is None else v for v in values], color=PHASE_COLOURS.get(ph, '#999999'),
+                    lw=lw * (0.85 if k else 1), ls='--' if k else '-', alpha=1.0 if focus else 0.8, zorder=3 if ph == me else 2)
+    ax.set_xticks([7, 10, 13, 16])
+    ax.set_xticklabels(['7:00', '10:00', '13:00', '16:00'])
+    ax.set_xlim(HOUR_FROM - 0.3, HOUR_TO - 0.7)
+    _style(ax, title, '', '% of green' if scale == 'gor' else '% of cycles')
+
+
 def _scatter(ax, points: list):
-    p =np.array([[o, v, b] for o, v, b in points], dtype=float) if points else np.zeros((0, 3))
+    p = np.array([[o, v, b] for o, v, b in points], dtype=float) if points else np.zeros((0, 3))
     if len(p):
         free, blocked = p[p[:, 2] == 0], p[p[:, 2] == 1]
-        ax.scatter(free[:, 0], free[:, 1], color='#9a9a9a', s=4, alpha=0.5, linewidth=0)
-        ax.scatter(blocked[:, 0], blocked[:, 1], color=RED, s=8, linewidth=0, zorder=3)
+        ax.scatter(free[:, 0], free[:, 1], color='#9a9a9a', s=5, alpha=0.5, linewidth=0)
+        ax.scatter(blocked[:, 0], blocked[:, 1], color=RED, s=9, linewidth=0, zorder=3)
         levels = np.minimum(np.floor(p[:, 0] / 10), 9)
         xs, ys = [], []
         for lv in range(10):
@@ -552,24 +571,18 @@ def _scatter(ax, points: list):
             if len(sel) >= 8:
                 xs.append(lv * 10 + 5)
                 ys.append(sel[:, 1].mean())
-        ax.plot(xs, ys, color=BLUE, lw=2.0, zorder=4)
+        ax.plot(xs, ys, color=BLUE, lw=2.2, zorder=4)
         ax.set_ylim(0, max(600.0, float(np.quantile(p[:, 1], 0.995)) * 1.1))
     ax.set_xlim(0, 100)
-    ax.set_title('Volume against Occupancy', fontsize=8.5, loc='left', color=INK)
-    ax.set_xlabel('Green occupancy, %   (red = backed up)', fontsize=7.5, color=MUTED)
-    ax.set_ylabel('Vehicles / hour of green / lane', fontsize=7.5, color=MUTED)
-    ax.tick_params(labelsize=7.5)
-    for side in ('top', 'right'):
-        ax.spines[side].set_visible(False)
+    _style(ax, 'Volume against Occupancy', 'Green occupancy, %', 'Vehicles / hour of green / lane')
 
 
 def insight_chart(alert, name: str):
     """By hour of day, one line per phase, the phase in question thick: Premature Gap-Out shows split failures (dashed:
-    at a gap-out) and max-outs; the other checks max-outs, split failures and green occupancy with its ideal range;
-    Downstream Bottleneck adds volume against occupancy."""
+    with a gap-out) and max-outs; the other checks max-outs, split failures and green occupancy with its ideal range;
+    Downstream Bottleneck adds volume against occupancy, with its own legend."""
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
-    from .coordination_check import signal_number
     from .visualization import new_figure
     data = json.loads(alert['ChartData'])
     phases = {int(p): v for p, v in sorted(data['phases'].items(), key=lambda kv: int(kv[0]))}
@@ -583,38 +596,54 @@ def insight_chart(alert, name: str):
     else:
         panels = [(MAXOUT_TITLE, mo, 'full', None), (SPLIT_TITLE, sf, 'sf', None), (GOR_TITLE, gor, 'gor', None)]
     bottleneck = check == BOTTLENECK
+    rows = 2 if bottleneck else 1
+    legends = 2 if bottleneck else 1
+    height = TITLE_H + legends * LEGEND_ROW + rows * (PANEL_TITLE_H + PANEL_H + AXIS_H)
+    figure = new_figure((CHART_WIDTH, height), dpi=110)
+    columns = 2 if bottleneck else len(panels)
+    grid = figure.add_gridspec(rows, columns, left=0.08, right=0.985, bottom=AXIS_H / height,
+                               top=1 - (TITLE_H + legends * LEGEND_ROW + PANEL_TITLE_H) / height,
+                               hspace=(AXIS_H + PANEL_TITLE_H) / PANEL_H, wspace=0.3)
+    axes = [figure.add_subplot(grid[k // columns, k % columns]) for k in range(rows * columns)]
     if bottleneck:
-        figure = new_figure((CHART_WIDTH, 2 * PANEL_HEIGHT + 0.4), dpi=110)
-        grid = figure.subplots(2, 2)
-        axes = list(grid.flat)
         _scatter(axes[0], data.get('points') or [])
         chart_axes = axes[1:]
     else:
-        figure = new_figure((CHART_WIDTH, PANEL_HEIGHT + 0.5), dpi=110)
-        chart_axes = list(figure.subplots(1, len(panels)))
+        chart_axes = axes
     values = [v for _, block, sc, dashed in panels if sc == 'sf' for b in (block, dashed or {}) for s in b.values() for v in s
               if v is not None]
-    sf_top = max([10.0] + [max(values) * 1.15] if values else [10.0])
+    sf_top = max([10.0] + ([max(values) * 1.15] if values else []))
     for ax, (title, block, scale, dashed) in zip(chart_axes, panels):
         _panel(ax, title, block, me, scale, dashed)
         ax.set_ylim(0, sf_top if scale == 'sf' else 103)
     if data.get('missing'):
-        chart_axes[-1].set_xlabel(f"Hour of day   (not measured: ph {', '.join(map(str, data['missing']))})", fontsize=7.5, color=MUTED)
-    handles = [Line2D([0], [0], color=PHASE_COLOURS.get(p, '#999999'), lw=1.5 if me is None else (3.0 if p == me else 1.1),
+        chart_axes[-1].set_xlabel(f"Not measured: Ph {', '.join(map(str, data['missing']))}", fontsize=9, color=MUTED)
+
+    # the title and the alert's own words, as the detector charts have them
+    figure.text(0.01, 1 - 0.08 / height, name + ('' if me is None else f"  ·  Ph{me}"), fontsize=11, fontweight='bold', va='top')
+    day = pd.Timestamp(alert['Date'])
+    figure.text(0.01, 1 - 0.34 / height, f"{alert['Detail']}  Weekdays to {day:%a} {day.month}/{day.day}.", fontsize=9.5,
+                color='#333333', va='top')
+    blank = Line2D([], [], alpha=0)
+    handles = [Line2D([0], [0], color=PHASE_COLOURS.get(p, '#999999'), lw=1.6 if me is None else (3.0 if p == me else 1.2),
                       alpha=1.0 if me is None or p == me else 0.8) for p in phases]
     labels = [f'Ph {p}' for p in phases]
     if check == PREMATURE:
-        handles += [Line2D([0], [0], color=INK, lw=1.3), Line2D([0], [0], color=INK, lw=1.3, ls='--')]
-        labels += ['All split failures', 'At a gap-out']
+        handles += [blank, Line2D([0], [0], color=INK, lw=1.4), Line2D([0], [0], color=INK, lw=1.4, ls='--')]
+        labels += ['(', 'All Split Fail', 'Split Fail with Gap Out)']
     else:
-        handles.append(Patch(color=BAND, alpha=0.25, lw=0))
-        labels.append(f'Ideal occupancy {IDEAL_OCCUPANCY[0]}-{IDEAL_OCCUPANCY[1]}%')
-    day = pd.Timestamp(alert['Date'])
-    who = f"{signal_number(name)}" + ('' if me is None else f" Ph{me}")
-    figure.suptitle(f"{who}, weekdays to {day:%a} {day.month}/{day.day}", fontsize=9.5, x=0.01, ha='left', y=0.995)
-    figure.tight_layout(rect=(0, 0, 1, 0.86 if not bottleneck else 0.92))
-    figure.legend(handles, labels, loc='upper left', bbox_to_anchor=(0.01, 0.93 if not bottleneck else 0.965),
-                  ncol=len(labels), fontsize=7, frameon=False, handlelength=1.8, columnspacing=1.0)
+        handles.append(Patch(color=BAND, alpha=0.3, lw=0))
+        labels.append(f'Ideal Occupancy {IDEAL_OCCUPANCY[0]}-{IDEAL_OCCUPANCY[1]}%')
+    row_y = 1 - TITLE_H / height
+    figure.legend(handles, labels, loc='upper left', bbox_to_anchor=(0.01, row_y), ncol=len(labels), fontsize=9,
+                  frameon=False, handlelength=1.8, columnspacing=0.9, handletextpad=0.4)
+    if bottleneck:
+        dot = lambda colour: Line2D([0], [0], ls='', marker='o', ms=5, color=colour)
+        figure.legend([Line2D([0], [0], color=BLUE, lw=2.2), dot('#9a9a9a'), dot(RED)],
+                      ['Average at each occupancy', '15 minutes', '15 minutes backed up'], loc='upper left',
+                      bbox_to_anchor=(0.01, row_y - LEGEND_ROW / height), ncol=3, fontsize=9, frameon=False,
+                      handlelength=1.8, columnspacing=1.2, handletextpad=0.4)
+    figure.report_own_proportions = True     # drawn page-wide at its own height
     return figure
 
 
@@ -638,4 +667,6 @@ def create_insight_plots(alerts: Optional[pd.DataFrame], signals: Optional[pd.Da
 
 
 def chart_height_inches(check: str) -> float:
-    return (2 * PANEL_HEIGHT + 0.4 if check == BOTTLENECK else PANEL_HEIGHT + 0.5) * 6.5 / CHART_WIDTH
+    """The chart's height on the page, drawn 6.5 inches wide."""
+    rows = 2 if check == BOTTLENECK else 1
+    return (TITLE_H + rows * LEGEND_ROW + rows * (PANEL_TITLE_H + PANEL_H + AXIS_H)) * 6.5 / CHART_WIDTH

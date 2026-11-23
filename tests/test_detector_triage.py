@@ -280,7 +280,7 @@ def test_table_lists_service_lost_then_harm_then_the_rest():
     rows, total = prepare_atspm_detector_health_table(ranked, SIGNALS, ('bad',))
     assert rows['Signal'].tolist() == ['Bravo', 'Charlie', 'Alpha'] and total == 3
     assert rows.columns.tolist() == ['Signal', 'Det', 'Impact', 'What Is Wrong']
-    assert rows['Impact'].iloc[0] == '<b>Service lost.</b> Ph2 got 1 green against 14 normal over 5 h'
+    assert rows['Impact'].iloc[0] == "<font color='#c4302b'><b>Phase stopped serving.</b></font> Ph2 got 1 green against 14 normal over 5 h"
     assert 'Ph4 20 to 73 s' in rows['Impact'].iloc[1]
     assert rows['Impact'].iloc[2] == '<b>Data only.</b> No effect on other phases over 5 h'
 

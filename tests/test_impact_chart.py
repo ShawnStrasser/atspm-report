@@ -120,22 +120,22 @@ def test_measures_given_with_their_checks_off_leave_the_report_as_it_was():
     assert sorted(before['reports']) == sorted(after['reports'])
     for alert_type, frame in before['alerts'].items():
         pd.testing.assert_frame_equal(frame.reset_index(drop=True), after['alerts'][alert_type].reset_index(drop=True))
-    for alert_type in ('delay_rise', 'split_failure_trend', 'platoon_ratio_trend', 'phase_timing'):
+    for alert_type in ('delay_rise', 'split_failure_trend', 'platoon_ratio_trend', 'timing_insights'):
         assert after['alerts'][alert_type].empty and after['updated_past_alerts'][alert_type].empty
 
 
 def test_checks_switched_on_without_their_tables_do_nothing():
     inputs = _inputs()
     config = {'figures_per_device': 1, 'verbosity': 0, 'delay_rise_check_enabled': True, 'split_failure_trend_enabled': True,
-              'platoon_ratio_trend_enabled': True, 'split_failures_no_maxout_check_enabled': True,
+              'platoon_ratio_trend_enabled': True, 'timing_insights_enabled': True,
               }
     result = ReportGenerator(config).generate(**inputs)
-    assert all(result['alerts'][t].empty for t in ('delay_rise', 'split_failure_trend', 'platoon_ratio_trend', 'phase_timing'))
+    assert all(result['alerts'][t].empty for t in ('delay_rise', 'split_failure_trend', 'platoon_ratio_trend', 'timing_insights'))
 
 
 def test_signal_focus_does_not_read_the_new_alert_types():
     from atspm_report.signal_focus import collect_problems
     row = pd.DataFrame({'DeviceId': ['A'], 'Date': [pd.Timestamp('2026-11-13')], 'Phase': [4], 'Text': ['x']})
     told, _ = collect_problems({'delay_rise': row, 'split_failure_trend': row, 'platoon_ratio_trend': row,
-                                'phase_timing': row.assign(Check='Split failures without max outs')})
+                                'timing_insights': row.assign(Check='Premature Gap-Out')})
     assert told.empty

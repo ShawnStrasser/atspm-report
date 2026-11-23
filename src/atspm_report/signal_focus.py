@@ -51,6 +51,8 @@ SECTION_EXPLANATION = 'Signals with problems in more than one area'
 DETECTORS, PED_CATEGORY, SKIPS, MAX_OUTS, CONFLICTS, CLEARANCE, PREEMPT, ALARMS, MISSING = (
     'Detectors', 'Ped', 'Phase skips', 'Max outs', 'Conflicts', 'Clearance', 'Preempt', 'Alarms', 'Missing data')
 HARM_ROW, OTHER_DETECTORS_ROW, INFORMATION_ROW = 'Detector problems with worse operations during the fault', 'Other detector problems', 'For information'
+# A detector fault that left its phase's green unserved: the first row, in red (user, 2026-11-23). Ped walks lost are not this.
+SERVICE_ROW = 'PHASE STOPPED SERVING'
 HARM_TIERS = (SERVICE_LOST, OTHER_PHASES)
 
 # Severity of an area, and the variants within one.
@@ -83,7 +85,7 @@ PHASE_CATEGORIES = frozenset({MAX_OUTS, SKIPS})
 # What an area's score is worth by how many days before the most recent day of data its latest new problem was; older still counts the last.
 RECENCY_WEIGHTS = (1.0, 0.5, 0.25)
 # The table's rows, and so the charts' order, with Missing data always last.
-ROW_ORDER = [HARM_ROW, MAX_OUTS, SKIPS, CONFLICTS, CLEARANCE, PREEMPT, ALARMS, PED_CATEGORY, OTHER_DETECTORS_ROW, INFORMATION_ROW, MISSING]
+ROW_ORDER = [SERVICE_ROW, HARM_ROW, MAX_OUTS, SKIPS, CONFLICTS, CLEARANCE, PREEMPT, ALARMS, PED_CATEGORY, OTHER_DETECTORS_ROW, INFORMATION_ROW, MISSING]
 PREEMPT_CHANGES = ('Increase', 'Decrease')
 FLASH_ALARMS = ('MMU Flash', 'Flash - MMU', 'Flash - Fault Monitor')
 LABEL_WORDS = {'stuck on (together)': 'stuck on', 'count zone held ON': 'stuck on', 'counts dropped': 'counts fall'}
@@ -102,7 +104,8 @@ CHART_DETECTOR, CHART_MAX_OUT, CHART_WAIT, CHART_GREEN, CHART_SKIPS, CHART_PREEM
 # A measured rise its chart shows, in words without the numbers the chart gives.
 RISE_WORDS = {CHART_WAIT: 'Phase wait rose on {}', CHART_MAX_OUT: 'Max-outs rose on {}'}
 
-PROBLEM_COLUMNS = ['DeviceId', 'Category', 'Points', 'Links', 'Items', 'Lines', 'Harm', 'Phases', 'New', 'LastDay', 'OnPhases']
+PROBLEM_COLUMNS = ['DeviceId', 'Category', 'Points', 'Links', 'Items', 'Lines', 'Harm', 'Phases', 'New', 'LastDay', 'OnPhases',
+                   'ServiceLost']
 FOCUS_COLUMNS = ['Rank', 'DeviceId', 'Signal', 'Region', 'Score', 'Categories', 'Items', 'Rows', 'HasOngoing', 'Charts']
 
 
@@ -156,13 +159,14 @@ def _last_day(group):
     return max(days) if days else pd.NaT
 
 
-def _problem(device, category, severity, items, lines, group, links=0.0, harm=None, phases=None, on=None):
+def _problem(device, category, severity, items, lines, group, links=0.0, harm=None, phases=None, on=None, service_lost=False):
     """on: the phases the problem is on (its detectors' and buttons' phases and the phases they hurt, the phases that max out
     or skip), so problems that share one can be told apart from problems that only happen at the same signal."""
     held = group['_held'].astype(bool) if '_held' in group else pd.Series(False, index=group.index)
     return {'DeviceId': device, 'Category': category, 'Points': float(severity), 'Links': float(links), 'Items': int(items), 'Lines': lines,
             'Harm': harm or [], 'Phases': phases or {}, 'New': bool((~held).any()), 'LastDay': _last_day(group),
-            'OnPhases': sorted({int(phase) for phase in (() if on is None else on) if pd.notna(phase) and int(phase) > 0})}
+            'OnPhases': sorted({int(phase) for phase in (() if on is None else on) if pd.notna(phase) and int(phase) > 0}),
+            'ServiceLost': bool(service_lost)}
 
 
 def _phases_of(rows, urgent=None, phases: dict = None) -> set:
@@ -378,7 +382,7 @@ def _detector_problems(faults, info=None, counts=None, runs=None, told: set = No
         hurt = {phase for text in urgent['HurtPhases'].dropna() for phase in str(text).split(',') if phase}
         points += min(max(len(hurt) - 1, 0), MAX_HURT_PHASE_POINTS)
         problems.append(_problem(device, DETECTORS, points, group['Detector'].nunique(), lines, group, harm=harm, phases=phases,
-                                 on=_phases_of(group, urgent, phases)))
+                                 on=_phases_of(group, urgent, phases), service_lost=severity == 'service lost'))
     return problems
 
 
@@ -727,11 +731,15 @@ def rank_signals(problems: pd.DataFrame, min_score: float = MIN_SCORE, related_o
         Worth=('_worth', 'sum'), Categories=('Category', 'nunique'), Items=('Items', 'sum'), Harm=('_harm', 'max'))
     table['Categories'] = table['Categories'] + table['Harm'].astype(int)
     table['Score'] = table['Worth'].round(1)
-    table = table[(table['Categories'] > 1) & (table['Score'] >= min_score)]
+    # A phase that stopped being served is in by itself, whatever else the signal has, and goes first (user, 2026-11-23).
+    lost = set(new.loc[new['ServiceLost'].astype(bool), 'DeviceId']) if 'ServiceLost' in new else set()
+    table['_lost'] = table['DeviceId'].isin(lost)
+    table = table[((table['Categories'] > 1) & (table['Score'] >= min_score)) | table['_lost']]
     if related_only and not table.empty:
         keep = {device for device, rows in scored[scored['DeviceId'].isin(table['DeviceId'])].groupby('DeviceId') if _qualifies(rows, min_score)}
-        table = table[table['DeviceId'].isin(keep)]
-    return table.sort_values(['Score', 'Categories', 'Items', 'DeviceId'], ascending=[False, False, False, True])[columns].reset_index(drop=True)
+        table = table[table['DeviceId'].isin(keep) | table['_lost']]
+    return table.sort_values(['_lost', 'Score', 'Categories', 'Items', 'DeviceId'],
+                             ascending=[False, False, False, False, True])[columns].reset_index(drop=True)
 
 
 def _signal_rows(problems: pd.DataFrame, information: list = None) -> tuple:
@@ -742,7 +750,7 @@ def _signal_rows(problems: pd.DataFrame, information: list = None) -> tuple:
         for chart, phases in problem['Phases'].items():
             charts.setdefault(chart, set()).update(phases)
         if problem['Harm']:
-            rows.setdefault(HARM_ROW, []).extend(problem['Harm'])
+            rows.setdefault(SERVICE_ROW if problem.get('ServiceLost') else HARM_ROW, []).extend(problem['Harm'])
         if problem['Lines']:
             row = OTHER_DETECTORS_ROW if problem['Category'] == DETECTORS else problem['Category']
             rows.setdefault(row, []).extend(problem['Lines'])

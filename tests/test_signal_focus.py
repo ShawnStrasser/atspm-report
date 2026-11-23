@@ -7,7 +7,7 @@ from atspm_report import ReportGenerator
 from atspm_report.atspm_detector_health import listed_alerts
 from atspm_report.detector_triage import DATA_ONLY, OTHER_PHASES, SERVICE_LOST
 from atspm_report.signal_focus import (
-    HARM_ROW, MISSING, ROW_ORDER, SECTION_EXPLANATION, build_signal_focus, clearance_severity, collect_problems, hidden_signals, rank_signals,
+    HARM_ROW, MISSING, ROW_ORDER, SECTION_EXPLANATION, SERVICE_ROW, _signal_rows, build_signal_focus, clearance_severity, collect_problems, hidden_signals, rank_signals,
 )
 from atspm_report.data_processing import detect_feed_stop, mark_open_periods, process_missing_data, trim_findings_to_stop
 from atspm_report.generator import _usual_by_hour
@@ -92,6 +92,15 @@ def test_a_fault_measured_to_affect_operations_is_two_areas():
     # Harm to three or more phases brings a signal here with nothing else; one phase's lost service does not.
     listed = rank_signals(problems)
     assert listed['DeviceId'].tolist() == ['D', 'A'] and listed['Categories'].tolist() == [3, 2]
+
+
+def test_a_phase_that_stopped_serving_is_in_by_itself_and_first():
+    problems, _ = problems_of(atspm_detector_health=[
+        health('A', 5, tier=OTHER_PHASES, hurt='1,3,4,8'), health('E', 15, tier=SERVICE_LOST)])
+    listed = rank_signals(problems)
+    assert listed['DeviceId'].tolist() == ['E', 'A']
+    rows, _ = _signal_rows(problems[problems['DeviceId'] == 'E'])
+    assert rows[0]['type'] == SERVICE_ROW
 
 
 def test_faults_judged_as_one_event_tell_its_effect_once():
