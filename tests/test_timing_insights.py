@@ -210,6 +210,34 @@ def test_listed_alerts_keep_the_worst_rows_per_check():
     assert sorted(ti.listed_alerts(alerts, SIGNALS, 2)['Phase']) == [2, 4]
 
 
+def test_suppression_files_only_listed_rows_and_moves_repeats_to_ongoing():
+    from atspm_report import ReportGenerator
+
+    def failing(day, phase, hour):
+        b = light(day, phase, hour)
+        b['sf'] = {2: 1, 4: 2, 6: 3}.get(phase, 0)     # phase 6 worst, then 4, then 2
+        return b
+    inputs = tables(failing)
+    inputs.pop('actuations')
+    stamps = inputs['split_failures']['TimeStamp'].drop_duplicates()
+    inputs['has_data'] = pd.DataFrame({'TimeStamp': stamps, 'DeviceId': DEVICE})
+    start = REPORT_DAY + pd.Timedelta(hours=12)      # the timeline's latest day is the report day
+    inputs['timeline'] = pd.DataFrame({'DeviceId': [DEVICE], 'StartTime': [start], 'EndTime': [start + pd.Timedelta(seconds=5)],
+                                       'Duration': [5.0], 'IsValid': [True], 'EventClass': ['Pattern Change'],
+                                       'EventValue': [1.0]})
+    config = {'verbosity': 0, ti.CONFIG_SWITCH: True, ti.ROWS_CONFIG: 1, 'include_ongoing_issues': True,
+              'signal_focus_signals': 0}
+    first = ReportGenerator(config).generate(signals=SIGNALS, **inputs)
+    premature = lambda frame: sorted(frame.loc[frame['Check'] == ti.PREMATURE, 'Phase'].astype(int))
+    assert premature(first['alerts'][ti.ALERT_TYPE]) == [6]
+    assert premature(first['updated_past_alerts'][ti.ALERT_TYPE]) == [6]          # 4 and 2 not filed: come up later
+    second = ReportGenerator(config).generate(signals=SIGNALS, past_alerts=first['updated_past_alerts'], **inputs)
+    assert premature(second['alerts'][ti.ALERT_TYPE]) == [4]
+    assert premature(second['ongoing_alerts'][ti.ALERT_TYPE]) == [6]
+    assert premature(second['updated_past_alerts'][ti.ALERT_TYPE]) == [4, 6]
+    assert first['reports']
+
+
 def test_table_and_charts():
     alerts = pd.concat([run(recall_4), run(blocked_4)], ignore_index=True)
     rows, total = ti.prepare_insight_table(alerts, SIGNALS, 'Region 1', 5, ti.MAX_RECALL)

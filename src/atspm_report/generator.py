@@ -1235,10 +1235,15 @@ class ReportGenerator:
                     signals=signals)
             if self.config[timing_insights.CONFIG_SWITCH] and split_failures is not None and not _is_empty(terminations):
                 log_message("Checking timing insights (green use by phase)...", 1, verbosity)
+                # the measure faults with the count zones too (Downstream Bottleneck reads them)
+                insight_faults = measure_inputs.fault_spans(
+                    trim_findings_to_stop(_to_pandas(atspm_detector_findings), data_stopped_at)
+                    if atspm_detector_findings is not None else None,
+                    atspm_info, timeline, atspm_detector_minutes, zones_of=measure_inputs.WITH_COUNT_ZONES)
                 new_alerts[timing_insights.ALERT_TYPE] = timing_insights.build_insight_alerts(
                     split_failures, terminations, report_day, signals=signals, pedestrian=pedestrian,
                     coordination_agg=coordination_agg, actuations=actuations, detectors=atspm_info,
-                    faults=measure_faults, verbosity=verbosity)
+                    faults=insight_faults, verbosity=verbosity)
 
         # The overlap dual indication and signal conflict checks read the report
         # day's clean indications, which are built once for all of them. The dual
@@ -1657,6 +1662,9 @@ class ReportGenerator:
             reported_alerts = (
                 pd.concat(reported, ignore_index=True) if reported else pd.DataFrame()
             )
+            if alert_type == timing_insights.ALERT_TYPE:
+                # charts are drawn from each run's own rows, never from history: keep the history small
+                reported_alerts = reported_alerts.drop(columns=['ChartData'], errors='ignore')
             updated_past_alerts[alert_type] = self._update_alert_history(
                 reported_alerts,
                 past_alerts.get(alert_type, pd.DataFrame()),

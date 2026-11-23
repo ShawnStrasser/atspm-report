@@ -31,8 +31,10 @@ import pandas as pd
 
 from .duckdb_utils import is_relation, to_pandas
 
-STOP_BAR, ADVANCE = 'stop bar', 'advance'
+STOP_BAR, ADVANCE, COUNT = 'stop bar', 'advance', 'count'
 ZONE_OF_FUNCTION = {'Presence': STOP_BAR, 'Advance': ADVANCE}
+# Timing Insights' Downstream Bottleneck also reads the stop-bar count zones.
+WITH_COUNT_ZONES = {**ZONE_OF_FUNCTION, 'Count': COUNT}
 # The detector health labels that are faults (lane closures, timing plans and notes are not).
 FAULT_LABELS = ('stuck on', 'stuck on (together)', 'count zone held ON', 'silent', 'silent at night', 'counts dropped',
                 'misses vehicles at night', 'too-fast actuations', 'too many for the traffic', 'counts too high',
@@ -109,15 +111,17 @@ def holidays(start, end) -> list:
 
 # ---- Faults -------------------------------------------------------------------------------------------------------------
 
-def fault_spans(findings=None, detectors: Optional[pd.DataFrame] = None, timeline=None, minutes=None) -> pd.DataFrame:
+def fault_spans(findings=None, detectors: Optional[pd.DataFrame] = None, timeline=None, minutes=None,
+                zones_of: Optional[dict] = None) -> pd.DataFrame:
     """When each phase's stop-bar or advance zones had a known fault: SPAN_COLUMNS (Zone 'stop bar' or 'advance', s and
     e the fault's start and end). detectors: detector_info() rows (DeviceId, Detector, Phase, Function). Without them no
-    zone is known and nothing is masked."""
+    zone is known and nothing is masked. zones_of: Function -> Zone (default ZONE_OF_FUNCTION; WITH_COUNT_ZONES adds the
+    count zones)."""
     empty = pd.DataFrame({'DeviceId': pd.Series(dtype=str), 'Phase': pd.Series(dtype='int64'), 'Zone': pd.Series(dtype=str),
                           's': pd.Series(dtype='datetime64[us]'), 'e': pd.Series(dtype='datetime64[us]')})
     if detectors is None or len(detectors) == 0 or not {'DeviceId', 'Detector', 'Phase', 'Function'} <= set(detectors.columns):
         return empty
-    zones = detectors.assign(DeviceId=detectors['DeviceId'].astype(str), Zone=detectors['Function'].map(ZONE_OF_FUNCTION))
+    zones = detectors.assign(DeviceId=detectors['DeviceId'].astype(str), Zone=detectors['Function'].map(zones_of or ZONE_OF_FUNCTION))
     zones = zones[zones['Zone'].notna() & zones['Phase'].notna()]
     zones = zones.assign(Detector=pd.to_numeric(zones['Detector']).astype('int64'), Phase=zones['Phase'].astype('int64'))
     parts = []
