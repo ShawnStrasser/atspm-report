@@ -1914,6 +1914,12 @@ class ReportGenerator:
             if together:
                 harm_faults = other_faults = faults.iloc[0:0]
             add(detector_charts(harm_faults), FOCUS_CHART_DETECTOR, 7.5 * inch, None)
+            if FOCUS_SKIPS in types:
+                # The phase skip section's chart over the days the table counts its skips (user, 2026-11-24: 08411 said 3
+                # skips in 14 days while the overview, on the report's days only, showed one).
+                skip_rows = rows_of('phase_skips', device)
+                add(unique(self._create_phase_skip_figures(skip_rows, one, 1, days_plotted=self.config['phase_skip_retention_days'])),
+                    FOCUS_CHART_SKIPS, 6.5 * inch, None)
             if FOCUS_PREEMPT in types:
                 # The preempt section's own charts (calls a day over the call lengths), which the signal has left.
                 drawn = self._create_preempt_figures(rows_of('preempts', device), preempt_calls, preempt_history, one)

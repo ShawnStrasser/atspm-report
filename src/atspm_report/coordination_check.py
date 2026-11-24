@@ -216,6 +216,9 @@ MAP_CREDIT = 'Base map: Esri, HERE, Garmin, (c) OpenStreetMap contributors'
 MAP_TILE_SECONDS = 10
 MAP_MAX_ZOOM = 16
 MAP_PX = (840, 552)
+# The map is shown at half the page's width (report_generation, 2026-11-23), about 0.56 of its drawn size: its text is drawn
+# this much larger so it reads at the size it had full width (user, 2026-11-24: the map text is tiny).
+MAP_TEXT = 1.6
 MAP_MARGIN_MILES = 0.6
 
 
@@ -1605,13 +1608,14 @@ def _group_map(where: pd.DataFrame, number, alerted: list, parts: list, no_data=
     # labels placed least.
     figure.canvas.draw()
     crowded = len(members) > 8          # a downtown grid: a little smaller so the numbers do not run together
-    points = ([(d, outline, 9.0, 'bold') for d, _, outline in alerted if d in xy]
-              + [(d, colour_of[d], 6.6 if crowded else 7.5, 'bold') for d in members if d in xy]
-              + [(d, GREY, 6.0 if crowded else 6.5, 'normal') for d in others])
+    points = ([(d, outline, 9.0 * MAP_TEXT, 'bold') for d, _, outline in alerted if d in xy]
+              + [(d, colour_of[d], (6.6 if crowded else 7.5) * MAP_TEXT, 'bold') for d in members if d in xy]
+              + [(d, GREY, (6.0 if crowded else 6.5) * MAP_TEXT, 'normal') for d in others])
     px = {d: ax.transData.transform(xy[d]) for d, *_ in points}
     taken = [(x - 4, y - 4, x + 4, y + 4) for x, y in px.values()]
     spots = [(5, 2), (5, -8), (-5, 2), (-5, -8), (0, 6), (0, -13), (5, 10), (-5, -16), (5, -17), (-5, 10),
              (0, 14), (0, -21), (12, 14), (-12, 14), (12, -21), (-12, -21)]
+    spots = [(dx * MAP_TEXT, dy * MAP_TEXT) for dx, dy in spots]     # the spots grow with the text
     scale = 130 / 72
     for d, colour, size, weight in points:
         text = number(d)
@@ -1636,15 +1640,15 @@ def _group_map(where: pd.DataFrame, number, alerted: list, parts: list, no_data=
     bar = 0.5 if half * wide > 1.2 else 0.25
     bx, by = x0 + 0.03 * (x1 - x0), y1 - 0.05 * (y1 - y0)
     ax.plot([bx, bx + bar * miles_px], [by, by], color='#222222', lw=2, zorder=6)
-    ax.annotate(f'{bar:g} mi', (bx, by), xytext=(0, 3), textcoords='offset points', fontsize=6.5, color='#222222',
+    ax.annotate(f'{bar:g} mi', (bx, by), xytext=(0, 3), textcoords='offset points', fontsize=6.5 * MAP_TEXT, color='#222222',
                 zorder=6, path_effects=[pe.withStroke(linewidth=1.6, foreground='white')])
     if base is not None:
         ax.annotate(MAP_CREDIT, (1, 0), xycoords='axes fraction', xytext=(-2, 2), textcoords='offset points', ha='right',
-                    fontsize=4.5, color='#444444', zorder=6, path_effects=[pe.withStroke(linewidth=1.4, foreground='white')])
+                    fontsize=4.5 * MAP_TEXT, color='#444444', zorder=6, path_effects=[pe.withStroke(linewidth=1.4, foreground='white')])
     handles, labels = ax.get_legend_handles_labels()
     order = [labels.index(x) for x in [label for label, _, _ in parts] + ['Other signals', 'No data'] if x in labels]
     figure.legend([handles[i] for i in order], [labels[i] for i in order], loc='upper left', bbox_to_anchor=(0.0, 1.0),
-                  ncol=6, frameon=False, fontsize=8, handletextpad=0.1, columnspacing=1.0, borderaxespad=0.2)
+                  ncol=6, frameon=False, fontsize=8 * MAP_TEXT, handletextpad=0.1, columnspacing=1.0, borderaxespad=0.2)
     figure.report_own_proportions = True
     return figure
 

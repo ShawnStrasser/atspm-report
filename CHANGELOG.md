@@ -13,6 +13,8 @@
 - **A detector's normal leaves out odd days.** The detector triage's normal greens and walks leave out earlier days far off the others in those clock hours (over 3 times their median, or under a third, beyond a green an hour): a detector's own earlier false calls no longer make a silent spell look like lost service. A ped button that cost its walks reads "Walks stopped serving".
 - **Coordination groups are smaller**: the map at half width beside the first chart, every day chart the same half-width size; a clock chart keeps a full row.
 - **Timing Insights order**: Downstream Bottleneck, then Max Capacity, last.
+- **Signal Focus shows skips over their days**: a signal with phase skips gets the Phase Skip section's chart over the retention window the table counts (its overview covers only the report's days). The overview's silent detector rows read "No counts" (was "Sending nothing").
+- **Coordination maps' text** is drawn 1.6 times larger, as the map now shows at half width.
 - **Headings stay with what follows them**: a heading goes to the next page unless the first rows of its table, or the chart or map that comes first, fit under it.
 
 ### Removed
