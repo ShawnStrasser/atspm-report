@@ -210,7 +210,7 @@ def test_listed_alerts_keep_the_worst_rows_per_check():
     assert sorted(ti.listed_alerts(alerts, SIGNALS, 2)['Phase']) == [2, 4]
 
 
-def test_suppression_files_only_listed_rows_and_moves_repeats_to_ongoing():
+def test_suppression_files_only_listed_rows_and_never_shows_repeats_as_ongoing():
     from atspm_report import ReportGenerator
 
     def failing(day, phase, hour):
@@ -233,7 +233,7 @@ def test_suppression_files_only_listed_rows_and_moves_repeats_to_ongoing():
     assert premature(first['updated_past_alerts'][ti.ALERT_TYPE]) == [6]          # 4 and 2 not filed: come up later
     second = ReportGenerator(config).generate(signals=SIGNALS, past_alerts=first['updated_past_alerts'], **inputs)
     assert premature(second['alerts'][ti.ALERT_TYPE]) == [4]
-    assert premature(second['ongoing_alerts'][ti.ALERT_TYPE]) == [6]
+    assert second['ongoing_alerts'][ti.ALERT_TYPE].empty             # Timing Insights are never Ongoing Issues
     assert premature(second['updated_past_alerts'][ti.ALERT_TYPE]) == [4, 6]
     assert first['reports']
 

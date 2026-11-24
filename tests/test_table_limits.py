@@ -307,3 +307,15 @@ def test_a_rotated_table_stays_within_its_row_limit_keeping_each_signal_whole():
     assert len(shown) <= 5 and (shown['DeviceId'] == 'A').sum() == 4                    # A whole, then one more signal
     cut, _ = _run(ongoing, ROTATION_SIGNALS, None, 2, start + pd.Timedelta(weeks=1))
     assert set(cut['clearance_intervals']['DeviceId']) == {'A'}                              # the first always fits
+
+
+def test_listed_by_table_files_only_what_a_table_listed():
+    from atspm_report.table_limits import listed_by_table
+    signals = pd.DataFrame({'DeviceId': ['a', 'b', 'c'], 'Name': ['A', 'B', 'C'], 'Region': ['R1', 'R1', 'R2']})
+    alerts = pd.DataFrame({'DeviceId': ['a', 'b', 'c'], 'Score': [3, 1, 2]})
+
+    def table(frame, scope, report):     # each table shows its one worst signal
+        rows = frame[frame['DeviceId'].isin(scope['DeviceId'])].sort_values('Score', ascending=False).head(1)
+        return pd.DataFrame({'Signal': rows['DeviceId'].map(dict(zip(signals['DeviceId'], signals['Name'])))}), len(rows)
+    assert sorted(listed_by_table(alerts, signals, table)['DeviceId']) == ['a', 'c']       # b: never in a table
+    assert sorted(listed_by_table(alerts, signals, table, hidden={'R1': {'a'}})['DeviceId']) == ['a', 'b', 'c']

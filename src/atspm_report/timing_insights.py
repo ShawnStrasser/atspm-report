@@ -77,7 +77,8 @@ MAX_RECALL = 'Max Recall despite Detection'
 NEEDS_GREEN = 'Needs More Green'
 CAPACITY = 'Max Capacity'
 BOTTLENECK = 'Downstream Bottleneck'
-CHECKS = (PREMATURE, MAXOUT_LOW, MAX_RECALL, NEEDS_GREEN, CAPACITY, BOTTLENECK)
+# Report order, the first kept when a report is long (user, 2026-11-23: Downstream Bottleneck, then Max Capacity, last).
+CHECKS = (PREMATURE, MAXOUT_LOW, MAX_RECALL, NEEDS_GREEN, BOTTLENECK, CAPACITY)
 
 # The user's own words for each table (2026-11-23).
 NOTES = {

@@ -51,6 +51,10 @@ from .duckdb_utils import TableLike, to_pandas
 MIN_CONFIDENCE = 0.5    # the health check's own suspect limit
 MIN_BIN_MINUTES = 5.0   # a 15-minute bin counts as at fault with this many minutes of it at fault
 MIN_NORMAL_DAYS = 3
+# A normal day whose greens (per bin, those clock hours) are over OUTLIER_FACTOR x the other days' median, or under it divided by
+# that, beyond a slack of a green an hour, is left out: 04103 Ph5 (2026-11-23) had a normal of 68 greens over 9 night hours from
+# weekends its own detector made false calls on (97 and 38 greens against a usual 2 to 15).
+OUTLIER_FACTOR, OUTLIER_SLACK_PER_BIN = 3.0, 0.25
 MIN_NORMAL_COVER = 0.8  # a normal day holds at least this share of the fault's clock bins
 COFAULT_SHARE = 0.25    # another phase with its own fault in this share of the row's bins is left out: its change may be its own
 # Tier A, vehicle: only a phase that almost disappears can be told from chance.
@@ -116,6 +120,7 @@ SILENT_MIN_DAY_BINS = 80
 SERVICE_LOST, OTHER_PHASES, DATA_ONLY, NOT_MEASURED = 'Service lost', 'Harm to other phases', 'Data only', 'Not measured'
 # How the report says it: a phase that stopped being served is the most urgent problem it tells (user, 2026-11-23).
 SERVICE_LOST_WORDS = 'Phase stopped serving'
+PED_SERVICE_LOST_WORDS = 'Walks stopped serving'
 URGENT_COLOUR = '#c4302b'
 TIER_ORDER = {SERVICE_LOST: 1, OTHER_PHASES: 2, DATA_ONLY: 3, NOT_MEASURED: 3}
 
@@ -304,7 +309,12 @@ def _compare(con, wait_start) -> None:
        GROUP BY ALL""")
     con.execute(f"""CREATE TEMP TABLE norm AS
        WITH fd AS (SELECT rid, fday, Phase, nb FROM per_day WHERE dy = fday),
-       o AS (SELECT o.* FROM per_day o JOIN fd f USING (rid, fday, Phase) WHERE o.dy <> o.fday AND o.nb >= {MIN_NORMAL_COVER} * f.nb)
+       o0 AS (SELECT o.* FROM per_day o JOIN fd f USING (rid, fday, Phase) WHERE o.dy <> o.fday AND o.nb >= {MIN_NORMAL_COVER} * f.nb),
+       -- a day far off the others in the phase's own greens (the detector's own earlier faults, false calls) is no normal
+       m AS (SELECT rid, fday, Phase, median(services * 1.0 / nb) AS m1 FROM o0 GROUP BY ALL),
+       o AS (SELECT o0.* FROM o0 JOIN m USING (rid, fday, Phase)
+             WHERE services * 1.0 / nb <= {OUTLIER_FACTOR} * m.m1 + {OUTLIER_SLACK_PER_BIN}
+               AND services * 1.0 / nb >= m.m1 / {OUTLIER_FACTOR} - {OUTLIER_SLACK_PER_BIN})
        SELECT rid, fday, Phase, count(*) AS ndays,
               median(services * 1.0 / nb) AS s_n, quantile_cont(services * 1.0 / nb, 0.1) AS s_q10,
               median(100.0 * maxouts / nullif(services, 0)) AS pct_n,
@@ -897,8 +907,9 @@ def impact_label(row) -> str:
         return 'Not measured'
     if tier == NOT_MEASURED:
         return text
-    if tier == SERVICE_LOST:   # the most urgent: the phase is not being served
-        return f"<font color='{URGENT_COLOUR}'><b>{SERVICE_LOST_WORDS}.</b></font> {text}"
+    if tier == SERVICE_LOST:   # the most urgent: the phase is not being served (its walks, for a ped button)
+        words = PED_SERVICE_LOST_WORDS if row.get('DetectorType') == PED else SERVICE_LOST_WORDS
+        return f"<font color='{URGENT_COLOUR}'><b>{words}.</b></font> {text}"
     return f"<b>{tier}.</b> {text}"
 
 

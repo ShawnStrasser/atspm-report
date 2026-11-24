@@ -220,3 +220,23 @@ def listed_phase_skips(alerts: pd.DataFrame, phase_skip_rows: pd.DataFrame, sign
         in_report = scope if report == 'All Regions' else scope[scope['Region'] == report]
         keep.update(in_report.loc[in_report['Name'].isin(rows['Signal']), 'DeviceId'])
     return alerts[alerts['DeviceId'].astype(str).isin(keep)]
+
+
+def listed_by_table(alerts: pd.DataFrame, signals: pd.DataFrame, table, hidden: Optional[dict] = None) -> pd.DataFrame:
+    """The new alerts some report's table lists, by its own table function: table(alerts, report signals, report) ->
+    (rows with a Signal column, total), run for All Regions and each region over that report's signals (Signal Focus
+    signals left out: that section tells them, so their alerts are kept). Only these are filed in the history, so an
+    alert no table had room for comes up on a later run instead of being held back unseen."""
+    if alerts is None or alerts.empty or signals is None or signals.empty:
+        return alerts
+    hidden = hidden or {}
+    info = signals.assign(DeviceId=signals['DeviceId'].astype(str)).drop_duplicates('DeviceId')
+    keep = set().union(*hidden.values()) if hidden else set()
+    for report in ['All Regions'] + sorted(info['Region'].dropna().unique().tolist()):
+        scope = info if report == 'All Regions' else info[info['Region'] == report]
+        scope = scope[~scope['DeviceId'].isin(hidden.get(report, ()))]
+        rows, _ = table(alerts, scope, report)
+        if rows is None or rows.empty or 'Signal' not in rows.columns:
+            continue
+        keep.update(scope.loc[scope['Name'].isin(rows['Signal']), 'DeviceId'])
+    return alerts[alerts['DeviceId'].astype(str).isin(keep)]

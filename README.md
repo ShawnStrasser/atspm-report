@@ -298,6 +298,7 @@ Pass a plain dict; every key has a default.
 | `coordination_figures` | `5` | Coordination groups shown per report in a run (new and ongoing each), each with its map and charts; the rest come up on later runs and are not held back until then |
 | `delay_rise_check_enabled` | `False` | Sudden rise in delay per vehicle |
 | `split_failure_trend_enabled` / `platoon_ratio_trend_enabled` | `False` | Rising split failures, falling platoon ratio |
+| `ongoing_figures` / `ongoing_preempt_figures` / `ongoing_coordination_figures` | `None` | Charts per Ongoing Issues table, Ongoing preempt charts per section, Ongoing coordination groups (0: none; `None`: `figures_per_device`, `ongoing_figures`, `coordination_figures`) |
 | `timing_insights_enabled` / `timing_insights_rows` | `False` / `3` | The Timing Insights section and its rows (each with a chart) per table and report |
 | `preempt_rail_numbers` | `None` | Preempt inputs that are rail (the Rail section, longer stuck-on limit); `None` holds every preempt to the rail limit |
 | `custom_logo_path` | `None` | Logo for the PDF header |

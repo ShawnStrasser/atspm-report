@@ -190,29 +190,41 @@ def _chart_flowables(figures: list, height: float = 2.8*inch, width: float = 6.5
 
 
 def _coordination_group_flowables(groups: list, styles) -> list:
-    """Coordination groups (coordination_check.CoordinationGroup), each its signals' names, its map and its charts two
-    to a row; no table (user, 2026-11-17)."""
-    elements = []
+    """Coordination groups (coordination_check.CoordinationGroup), each its signals' names, then its map and its charts two to
+    a row at half width, the map first (user, 2026-11-23: a smaller map, every chart the same size); a wide chart (the clock
+    alert's) takes a row of its own. No table (user, 2026-11-17)."""
     half = 3.6*inch
+    base = [('VALIGN', (0, 0), (-1, -1), 'TOP'), ('LEFTPADDING', (0, 0), (-1, -1), 0),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 0), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]
+
+    def grid(rows):
+        table = Table(rows, colWidths=[half, half])
+        wide = [k for k, cells in enumerate(rows) if cells[1] == '' and cells[0].width > half]
+        table.setStyle(TableStyle(base + [('SPAN', (0, k), (1, k)) for k in wide]))
+        return table
+
+    elements = []
     for group in groups:
         head = [Paragraph(f'<b>{escape(str(group.title))}</b>', styles['Normal']), Spacer(1, 0.06*inch)]
-        if group.map is not None:
-            head.append(MatplotlibFigure(group.map, width=6.5*inch, height=None))
-            head.append(Spacer(1, 0.08*inch))
-        cells = [MatplotlibFigure(chart, width=half, height=None) for chart in group.charts]
-        if len(cells) == 1:         # one chart (a clock alert, or one day): full width under the map
-            grid = [[MatplotlibFigure(group.charts[0], width=6.5*inch, height=None)]]
-            table = Table(grid, colWidths=[2 * half])
-        else:
-            grid = [cells[k:k + 2] + [''] * (2 - len(cells[k:k + 2])) for k in range(0, len(cells), 2)]
-            table = Table(grid, colWidths=[half, half]) if grid else None
-        if table is not None:
-            table.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP'), ('LEFTPADDING', (0, 0), (-1, -1), 0),
-                                       ('RIGHTPADDING', (0, 0), (-1, -1), 0), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
-        elements.append(KeepTogether(head + ([table] if table is not None else [])) if len(grid) <= 1
-                        else KeepTogether(head))
-        if table is not None and len(grid) > 1:
-            elements.append(table)
+        rows, row = [], []
+        for figure in ([group.map] if group.map is not None else []) + list(group.charts):
+            width, height = figure.get_size_inches()
+            if width / height > 2.0:          # a wide chart: a row of its own, page-wide
+                if row:
+                    rows.append(row + [''])
+                    row = []
+                rows.append([MatplotlibFigure(figure, width=2 * half, height=None), ''])
+                continue
+            row.append(MatplotlibFigure(figure, width=half, height=None))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row + [''])
+        # the names and the first row together; the rest may go on
+        elements.append(KeepTogether(head + ([grid(rows[:1])] if rows else [])))
+        if len(rows) > 1:
+            elements.append(grid(rows[1:]))
         elements.append(Spacer(1, 0.25*inch))
     return elements
 

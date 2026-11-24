@@ -38,7 +38,10 @@ from .focus_overview import (
     signal_phases,
 )
 from .report_generation import generate_pdf_report
-from .table_generation import ONGOING_SINCE_COLUMN
+from .table_generation import (
+    ONGOING_SINCE_COLUMN, prepare_clearance_interval_alerts_table, prepare_missing_data_alerts_table, prepare_phase_termination_alerts_table,
+    prepare_preempt_alerts_table,
+)
 from .phase_skip_processing import process_phase_wait_data
 from .clearance_processing import process_clearance_intervals
 from .alarm_processing import (
@@ -512,6 +515,8 @@ class ReportGenerator:
             - figures_per_device (int): Plots per device in report. Default: 3
             - ongoing_figures (int): Charts per Ongoing Issues table and report, for its first rows. Default: None
               (figures_per_device)
+            - ongoing_preempt_figures / ongoing_coordination_figures (int): The Ongoing preempt charts per section and the
+              Ongoing coordination groups per report (0: none). Default: None (ongoing_figures; coordination_figures)
             - verbosity (int): 0=silent, 1=info, 2=debug. Default: 1
             - phase_skip_alert_threshold (int): Min skips to trigger alert. Default: 1
             - phase_skip_retention_days (int): Days to retain phase skip data. Default: 14
@@ -603,8 +608,11 @@ class ReportGenerator:
             **MAXOUT_DRAIN_DEFAULTS,
             'alert_retention_weeks': 104,
             'figures_per_device': 3,
-            # Charts per Ongoing Issues table and report; None: figures_per_device.
+            # Charts per Ongoing Issues table and report; None: figures_per_device. Preempt charts and coordination groups of
+            # the Ongoing Issues have their own (None: ongoing_figures, coordination_figures; 0: none).
             'ongoing_figures': None,
+            'ongoing_preempt_figures': None,
+            'ongoing_coordination_figures': None,
             'verbosity': 1,
             'phase_skip_alert_threshold': 1,
             'phase_skip_retention_days': 14,
@@ -1373,6 +1381,8 @@ class ReportGenerator:
             final_alerts[COORDINATION] = listed_alerts(final_alerts[COORDINATION], signals,
                                                        self.config['coordination_figures'])
 
+        # Timing Insights are never Ongoing Issues (user, 2026-11-23): a repeat is held back and filed, not shown again.
+        ongoing_alerts[timing_insights.ALERT_TYPE] = pd.DataFrame()
         # Timing Insights: each table lists a few rows per report; the ones left over are not filed as told and come up later.
         insight_waiting = final_alerts.get(timing_insights.ALERT_TYPE)    # every new one, for the tables' totals
         final_alerts[timing_insights.ALERT_TYPE] = timing_insights.listed_alerts(
@@ -1450,17 +1460,19 @@ class ReportGenerator:
         )
         ongoing_preempt_figures = self._create_preempt_figures(
             ongoing_alerts['preempts'], updated_preempt_calls, updated_preempt_history, signals, exclude=focus_hidden,
-            num_figures=min(self.config['preempt_figures'], ongoing_charts),
+            num_figures=min(self.config['preempt_figures'], ongoing_charts if self.config['ongoing_preempt_figures'] is None
+                            else self.config['ongoing_preempt_figures']),
         )
         # Coordination: each listed group's map and charts (coordination_check.create_coordination_plots), no table.
         coordination_figures = create_coordination_plots(final_alerts.get(COORDINATION), signals,
                                                          self.config['coordination_figures'])
-        ongoing_coordination_figures = create_coordination_plots(ongoing_alerts.get(COORDINATION), signals,
-                                                                 self.config['coordination_figures'])
+        ongoing_groups = (self.config['coordination_figures'] if self.config['ongoing_coordination_figures'] is None
+                          else self.config['ongoing_coordination_figures'])
+        ongoing_coordination_figures = (create_coordination_plots(ongoing_alerts.get(COORDINATION), signals, ongoing_groups)
+                                        if ongoing_groups > 0 else [])
         insight_rows = self.config[timing_insights.ROWS_CONFIG]
         insight_figures = timing_insights.create_insight_plots(final_alerts.get(timing_insights.ALERT_TYPE), signals, insight_rows)
-        ongoing_insight_figures = timing_insights.create_insight_plots(ongoing_alerts.get(timing_insights.ALERT_TYPE), signals,
-                                                                       min(ongoing_charts, self._ongoing_limits().get(timing_insights.ALERT_TYPE) or insight_rows))
+        ongoing_insight_figures = []
 
         # Detector health (atspm-detector): one chart per signal phase for the faults, the lane
         # closures and the timing plans, from the 15-minute actuations in
@@ -1628,6 +1640,23 @@ class ReportGenerator:
 
         # Update and save past alerts with retention
         log_message("Updating past alerts history...", 1, verbosity)
+        # The tables that stop at max_table_rows: only what one of them listed is filed (table_limits.listed_by_table).
+        rows_limit = self.config['max_table_rows']
+
+        def preempt_table(alerts, scope, report):
+            classes = alerts['Class'].fillna(SECTION_EV) if 'Class' in alerts.columns else pd.Series(SECTION_EV, index=alerts.index)
+            parts = [prepare_preempt_alerts_table(alerts[classes == section], scope, region=report, max_rows=rows_limit)[0]
+                     for section in classes.unique()]
+            parts = [part for part in parts if part is not None and not part.empty]
+            return (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()), 0
+        listing_tables = {
+            'clearance_intervals': lambda alerts, scope, report: prepare_clearance_interval_alerts_table(
+                alerts, scope, region=report, max_rows=rows_limit),
+            'maxout': lambda alerts, scope, report: prepare_phase_termination_alerts_table(alerts, scope, max_rows=rows_limit),
+            'missing_data': lambda alerts, scope, report: prepare_missing_data_alerts_table(
+                alerts, scope, max_rows=rows_limit, hourly=missing_hourly),
+            'preempts': preempt_table,
+        }
         updated_past_alerts = {}
         for alert_type in ALERT_CONFIG:
             # Record exactly what the report accounted for: the new alerts plus the
@@ -1643,6 +1672,8 @@ class ReportGenerator:
                                                    data_only_signals=self.config['data_only_table_signals'])
             if alert_type == 'phase_skips':
                 new_reported = listed_phase_skips    # the same: only the signals the tables had room for
+            if alert_type in listing_tables and new_reported is not None and not new_reported.empty:
+                new_reported = table_limits.listed_by_table(new_reported, signals, listing_tables[alert_type], hidden=focus_hidden)
             reported = [
                 frame for frame in (
                     new_reported,
@@ -1726,7 +1757,6 @@ class ReportGenerator:
         limits[ATSPM_DETECTOR_HEALTH] = lowest(ongoing, faults)
         limits[(ATSPM_DETECTOR_HEALTH, table_limits.DATA_ONLY_TABLE)] = lowest(ongoing, faults, self.config['data_only_table_signals'])
         limits[(ATSPM_DETECTOR_HEALTH, ATSPM_PED)] = lowest(ongoing, rows.get('ped_faults', default))
-        limits[timing_insights.ALERT_TYPE] = lowest(ongoing, self.config[timing_insights.ROWS_CONFIG])
         return limits
 
     def _maxout_thresholds(self) -> dict:
@@ -1939,7 +1969,7 @@ class ReportGenerator:
                 section_calls,
                 section_history,
                 signals,
-                num_figures=num_figures or self.config['preempt_figures'],
+                num_figures=self.config['preempt_figures'] if num_figures is None else num_figures,
                 rail_preempts=rail,
                 exclude=exclude,
                 **extra,
