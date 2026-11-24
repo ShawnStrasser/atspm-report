@@ -132,16 +132,27 @@ def texts(ax):
 
 def test_a_fault_with_no_time_of_its_own_is_another_fault_not_shaded_behind_the_measures():
     whole = {'DetectorType': 'Vehicle', 'Detector': 2, 'Periods': [{'what': 'no daily pattern', 'start': None, 'end': None}]}
-    rows = fault_rows(pd.DataFrame([whole, fault(9, ('counts dropped', '06:00', '09:00'))]), DAY, END)
+    rows = fault_rows(pd.DataFrame([whole, fault(9, ('counts dropped', '06:00', '09:00'))]).assign(FaultPhases=[[4], [4]]), DAY, END)
     assert rows[0]['spans'] == [(DAY, END, WHOLE)] and STATE_COLOR[WHOLE] == STATE_COLOR[OTHER]
     series = pd.Series(0.2, index=pd.date_range(DAY - pd.Timedelta(days=7), END, freq='h', inclusive='left'))
-    panels = [{'kind': MAX_OUT, 'title': 'Percent Max Out', 'series': series, 'band': normal_range(series, DAY, END)}]
+    panels = [{'kind': MAX_OUT, 'title': 'Percent Max Out', 'series': series, 'band': normal_range(series, DAY, END), 'phases': [4]}]
     figure = create_focus_overview('Alpha', (DAY, END), rows, panels)
     legend = [text.get_text() for text in figure.legends[0].get_texts()]
     assert legend == ['Normal range', 'Measured', 'Other fault']
     # Shaded behind the measures: only det 9's three hours, not the whole day.
     shaded = [patch for patch in figure.axes[1].patches if patch.get_facecolor()[:3] != (1.0, 1.0, 1.0)]
     assert len(shaded) == 1
+
+
+def test_a_fault_is_shaded_only_behind_the_measures_of_its_phases():
+    rows = fault_rows(pd.DataFrame([fault(48, ('silent', '03:00', '05:00'))]).assign(FaultPhases=[[8]]), DAY, END)
+    series = pd.Series(0.2, index=pd.date_range(DAY - pd.Timedelta(days=7), END, freq='h', inclusive='left'))
+    panel = lambda phases: {'kind': MAX_OUT, 'title': 'Max Out', 'series': series, 'band': normal_range(series, DAY, END), 'phases': phases}
+    skips = {'title': 'Skips', 'rows': [('Ph1', [DAY + pd.Timedelta(hours=15)])], 'phases': [1]}
+    figure = create_focus_overview('Alpha', (DAY, END), rows, [panel([8]), panel([2])], [skips])
+    shaded = lambda ax: [patch for patch in ax.patches if patch.get_facecolor()[:3] != (1.0, 1.0, 1.0)]
+    assert len(shaded(figure.axes[1])) == 1                                  # its own phase
+    assert shaded(figure.axes[2]) == [] and shaded(figure.axes[3]) == []     # another phase, skips on Ph1: no connection
 
 
 def test_smoothing_keeps_blank_hours_blank():

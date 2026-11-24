@@ -8,7 +8,7 @@ Top to bottom, only the parts a signal's table names:
   of each hour, over their normal range, smoothed. A long stretch with no wait measured while the signal sent data (no calls
   logged, as when every detector is down) says so.
 - Skips and preempt calls, as ticks; a row with none in these days says so, with the last one before them when known.
-The fault times are shaded lightly behind the measures, so a rise lines up with its cause, and hours the signal sent no data are
+The fault times are shaded lightly behind the measures of the phases they are connected to, so a rise lines up with its cause, and hours the signal sent no data are
 hatched in every part. It covers the same days as the signal's detector charts.
 
 The normal range of an hour is the middle NORMAL_SHARE of the same hour on the BASELINE_DAYS before the chart (weekdays and
@@ -266,26 +266,31 @@ def fault_rows(faults: pd.DataFrame, start, end, together=None, active=0) -> lis
             held = sum((max(min(b, y) - max(a, x), pd.Timedelta(0)) for x, y in down.get(HELD, [])), pd.Timedelta(0))
             silent = sum((max(min(b, y) - max(a, x), pd.Timedelta(0)) for x, y in down.get(SILENT, [])), pd.Timedelta(0))
             spans.append((a, b, HELD if held > silent else SILENT))
-        rows.append({'label': f"All {active} detectors" if active else 'All detectors', 'spans': _clip(spans, start, end)})
+        # every detector down: connected to every phase
+        rows.append({'label': f"All {active} detectors" if active else 'All detectors', 'spans': _clip(spans, start, end),
+                     'phases': None})
     ordered = []
     for _, fault in faults.iterrows():
         spans = _minus(_spans_of(fault, start, end), holes)
         if not spans:
             continue
         item = 'Button' if str(fault.get('DetectorType')) == 'Ped' else 'Det'
+        phases = set(fault.get('FaultPhases') or []) if isinstance(fault.get('FaultPhases'), (list, tuple, set, np.ndarray)) else set()
         group = next((group for group in ordered if group['item'] == item and _alike(group['spans'], spans)), None)
         if group is None:
-            ordered.append({'item': item, 'numbers': [int(fault['Detector'])], 'spans': spans})
+            ordered.append({'item': item, 'numbers': [int(fault['Detector'])], 'spans': spans, 'phases': phases})
         else:
             group['numbers'].append(int(fault['Detector']))
             group['spans'] = _union(group['spans'] + spans)
+            group['phases'] |= phases
     room = MAX_FAULT_ROWS - len(rows)
     for group in ordered[:room - 1] if len(ordered) > room else ordered:
-        rows.append({'label': _row_label(group['item'], group['numbers']), 'spans': group['spans']})
+        rows.append({'label': _row_label(group['item'], group['numbers']), 'spans': group['spans'], 'phases': group['phases']})
     if len(ordered) > room:
         rest = ordered[room - 1:]
         numbers = [number for group in rest for number in group['numbers']]
-        rows.append({'label': f"{len(numbers)} more", 'spans': [span for group in rest for span in group['spans']]})
+        rows.append({'label': f"{len(numbers)} more", 'spans': [span for group in rest for span in group['spans']],
+                     'phases': set().union(*(group['phases'] for group in rest))})
     return rows
 
 
@@ -454,6 +459,15 @@ def create_focus_overview(name: str, window, faults: list = None, panels: list =
     shade = [span for row in faults for span in row['spans']]
     states = {state for _, _, state in shade}
 
+    def connected(phases) -> list:
+        """The fault spans to shade behind a measure of these phases: only faults connected to one of them (the faulty
+        detector's own phase or a phase it was measured to hurt; every detector down is connected to all). A row with no
+        phases (preempt calls) gets none (user, 2026-11-24: shading only where there is a connection)."""
+        if not phases:
+            return []
+        wanted = {int(p) for p in phases}
+        return [span for row in faults for span in row['spans'] if row.get('phases') is None or set(row['phases']) & wanted]
+
     parts = []   # (kind, item, height of its plot)
     if faults:
         parts.append(('faults', faults, FAULT_ROW_H * len(faults)))
@@ -500,7 +514,7 @@ def create_focus_overview(name: str, window, faults: list = None, panels: list =
             _hatch(ax, gaps)
         elif kind == 'panel':
             _title(ax, item['title'])
-            _shade(ax, shade)
+            _shade(ax, connected(item.get('phases')))
             _hatch(ax, gaps)
             band = item['band']
             if band is not None and band['hi'].notna().any():
@@ -539,7 +553,7 @@ def create_focus_overview(name: str, window, faults: list = None, panels: list =
             ax.set_axisbelow(True)
         else:
             _title(ax, item['title'])
-            _shade(ax, shade)
+            _shade(ax, connected(item.get('phases')))
             _hatch(ax, gaps)
             # A row is (label, times) or (label, times, what to say when it has none in these days).
             rows = [tuple(row) + (None,) * (3 - len(row)) for row in item['rows']]

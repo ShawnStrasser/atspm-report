@@ -478,6 +478,27 @@ def _split_system_outages(outages: pd.DataFrame, recent: pd.DataFrame, past: pd.
     return new.reset_index(drop=True), ongoing.reset_index(drop=True)
 
 
+def _with_fault_phases(faults: pd.DataFrame, detectors: Optional[pd.DataFrame], ped_inputs: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """The faults with FaultPhases: the phase of each detector (detector table) or button (ped inputs), and the phases it was
+    measured to hurt (HurtPhases), so the overview shades a measure only behind a fault connected to its phases."""
+    def table(frame, key):
+        if frame is None or len(frame) == 0 or not {'DeviceId', key, 'Phase'} <= set(frame.columns):
+            return {}
+        rows = frame.dropna(subset=['Phase'])
+        return {(str(d), int(k)): int(p) for d, k, p in zip(rows['DeviceId'], pd.to_numeric(rows[key]), rows['Phase'])}
+    own_det, own_ped = table(detectors, 'Detector'), table(ped_inputs, 'Input')
+    phases = []
+    for _, fault in faults.iterrows():
+        key = (str(fault['DeviceId']), int(fault['Detector']))
+        own = (own_ped if str(fault.get('DetectorType')) == ATSPM_PED else own_det).get(key)
+        hurt = fault.get('HurtPhases')
+        found = {own} if own is not None else set()
+        if isinstance(hurt, str):
+            found |= {int(p) for p in hurt.split(',') if p.strip()}
+        phases.append(sorted(found))
+    return faults.assign(FaultPhases=phases)
+
+
 class ReportGenerator:
     """
     Generate ATSPM anomaly detection reports.
@@ -1840,7 +1861,8 @@ class ReportGenerator:
             # The overview.
             strip = []
             if not (faults.empty and buttons.empty):
-                strip = fault_rows(pd.concat([harm_faults, other_faults, buttons], ignore_index=True), start, end, together, len(known))
+                strip = fault_rows(_with_fault_phases(pd.concat([harm_faults, other_faults, buttons], ignore_index=True),
+                                                      detector_table, ped_inputs), start, end, together, len(known))
             covered = {FOCUS_CHART_DETECTOR} if strip else set()
             mine = of_device(term_hourly, device)
             stamps = pd.to_datetime(mine['TimeStamp']) if not mine.empty else None
@@ -1856,7 +1878,7 @@ class ReportGenerator:
                 if series.empty:
                     continue
                 # Wait is measured from a call to its green: with no calls logged (every detector down) there is none to show.
-                panels.append({'kind': kind, 'series': series, 'band': normal_range(series, start, end),
+                panels.append({'kind': kind, 'series': series, 'band': normal_range(series, start, end), 'phases': list(wanted_phases),
                                'title': f"{OVERVIEW_TITLES[kind]} ({overview_phase_words(wanted_phases, all_phases)})",
                                'blank': OVERVIEW_NO_WAIT if kind == OVERVIEW_WAIT else None})
                 covered.add(chart)
@@ -1865,7 +1887,7 @@ class ReportGenerator:
                 skipped = sorted(rows_of('phase_skips', device)['Phase'].dropna().astype(int).unique())
                 bins = of_device(waits, device)
                 bins = bins[bins['TotalSkips'] > 0] if not bins.empty else bins
-                ticks.append({'title': 'Skips', 'empty': 'none in these days',
+                ticks.append({'title': 'Skips', 'empty': 'none in these days', 'phases': skipped,
                               'rows': [(f"Ph{phase}", bins.loc[bins['Phase'] == phase, 'TimeStamp'].tolist() if not bins.empty else [])
                                        for phase in skipped]})
                 covered.add(FOCUS_CHART_SKIPS)
