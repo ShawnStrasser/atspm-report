@@ -261,6 +261,28 @@ Version 2.0 dropped Ibis: inputs are pandas DataFrames or DuckDB relations, and 
 | `updated_preempt_history` | **Persist.** Next run's `preempt_history` |
 | `alarms` | Controller alarms listed this run |
 
+### Connection mode, report day and analytics runs
+
+An application whose atspm 3 writes its tables on a DuckDB connection (conn mode) can run the report there, as atspm does, instead of building frames:
+
+```python
+from atspm_report import connection
+
+# the daily report for yesterday: inputs from atspm's tables, state kept in the schema atspm_report
+result = connection.run(con, report_date, signals=signals_df, config=config, detector_config=detectors_df,
+                        as_of=now, save=False)       # save=False: call connection.save_state(con, result) once it is sent
+# between reports: what a report would find, with nothing drawn and no state touched
+connection.run(con, report_date, signals=signals_df, config=config, as_of=now, analytics_only=True)
+```
+
+Each run writes `atspm_report.signal_problems` (one row per signal and area, with `ReportDate`, `AsOf`, `Mode`, `RunAt` and `Today`).
+
+`generate()` takes the same three arguments directly:
+
+- `report_date`: the day the report covers. Every input is cut at the midnight after it (by default the latest timeline day is the report day).
+- `as_of`: with `report_date`, the rows from the report day's end up to `as_of` say whether each problem still shows today (`signal_problems['Today']`: max outs, phase skips and missing data, set against the same clock hours of the report day; None where that cannot be told). They never change what the report finds.
+- `analytics_only`: no charts and no PDF; every `updated_*` state comes back as passed in.
+
 ### State between runs
 
 `generate()` never writes anything. Save `updated_past_alerts` and pass it back unchanged next run; do the same with `updated_alarm_history` and `updated_preempt_history` unless you pass a multi-day `timeline`, in which case those two are rebuilt every run and need not be stored. Every retention and suppression rule is already applied inside, so do not filter, dedupe, or reshape them. Dropping them does not error; it silently resets suppression, alarm totals, or the preempt baseline.

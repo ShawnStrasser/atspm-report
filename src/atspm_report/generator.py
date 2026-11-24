@@ -134,6 +134,7 @@ from .measure_checks import (
 )
 from . import timing_insights
 from . import table_limits
+from . import today as today_check
 from .utils import log_message
 from . import duckdb_utils
 from .duckdb_utils import TableLike, run_sql
@@ -247,6 +248,25 @@ def _normalize_deviceid(data: Optional[TableLike]) -> Optional[TableLike]:
             data = data.project('* REPLACE (CAST(DeviceId AS VARCHAR) AS DeviceId)')
         return data
     
+    return data
+
+
+def _before(data: Optional[TableLike], column: str, end) -> Optional[TableLike]:
+    """The rows of a DataFrame or DuckDB relation whose column is before end (None stays None)."""
+    if data is None:
+        return None
+    end = pd.Timestamp(end)
+    if isinstance(data, pd.DataFrame):
+        if column not in data.columns or data.empty:
+            return data
+        values = pd.to_datetime(data[column], errors='coerce')
+        if getattr(values.dt, 'tz', None) is not None:
+            values = values.dt.tz_localize(None)
+        return data[~(values >= end)]
+    if duckdb_utils.is_relation(data):
+        if column not in data.columns:
+            return data
+        return data.filter(f'"{column}" IS NULL OR "{column}" < TIMESTAMP \'{end.isoformat(sep=" ")}\'')
     return data
 
 
@@ -743,6 +763,9 @@ class ReportGenerator:
         approach_delay: Optional[TableLike] = None,
         ongoing_last_shown: Optional[pd.DataFrame] = None,
         actuations: Optional[TableLike] = None,
+        report_date=None,
+        as_of=None,
+        analytics_only: bool = False,
     ) -> dict:
         """
         Generate reports from provided pandas DataFrames or DuckDB relations.
@@ -873,6 +896,16 @@ class ReportGenerator:
                 'updated_ongoing_last_shown'. None: nothing shown yet.
             actuations: 15-minute detector counts (TimeStamp, DeviceId, Detector, Total) over the Timing Insights'
                 weekdays, for Downstream Bottleneck; only the detector table's count zones (Function 'Count') are read.
+            report_date: The day the report covers (a date). By default the latest timeline day (else the day after the
+                latest has_data day, less one). Given, every input is cut at the midnight after it, so rows from later days
+                never change what the report finds, and expected_data_end defaults to that midnight.
+            as_of: With report_date, when the run looks from (the time of the data the inputs reach, wall clock as the data):
+                the rows from the report day's end up to it only say whether each problem still shows today, in the 'Today'
+                column of signal_problems (today.today_flags: max outs, phase skips, missing data; None where that cannot
+                be told). Without as_of signal_problems has no Today column.
+            analytics_only: Analyse only: no charts and no PDF ('reports' is empty), and every 'updated_*' state is the
+                one passed in, unchanged, so a run between two reports never files, suppresses or rotates anything. The
+                alerts and signal_problems are those a report run on the same inputs would give.
 
         Returns:
             dict with keys:
@@ -932,11 +965,44 @@ class ReportGenerator:
         # Convert signals to pandas (needed for downstream operations)
         signals = _to_pandas(signals)
 
+        # The state passed in, returned unchanged by an analytics-only run.
+        state_in = {'past_alerts': dict(past_alerts) if past_alerts is not None else None, 'ongoing_last_shown': ongoing_last_shown, 'alarm_history': alarm_history,
+                    'preempt_history': preempt_history, 'preempt_calls': preempt_calls,
+                    'atspm_detector_minutes': atspm_detector_minutes}
+
+        # An explicit report day: everything after it is cut, kept only to tell what still shows today (as_of).
+        report_end, today_inputs = None, None
+        if report_date is not None:
+            report_end = pd.Timestamp(report_date).normalize() + pd.Timedelta(days=1)
+            if expected_data_end is None:
+                expected_data_end = report_end.to_pydatetime()
+            if as_of is not None and today_check.window(report_end, as_of) is not None:
+                today_inputs = {'terminations': terminations, 'phase_wait': phase_wait, 'has_data': has_data}
+            terminations = _before(terminations, 'TimeStamp', report_end)
+            detector_counts = _before(detector_counts, 'TimeStamp', report_end)
+            has_data = _before(has_data, 'TimeStamp', report_end)
+            pedestrian = _before(pedestrian, 'TimeStamp', report_end)
+            phase_wait = _before(phase_wait, 'TimeStamp', report_end)
+            coordination_agg = _before(coordination_agg, 'TimeStamp', report_end)
+            timeline = _before(timeline, 'StartTime', report_end)
+            device_days = _before(device_days, 'Date', report_end)
+            preempt_events = _before(preempt_events, 'TimeStamp', report_end)
+            atspm_detector_findings = _before(atspm_detector_findings, 'Start', report_end)
+            ped_press_counts = _before(ped_press_counts, 'TimeStamp', report_end)
+            actuations = _before(actuations, 'TimeStamp', report_end)
+            split_failures, arrival_on_green, platoon_ratio, approach_delay = (
+                _before(table, 'TimeStamp', report_end) for table in (split_failures, arrival_on_green, platoon_ratio, approach_delay))
+
         # Latest day = report day for the clearance and conflict checks; every day
         # feeds the alarm and preempt counters (see _split_timeline_days).
         timeline_latest, report_day = None, None
         if not _is_empty(timeline):
             timeline, timeline_latest, report_day = _split_timeline_days(_to_pandas(timeline))
+        if report_end is not None:
+            report_day = report_end - pd.Timedelta(days=1)
+            if timeline_latest is not None:
+                timeline_latest = timeline_latest.iloc[0:0] if timeline is None else timeline[
+                    pd.to_datetime(timeline['StartTime'], errors='coerce') >= report_day]
         device_days = _to_pandas(device_days) if not _is_empty(device_days) else None
         today = self.report_today = _report_today(report_day, has_data)
         reset_base_map()   # a base map that failed in an earlier report is tried again
@@ -1431,10 +1497,38 @@ class ReportGenerator:
         problems, problem_information = collect_problems(
             final_alerts, suppressed_alerts, alarm_alerts, atspm_info, self.config['phase_skip_retention_days'],
             detector_counts=focus_counts, signal_phases=runs)
+        if report_end is not None and as_of is not None and problems is not None:
+            problems = problems.copy()
+            problems[today_check.TODAY_COLUMN] = (
+                today_check.today_flags(problems, report_end, as_of, **today_inputs) if today_inputs is not None
+                else pd.Series([None] * len(problems), index=problems.index, dtype=object))
         if self.config['signal_focus_signals'] > 0:
             signal_focus = build_signal_focus(problems, signals, problem_information, self.config['signal_focus_signals'],
                                               related_only=self.config['signal_focus_related_only'])
         focus_hidden = hidden_signals(signal_focus)
+
+        if analytics_only:
+            # Between reports: what a report would find, with nothing drawn, filed, suppressed or rotated.
+            log_message("Analysis complete (analytics only: no report, state unchanged).", 1, verbosity)
+            return {
+                'reports': {},
+                'alerts': final_alerts,
+                'ongoing_alerts': ongoing_alerts,
+                'updated_past_alerts': state_in['past_alerts'] if state_in['past_alerts'] is not None else {},
+                'updated_ongoing_last_shown': state_in['ongoing_last_shown'],
+                'updated_alarm_history': state_in['alarm_history'],
+                'updated_preempt_history': state_in['preempt_history'],
+                'updated_preempt_calls': state_in['preempt_calls'],
+                'updated_atspm_detector_minutes': state_in['atspm_detector_minutes'],
+                'preempt_cascade_links': preempt_cascade_links,
+                'overruled_preempt_alerts': overruled_preempt_alerts,
+                'alarms': alarm_alerts,
+                'signal_focus': signal_focus,
+                'signal_problems': problems,
+                'data_stopped_at': data_stopped_at,
+                'silent_ped_phases': silent_phases,
+                'hourly_data': hourly_data,
+            }
 
         # Report length (table_limits). The Ongoing tables show each region the signals waiting longest since they were
         # last shown, worse ones sooner; every ongoing alert is still filed, as it was told before. New phase skips: only

@@ -10,6 +10,7 @@ from .generator import ReportGenerator
 from .alarm_processing import ALARM_EVENT_CLASSES, ALARM_HISTORY_DAYS, FLASH_EVENT_CLASSES
 from .preempt_processing import PREEMPT_HISTORY_DAYS
 from .atspm_detector_health import run_atspm_detector_findings
+from . import connection
 
 __version__ = "2.1.0"
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "FLASH_EVENT_CLASSES",
     "PREEMPT_HISTORY_DAYS",
     "run_atspm_detector_findings",
+    "connection",
 ]
