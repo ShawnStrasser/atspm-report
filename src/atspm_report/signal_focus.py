@@ -38,6 +38,8 @@ import math
 
 import pandas as pd
 
+from .alarm_processing import FLASH_EVENT_CLASSES, FLASH_INPUT_WORDS, URGENT_FLASH_CLASSES
+from .coordination_holding import CATEGORY as HOLDING_CATEGORY, URGENT, REVIEW
 from .atspm_detector_health import ALERT_TYPE, FAULT_STATUSES, PED, VEHICLE
 from .detector_triage import FAULT_KINDS, KIND_WORDS, OTHER_PHASES, PED_KINDS, SERVICE_LOST
 from .focus_overview import phase_words
@@ -50,6 +52,8 @@ SECTION_EXPLANATION = 'Signals with problems in more than one area'
 
 DETECTORS, PED_CATEGORY, SKIPS, MAX_OUTS, CONFLICTS, CLEARANCE, PREEMPT, ALARMS, MISSING = (
     'Detectors', 'Ped', 'Phase skips', 'Max outs', 'Conflicts', 'Clearance', 'Preempt', 'Alarms', 'Missing data')
+# Coordination holding (coordination_holding_enabled).
+COORDINATION = HOLDING_CATEGORY
 HARM_ROW, OTHER_DETECTORS_ROW, INFORMATION_ROW = 'Detector problems with worse operations during the fault', 'Other detector problems', 'For information'
 # A detector fault that left its phase's green unserved: the first row, in red (user, 2026-11-23). Ped walks lost are not this.
 SERVICE_ROW = 'PHASE STOPPED SERVING'
@@ -60,8 +64,8 @@ SEVERITY = {
     CONFLICTS: 5.0,
     'preempt fault': 4.0, 'flash alarm': 4.0, 'service lost': 4.0,
     'harm to other phases': 3.0, SKIPS: 3.0,
-    MAX_OUTS: 2.0, 'preempt change': 2.0, ALARMS: 2.0,
-    DETECTORS: 1.0, PED_CATEGORY: 1.0, 'skips rare': 1.0,
+    MAX_OUTS: 2.0, 'preempt change': 2.0, ALARMS: 2.0, 'coordination urgent': 2.0,
+    DETECTORS: 1.0, PED_CATEGORY: 1.0, 'skips rare': 1.0, COORDINATION: 1.0,
     MISSING: 0.0,
 }
 CLEARANCE_SCALE = 5.0
@@ -85,7 +89,7 @@ PHASE_CATEGORIES = frozenset({MAX_OUTS, SKIPS})
 # What an area's score is worth by how many days before the most recent day of data its latest new problem was; older still counts the last.
 RECENCY_WEIGHTS = (1.0, 0.5, 0.25)
 # The table's rows, and so the charts' order, with Missing data always last.
-ROW_ORDER = [SERVICE_ROW, HARM_ROW, MAX_OUTS, SKIPS, CONFLICTS, CLEARANCE, PREEMPT, ALARMS, PED_CATEGORY, OTHER_DETECTORS_ROW, INFORMATION_ROW, MISSING]
+ROW_ORDER = [SERVICE_ROW, HARM_ROW, MAX_OUTS, SKIPS, CONFLICTS, CLEARANCE, PREEMPT, ALARMS, COORDINATION, PED_CATEGORY, OTHER_DETECTORS_ROW, INFORMATION_ROW, MISSING]
 PREEMPT_CHANGES = ('Increase', 'Decrease')
 FLASH_ALARMS = ('MMU Flash', 'Flash - MMU', 'Flash - Fault Monitor')
 LABEL_WORDS = {'stuck on (together)': 'stuck on', 'count zone held ON': 'stuck on', 'counts dropped': 'counts fall'}
@@ -570,9 +574,66 @@ def _preempt_problems(frame) -> list:
     return problems
 
 
+def _times(n) -> str:
+    n = int(n)
+    return 'once' if n == 1 else 'twice' if n == 2 else f'{n:,} times'
+
+
+def _verified_alarm_problems(frame, conflicts=frozenset()) -> list:
+    """Alarms with the flash verification (flash_verification_enabled): a flash the signal kept cycling through is its
+    flash input, a review item; a flash is urgent only while still on at the end of the data. Each line has its grade."""
+    problems = []
+    for device, group in frame.groupby('DeviceId', sort=False):
+        marked = group.assign(_held=group['TotalCount'] > group['DayCount'], _flash=group['AlarmType'].isin(FLASH_EVENT_CLASSES))
+        verified = marked['KeptCycling'].notna()
+        kept = verified & marked['KeptCycling'].map(lambda v: v is True)
+        ongoing = verified & marked['Ongoing'].map(lambda v: v is True)
+        urgent = (marked['AlarmType'].isin(URGENT_FLASH_CLASSES) & ongoing & ~kept) | (
+            ~verified & marked['AlarmType'].isin(FLASH_ALARMS))    # no events to tell by: as without the verification
+        ordered = marked.assign(_urgent=urgent, _kept=kept, _ongoing=ongoing, _verified=verified).sort_values(
+            ['_urgent', '_flash', '_kept', 'TotalCount'], ascending=[False, False, True, False])
+        lines = []
+        for position, row in ordered.iterrows():
+            if row['_kept']:
+                kind = FLASH_INPUT_WORDS.get(row['AlarmType'], row['AlarmType'].lower())
+                text = f"{_upper_first(kind)} flash logged {_times(row['Onsets'])} while the signal kept cycling"
+            else:
+                text = f"{row['AlarmType']}: {int(row['DayCount'])} on {_date(row['Date'])}, {int(row['TotalCount'])} in 6 weeks"
+                if row['_flash'] and row['_verified']:
+                    text += ('; still in flash at the end of the data' if row['_ongoing'] else '; not in flash at the end of the data')
+            line = _line(text, rows=ordered.loc[[position]])
+            line['grade'] = URGENT if row['_urgent'] else REVIEW
+            lines.append(line)
+        severe = bool(ordered['_urgent'].iloc[0])
+        problems.append(_problem(device, ALARMS, SEVERITY['flash alarm' if severe else ALARMS], len(group), lines, marked,
+                                 links=LINK_POINTS if severe and device in conflicts else 0.0))
+    return problems
+
+
+def _holding_problems(frame) -> list:
+    """Coordination holding findings (coordination_holding.holding_findings), one problem per signal, each line with its grade."""
+    if frame is None or frame.empty:
+        return []
+    problems = []
+    rows = frame.assign(DeviceId=frame['DeviceId'].astype(str), _held=False, Date=pd.to_datetime(frame['Start']).dt.normalize())
+    for device, group in rows.groupby('DeviceId', sort=False):
+        ordered = group.assign(_urgent=group['Grade'] == URGENT).sort_values(['_urgent', 'Start'], ascending=[False, True])
+        lines = []
+        for _, row in ordered.iterrows():
+            line = _line(row['Text'])
+            line['grade'] = row['Grade']
+            lines.append(line)
+        severe = bool(ordered['_urgent'].iloc[0])
+        problems.append(_problem(device, COORDINATION, SEVERITY['coordination urgent' if severe else COORDINATION], len(group),
+                                 lines, group))
+    return problems
+
+
 def _alarm_problems(frame, conflicts=frozenset()) -> list:
     if frame is None or frame.empty:
         return []
+    if 'KeptCycling' in frame.columns:
+        return _verified_alarm_problems(frame, conflicts)
     problems = []
     for device, group in frame.groupby('DeviceId', sort=False):
         # Alarms list every day they recur, so only a first one in the six weeks is news.
@@ -609,7 +670,7 @@ def _combined(new_alerts: dict, held_back: dict, key: str) -> pd.DataFrame:
 
 
 def _collect(new_alerts: dict, held_back: dict, alarms: pd.DataFrame, info: pd.DataFrame, skip_retention_days: int,
-             counts: pd.DataFrame = None, runs: dict = None) -> list:
+             counts: pd.DataFrame = None, runs: dict = None, holding: pd.DataFrame = None) -> list:
     health = _combined(new_alerts, held_back, ALERT_TYPE)
     faults = _faults(health, info)
     told = set()
@@ -625,23 +686,26 @@ def _collect(new_alerts: dict, held_back: dict, alarms: pd.DataFrame, info: pd.D
     problems += _preempt_problems(_combined(new_alerts, held_back, 'preempts'))
     if alarms is not None and not alarms.empty:
         problems += _alarm_problems(alarms.assign(DeviceId=alarms['DeviceId'].astype(str)), {problem['DeviceId'] for problem in conflicts})
+    problems += _holding_problems(holding)
     return problems
 
 
 def collect_problems(new_alerts: dict, held_back: dict = None, alarms: pd.DataFrame = None, detector_info: pd.DataFrame = None,
-                     skip_retention_days: int = 14, detector_counts: pd.DataFrame = None, signal_phases: dict = None) -> tuple:
+                     skip_retention_days: int = 14, detector_counts: pd.DataFrame = None, signal_phases: dict = None,
+                     holding: pd.DataFrame = None) -> tuple:
     """Each signal's problems, one row per area (PROBLEM_COLUMNS), and {device: its information text}.
 
     new_alerts and held_back: alert type -> rows, as the report holds them. detector_info: DeviceId, Detector, Phase.
-    signal_phases: {device: the phases it runs}, so a rise on every one of them reads 'all phases'.
+    signal_phases: {device: the phases it runs}, so a rise on every one of them reads 'all phases'. holding: the coordination
+    holding findings (category Coordination), new every run.
     Lines and Harm tell everything; Points, Links and LastDay count only what is new, so a problem that is only held back has none.
     """
     info = detector_info if detector_info is not None else pd.DataFrame(columns=['DeviceId', 'Detector', 'Phase'])
-    told = pd.DataFrame(_collect(new_alerts, held_back, alarms, info, skip_retention_days, detector_counts, signal_phases),
+    told = pd.DataFrame(_collect(new_alerts, held_back, alarms, info, skip_retention_days, detector_counts, signal_phases, holding),
                         columns=PROBLEM_COLUMNS)
     # An alarm that repeats is not new, however it is held.
     new_alarms = alarms[alarms['TotalCount'] <= alarms['DayCount']] if alarms is not None and not alarms.empty else None
-    counted = pd.DataFrame(_collect(new_alerts, None, new_alarms, info, skip_retention_days, detector_counts, signal_phases),
+    counted = pd.DataFrame(_collect(new_alerts, None, new_alarms, info, skip_retention_days, detector_counts, signal_phases, holding),
                            columns=PROBLEM_COLUMNS)
     points = counted.set_index(['DeviceId', 'Category'])[['Points', 'Links', 'Items', 'LastDay', 'OnPhases']]
     keys = pd.MultiIndex.from_frame(told[['DeviceId', 'Category']])

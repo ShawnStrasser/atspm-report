@@ -14,6 +14,9 @@ with midnight to 6 AM), since a quiet night says nothing about the morning peak:
 * Phase skips: a phase that skipped in those hours of the report day still does when it skips today; cleared when
   it served with no skip.
 * Missing data: still missing when today's hours miss at least MISSING_SHARE of their 15-minute records.
+* Alarms, with the flash verification (alarm_flags): still in flash at as_of (the last flash state up to it), or over.
+  The last state tells it at any hour, so it needs no MIN_HOURS of today. A flash the signal kept cycling through (its
+  flash input, not a flash) and alarms that are no flash do not tell.
 
 True: still there today. False: cleared today. None: today's hours cannot tell (too little of the day yet, no
 rows those hours on the report day to set against, or a kind of problem this does not judge).
@@ -36,7 +39,7 @@ MIN_MAXOUT_SHARE = 0.2
 MISSING_SHARE = 0.2
 BIN_MINUTES = 15
 
-MAX_OUTS, SKIPS, MISSING = 'Max outs', 'Phase skips', 'Missing data'
+MAX_OUTS, SKIPS, MISSING, ALARMS = 'Max outs', 'Phase skips', 'Missing data', 'Alarms'
 
 
 def window(report_end, as_of):
@@ -136,3 +139,21 @@ def _phase_verdict(device, phases, values, judge) -> Optional[bool]:
     if not verdicts:
         return None
     return any(verdicts)
+
+
+def alarm_flags(problems: pd.DataFrame, alarms: pd.DataFrame) -> pd.Series:
+    """The Today value of each Alarms row of problems with the flash verification (alarms with OngoingNow, from
+    alarm_processing.verify_flash_alarms): True when one of the signal's flashes is still on at as_of, False when every
+    flash the events tell of is over, None otherwise (and for the other categories), indexed like problems."""
+    out = pd.Series([None] * len(problems), index=problems.index, dtype=object)
+    if problems is None or problems.empty or alarms is None or alarms.empty or 'OngoingNow' not in alarms.columns:
+        return out
+    kept = alarms['KeptCycling'].map(lambda v: v is True)
+    flashes = alarms[alarms['OngoingNow'].notna() & ~kept]
+    now = {}
+    for device, rows in flashes.groupby(flashes['DeviceId'].astype(str)):
+        now[device] = bool(rows['OngoingNow'].map(lambda v: v is True).any())
+    for idx, row in problems.iterrows():
+        if row['Category'] == ALARMS and str(row['DeviceId']) in now:
+            out[idx] = now[str(row['DeviceId'])]
+    return out

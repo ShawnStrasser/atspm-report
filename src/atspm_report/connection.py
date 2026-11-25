@@ -24,7 +24,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from .alarm_processing import ALARM_EVENT_CLASSES, ALARM_HISTORY_DAYS
+from .alarm_processing import ALARM_EVENT_CLASSES, ALARM_HISTORY_DAYS, FLASH_EVENT_IDS
+from . import coordination_holding
 from .detector_triage import usual_detector_counts
 from .preempt_processing import PREEMPT_HISTORY_DAYS
 from . import today as today_check
@@ -174,8 +175,32 @@ def load_inputs(con, report_date, *, signals: pd.DataFrame, config: Optional[dic
             data[name] = con.sql(f"{query} WHERE TimeStamp >= $start AND TimeStamp < $end", params={'start': start, 'end': end})
         except Exception:
             data[name] = None
+    events = _controller_events(con, t['raw_events'], settings, report_day, report_end, end)
+    if events is not None:
+        data['controller_events'] = events
     data['expected_data_end'] = report_end
     return {key: value for key, value in data.items() if value is not None}
+
+
+def _controller_events(con, table, settings, report_day, report_end, end):
+    """The raw events the checks on them read, as a relation on con (nothing is read here), or None when none of them is
+    switched on: flash_verification_enabled reads 1, 173 and 174 over the report day and on to as_of (for Today);
+    coordination_holding_enabled its EVENT_IDS over the report day and the plan events of the PLAN_LEAD_DAYS before."""
+    flash, holding = settings.get('flash_verification_enabled'), settings.get(coordination_holding.CONFIG_SWITCH)
+    if not (flash or holding):
+        return None
+    ids = sorted(set(FLASH_EVENT_IDS if flash else ()) | set(coordination_holding.EVENT_IDS if holding else ()))
+    plan_ids = ', '.join(str(i) for i in coordination_holding.PLAN_EVENT_IDS)
+    lead = report_day - timedelta(days=coordination_holding.PLAN_LEAD_DAYS)
+    where = f"(TimeStamp >= $start AND TimeStamp < $end AND EventId IN ({', '.join(str(i) for i in ids)}))"
+    if holding:
+        where += f" OR (TimeStamp >= $lead AND TimeStamp < $start AND EventId IN ({plan_ids}))"
+    try:
+        return con.sql(f'SELECT CAST(DeviceId AS VARCHAR) AS DeviceId, CAST(TimeStamp AS TIMESTAMP) AS TimeStamp, EventId, '
+                       f'Parameter FROM "{table}" WHERE {where}',
+                       params={'start': report_day, 'end': end if flash else report_end, **({'lead': lead} if holding else {})})
+    except Exception:
+        return None
 
 
 def _detector_health_inputs(con, t, report_end, days, detector_config, timezone) -> Dict[str, Any]:

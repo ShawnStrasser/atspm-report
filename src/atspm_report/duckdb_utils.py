@@ -82,3 +82,20 @@ def quote(name: str) -> str:
 def quote_literal(value: str) -> str:
     """Quote a SQL string literal."""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def query_table(data, sql: str, name: str = 'raw') -> pd.DataFrame:
+    """Run sql with data (a DataFrame or DuckDB relation) as the table called name: a relation on its own connection, so
+    only the result is read; a DataFrame copied into a table of a private in-memory connection first (a query that reads
+    the frame many times runs a hundred times slower on the frame itself)."""
+    if is_relation(data):
+        return data.query(name, sql).df()
+    con = duckdb.connect()
+    try:
+        con.execute("SET threads = 4")
+        con.register('_frame', data)
+        con.execute(f"CREATE TABLE {quote(name)} AS SELECT * FROM _frame")
+        con.unregister('_frame')
+        return con.execute(sql).df()
+    finally:
+        con.close()

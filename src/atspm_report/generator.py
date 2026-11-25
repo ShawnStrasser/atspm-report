@@ -49,7 +49,10 @@ from .alarm_processing import (
     summarize_daily_alarms,
     update_alarm_history,
     build_alarm_alerts,
+    flash_verdicts,
+    verify_flash_alarms,
 )
+from . import coordination_holding
 from .preempt_cascade import (
     CLASS_BUS_PREEMPT,
     CLASS_TSP,
@@ -137,7 +140,7 @@ from . import table_limits
 from . import today as today_check
 from .utils import log_message
 from . import duckdb_utils
-from .duckdb_utils import TableLike, run_sql
+from .duckdb_utils import TableLike, query_table, run_sql
 
 
 def _is_empty(data: Optional[TableLike]) -> bool:
@@ -632,6 +635,18 @@ class ReportGenerator:
               table's count zones for Downstream Bottleneck. Default: False
             - timing_insights_rows (int): Rows (each with its chart) per Timing Insights table in each report, new and
               ongoing; new alerts left out are not filed, so they come up on a later run. 0: no limit. Default: 3
+            - flash_verification_enabled (bool): Check each flash alarm against the raw events (controller_events: 173,
+              174 and green starts 1): a flash the signal kept cycling through (a green within 3 minutes after at least
+              half of its onsets) is told as its flash input logging while the signal kept cycling, a review item; a
+              flash is urgent only while still on at the end of the data (else a review item, told as over); the same
+              flash by 173 and 174 ('Flash - MMU', 'MMU Flash') is told once. With as_of, the Alarms rows of
+              signal_problems get Today: still in flash at as_of. Adds Onsets, KeptCycling, Ongoing and OngoingNow to
+              'alarms' and a 'grade' ('urgent' / 'review') to each Alarms line. Default: False
+            - coordination_holding_enabled (bool): Whether each signal holds its own programmed plan, per cycle, from the
+              raw events (controller_events; see coordination_holding): patterns out of step on 20 %+ of their steady
+              cycles, with the cause (a walk running past its split, a preempt or TSP), and slow transitions after a plan
+              change. One day of data is enough. signal_problems category 'Coordination' (each line with its 'grade') and
+              result 'coordination_holding'; no report section. Default: False
             - joke_index (int): Specific joke index. Default: None (auto-cycle by date)
             - custom_logo_path (str): Path to custom logo. Default: None (use ODOT logo)
         """
@@ -731,6 +746,9 @@ class ReportGenerator:
             # Timing Insights: off until approved.
             timing_insights.CONFIG_SWITCH: False,
             timing_insights.ROWS_CONFIG: 3,
+            # Checks on the raw controller events (controller_events). Off until approved.
+            'flash_verification_enabled': False,
+            coordination_holding.CONFIG_SWITCH: False,
         }
         return {**defaults, **config}
     
@@ -763,6 +781,7 @@ class ReportGenerator:
         approach_delay: Optional[TableLike] = None,
         ongoing_last_shown: Optional[pd.DataFrame] = None,
         actuations: Optional[TableLike] = None,
+        controller_events: Optional[TableLike] = None,
         report_date=None,
         as_of=None,
         analytics_only: bool = False,
@@ -896,6 +915,11 @@ class ReportGenerator:
                 'updated_ongoing_last_shown'. None: nothing shown yet.
             actuations: 15-minute detector counts (TimeStamp, DeviceId, Detector, Total) over the Timing Insights'
                 weekdays, for Downstream Bottleneck; only the detector table's count zones (Function 'Count') are read.
+            controller_events: Raw controller events (DeviceId, TimeStamp, EventId, Parameter), only read by the checks
+                switched on that need them: flash_verification_enabled (173, 174 and 1 over the report day, and up to
+                as_of for Today) and coordination_holding_enabled (coordination_holding.EVENT_IDS over the report day, and
+                the plan events 131-149 of the day before). A DuckDB relation is queried on its own connection, so only
+                the findings are read.
             report_date: The day the report covers (a date). By default the latest timeline day (else the day after the
                 latest has_data day, less one). Given, every input is cut at the midnight after it, so rows from later days
                 never change what the report finds, and expected_data_end defaults to that midnight.
@@ -958,6 +982,7 @@ class ReportGenerator:
         ped_press_counts = _normalize_deviceid(ped_press_counts)
         atspm_ped_inputs = _normalize_deviceid(atspm_ped_inputs)
         detector_usual_counts = _normalize_deviceid(detector_usual_counts)
+        controller_events = _normalize_deviceid(controller_events)
         split_failures, arrival_on_green, platoon_ratio, approach_delay = (
             _normalize_deviceid(table) if measure_inputs.present(table) else None
             for table in (split_failures, arrival_on_green, platoon_ratio, approach_delay))
@@ -1165,6 +1190,22 @@ class ReportGenerator:
             verbosity=verbosity,
         )
         alarm_alerts = build_alarm_alerts(updated_alarm_history, report_date=report_day)
+        # The checks on the raw events judge the report day only; the flash state after it (up to as_of) only tells Today.
+        events_day = None
+        if not _is_empty(controller_events) and (self.config['flash_verification_enabled']
+                                                 or self.config[coordination_holding.CONFIG_SWITCH]):
+            events_day = (report_end - pd.Timedelta(days=1) if report_end is not None else report_day)
+            if events_day is None:
+                latest = query_table(controller_events, "SELECT MAX(CAST(TimeStamp AS TIMESTAMP)) AS t FROM raw")['t'].iloc[0]
+                events_day = pd.Timestamp(latest).normalize() if pd.notna(latest) else None
+        if self.config['flash_verification_enabled']:
+            verdicts = flash_verdicts(controller_events, events_day, as_of) if events_day is not None else None
+            alarm_alerts = verify_flash_alarms(alarm_alerts, verdicts)
+        holding_findings = None
+        if self.config[coordination_holding.CONFIG_SWITCH]:
+            log_message("Checking coordination holding...", 1, verbosity)
+            holding_findings = (coordination_holding.holding_findings(controller_events, events_day) if events_day is not None
+                                else pd.DataFrame(columns=coordination_holding.COLUMNS))
         log_message(
             f"Processed controller alarms. Shape: {alarm_alerts.shape}",
             1,
@@ -1496,12 +1537,15 @@ class ReportGenerator:
                                  *atspm_window)
         problems, problem_information = collect_problems(
             final_alerts, suppressed_alerts, alarm_alerts, atspm_info, self.config['phase_skip_retention_days'],
-            detector_counts=focus_counts, signal_phases=runs)
+            detector_counts=focus_counts, signal_phases=runs, holding=holding_findings)
         if report_end is not None and as_of is not None and problems is not None:
             problems = problems.copy()
             problems[today_check.TODAY_COLUMN] = (
                 today_check.today_flags(problems, report_end, as_of, **today_inputs) if today_inputs is not None
                 else pd.Series([None] * len(problems), index=problems.index, dtype=object))
+            if self.config['flash_verification_enabled']:
+                flags = today_check.alarm_flags(problems, alarm_alerts)
+                problems.loc[flags.notna(), today_check.TODAY_COLUMN] = flags[flags.notna()]
         if self.config['signal_focus_signals'] > 0:
             signal_focus = build_signal_focus(problems, signals, problem_information, self.config['signal_focus_signals'],
                                               related_only=self.config['signal_focus_related_only'])
@@ -1528,6 +1572,7 @@ class ReportGenerator:
                 'data_stopped_at': data_stopped_at,
                 'silent_ped_phases': silent_phases,
                 'hourly_data': hourly_data,
+                **({'coordination_holding': holding_findings} if holding_findings is not None else {}),
             }
 
         # Report length (table_limits). The Ongoing tables show each region the signals waiting longest since they were
@@ -1831,7 +1876,8 @@ class ReportGenerator:
             'signal_problems': problems,
             'data_stopped_at': data_stopped_at,
             'silent_ped_phases': silent_phases,
-            'hourly_data': hourly_data
+            'hourly_data': hourly_data,
+            **({'coordination_holding': holding_findings} if holding_findings is not None else {}),
         }
     
     def _summarize_phase_skip_alerts(self, alert_rows_all: pd.DataFrame, threshold: int) -> tuple:
