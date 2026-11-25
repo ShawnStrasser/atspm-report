@@ -283,15 +283,18 @@ result = connection.run(con, report_date, signals=signals_df, config=config, det
                         as_of=now, save=False)       # save=False: call connection.save_state(con, result) once it is sent
 # between reports: what a report would find, with nothing drawn and no state touched
 connection.run(con, report_date, signals=signals_df, config=config, as_of=now, analytics_only=True)
+# today so far: what started today up to now that no report told
+connection.run(con, now.date(), signals=signals_df, config=config, as_of=now, analytics_only=True)
 ```
 
-Each run writes `atspm_report.signal_problems` (one row per signal and area, with `ReportDate`, `AsOf`, `Mode`, `RunAt` and `Today`).
+Each run writes `atspm_report.signal_problems` (one row per signal and area, with `ReportDate`, `AsOf`, `Mode`, `RunAt` and `Today`); a run on today so far writes `atspm_report.signal_problems_today` instead (`Mode` 'today').
 
 `generate()` takes the same three arguments directly:
 
 - `report_date`: the day the report covers. Every input is cut at the midnight after it (by default the latest timeline day is the report day).
 - `as_of`: with `report_date`, the rows from the report day's end up to `as_of` say whether each problem still shows today (`signal_problems['Today']`: max outs, phase skips and missing data, set against the same clock hours of the report day; with `flash_verification_enabled` also alarms, still in flash at `as_of`; None where that cannot be told). They never change what the report finds.
 - `analytics_only`: no charts and no PDF; every `updated_*` state comes back as passed in.
+- Today so far (`report_date` the day of `as_of`, analytics only): today's hours up to `as_of` are judged, so problems that started today are found during the day. Max outs and missing data set each day's same clock hours against today's; an interval still going at `as_of` waits. Left out, as part of a day cannot tell them: preempt frequency and the preempt kinds counted per day (a call stuck on or held long is told), coordination plans and clocks, the trends, Timing Insights and the detector health (whole-day checks). `signal_problems` holds only what is new and last seen today.
 
 ### State between runs
 

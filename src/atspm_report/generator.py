@@ -54,6 +54,8 @@ from .alarm_processing import (
 )
 from . import coordination_holding
 from .preempt_cascade import (
+    DIRECTION_LONG_HOLD,
+    DIRECTION_STUCK,
     CLASS_BUS_PREEMPT,
     CLASS_TSP,
     BUS_DIRECTIONS,
@@ -252,6 +254,28 @@ def _normalize_deviceid(data: Optional[TableLike]) -> Optional[TableLike]:
         return data
     
     return data
+
+
+# A today-so-far run (generate with report_date the day of as_of, analytics only) finds what started today: every check
+# that judges the hours of a day runs on today's hours up to as_of, max outs and missing data against the same hours of
+# the earlier days. Left out, as part of a day cannot tell them: the checks over several days or whole days (these
+# switches), preempt frequency and the preempt kinds counted a day (only a call stuck on or held long is told), and the
+# detector health (its days are atspm-detector's whole-day checks).
+TODAY_SO_FAR_OFF = {
+    'coordination_plan_check_enabled': False,
+    'coordination_clock_check_enabled': False,
+    'split_failure_trend_enabled': False,
+    'platoon_ratio_trend_enabled': False,
+    timing_insights.CONFIG_SWITCH: False,
+    'preempt_false_calls_enabled': False,
+}
+TODAY_SO_FAR_PREEMPTS = (DIRECTION_STUCK, DIRECTION_LONG_HOLD)
+
+
+def is_today_so_far(report_date, as_of) -> bool:
+    """Whether a run with these is on today so far: report_date is the day of as_of."""
+    return (report_date is not None and as_of is not None
+            and pd.Timestamp(as_of).normalize() == pd.Timestamp(report_date).normalize())
 
 
 def _before(data: Optional[TableLike], column: str, end) -> Optional[TableLike]:
@@ -754,7 +778,18 @@ class ReportGenerator:
         }
         return {**defaults, **config}
     
-    def generate(
+    def generate(self, *args, **kwargs) -> dict:
+        """See _generate. A today-so-far run (is_today_so_far) runs with TODAY_SO_FAR_OFF switched off."""
+        if not is_today_so_far(kwargs.get('report_date'), kwargs.get('as_of')):
+            return self._generate(*args, **kwargs)
+        config = self.config
+        self.config = {**config, **TODAY_SO_FAR_OFF}
+        try:
+            return self._generate(*args, **kwargs)
+        finally:
+            self.config = config
+
+    def _generate(
         self,
         signals: TableLike,  # REQUIRED
         terminations: Optional[TableLike] = None,
@@ -998,27 +1033,42 @@ class ReportGenerator:
                     'atspm_detector_minutes': atspm_detector_minutes}
 
         # An explicit report day: everything after it is cut, kept only to tell what still shows today (as_of).
+        # Today so far (report_date is as_of's day): what today's hours up to as_of show (is_today_so_far).
         report_end, today_inputs = None, None
+        today_so_far = is_today_so_far(report_date, as_of)
+        if today_so_far and not analytics_only:
+            raise ValueError("A run on today so far (report_date is as_of's day) is analytics_only: no report of part of a day")
+        day_end = (pd.Timestamp(as_of).floor(f'{today_check.BIN_MINUTES}min') - pd.Timestamp(as_of).normalize()
+                   if today_so_far else None)
         if report_date is not None:
             report_end = pd.Timestamp(report_date).normalize() + pd.Timedelta(days=1)
-            if expected_data_end is None:
-                expected_data_end = report_end.to_pydatetime()
-            if as_of is not None and today_check.window(report_end, as_of) is not None:
+            # today so far: the day's data up to as_of's bin; else the whole report day
+            cut = pd.Timestamp(as_of).floor(f'{today_check.BIN_MINUTES}min') if today_so_far else report_end
+            if expected_data_end is None or today_so_far:
+                expected_data_end = cut.to_pydatetime()
+            if not today_so_far and as_of is not None and today_check.window(report_end, as_of) is not None:
                 today_inputs = {'terminations': terminations, 'phase_wait': phase_wait, 'has_data': has_data}
-            terminations = _before(terminations, 'TimeStamp', report_end)
-            detector_counts = _before(detector_counts, 'TimeStamp', report_end)
-            has_data = _before(has_data, 'TimeStamp', report_end)
-            pedestrian = _before(pedestrian, 'TimeStamp', report_end)
-            phase_wait = _before(phase_wait, 'TimeStamp', report_end)
-            coordination_agg = _before(coordination_agg, 'TimeStamp', report_end)
-            timeline = _before(timeline, 'StartTime', report_end)
-            device_days = _before(device_days, 'Date', report_end)
-            preempt_events = _before(preempt_events, 'TimeStamp', report_end)
-            atspm_detector_findings = _before(atspm_detector_findings, 'Start', report_end)
-            ped_press_counts = _before(ped_press_counts, 'TimeStamp', report_end)
-            actuations = _before(actuations, 'TimeStamp', report_end)
+            terminations = _before(terminations, 'TimeStamp', cut)
+            detector_counts = _before(detector_counts, 'TimeStamp', cut)
+            has_data = _before(has_data, 'TimeStamp', cut)
+            pedestrian = _before(pedestrian, 'TimeStamp', cut)
+            phase_wait = _before(phase_wait, 'TimeStamp', cut)
+            coordination_agg = _before(coordination_agg, 'TimeStamp', cut)
+            timeline = _before(timeline, 'StartTime', cut)
+            if today_so_far and timeline is not None and not _is_empty(timeline):
+                # an interval still going at as_of is not known yet (a replay of a past day would read its end)
+                timeline = _to_pandas(timeline)
+                ends = pd.to_datetime(timeline['EndTime'], errors='coerce')
+                if getattr(ends.dt, 'tz', None) is not None:
+                    ends = ends.dt.tz_localize(None)
+                timeline = timeline[~(ends > cut)]
+            device_days = _before(device_days, 'Date', cut)
+            preempt_events = _before(preempt_events, 'TimeStamp', cut)
+            atspm_detector_findings = _before(atspm_detector_findings, 'Start', cut)
+            ped_press_counts = _before(ped_press_counts, 'TimeStamp', cut)
+            actuations = _before(actuations, 'TimeStamp', cut)
             split_failures, arrival_on_green, platoon_ratio, approach_delay = (
-                _before(table, 'TimeStamp', report_end) for table in (split_failures, arrival_on_green, platoon_ratio, approach_delay))
+                _before(table, 'TimeStamp', cut) for table in (split_failures, arrival_on_green, platoon_ratio, approach_delay))
 
         # Latest day = report day for the clearance and conflict checks; every day
         # feeds the alarm and preempt counters (see _split_timeline_days).
@@ -1062,7 +1112,7 @@ class ReportGenerator:
         # Process maxout data if provided
         if not _is_empty(terminations):
             log_message("Processing max out data...", 1, verbosity)
-            maxout_daily, maxout_hourly = process_maxout_data(terminations)
+            maxout_daily, maxout_hourly = process_maxout_data(terminations, day_end=day_end)
             hourly_data['maxout_hourly'] = _to_pandas(maxout_hourly)
             log_message(f"Processed max out data. Shape: {_get_shape_str(maxout_daily)}", 1, verbosity)
             
@@ -1074,7 +1124,8 @@ class ReportGenerator:
             if self.config['maxout_drain_enabled']:
                 new_alerts['maxout'] = drain_maxout_alerts(
                     new_alerts['maxout'], terminations, self.config['maxout_drain_per_hour'],
-                    self.config['maxout_drain_threshold'], self.config['alert_recency_days'])
+                    self.config['maxout_drain_threshold'], self.config['alert_recency_days'],
+                    hours=24 if day_end is None else int(day_end // pd.Timedelta(hours=1)))
         else:
             new_alerts['maxout'] = pd.DataFrame()
             hourly_data['maxout_hourly'] = pd.DataFrame()
@@ -1082,7 +1133,7 @@ class ReportGenerator:
         # Process missing data if provided
         if not _is_empty(has_data):
             log_message("Processing missing data...", 1, verbosity)
-            missing_data = process_missing_data(has_data, data_stopped_at)
+            missing_data = process_missing_data(has_data, data_stopped_at, day_end=day_end)
             log_message(f"Processed missing data. Shape: {_get_shape_str(missing_data)}", 1, verbosity)
             
             # Filter out dates with system-wide missing data: a region-day whose
@@ -1268,6 +1319,8 @@ class ReportGenerator:
                 bus_alerts['ChartSeries'] = [[[d, int(p)]] for d, p in zip(bus_alerts['DeviceId'], bus_alerts['Preempt'])]
                 preempt_alerts = pd.concat([df for df in (preempt_alerts, bus_alerts) if not df.empty], ignore_index=True)
         preempt_alerts = _preempt_alert_classes(preempt_alerts, rail_numbers)
+        if today_so_far and not preempt_alerts.empty and 'Direction' in preempt_alerts:
+            preempt_alerts = preempt_alerts[preempt_alerts['Direction'].isin(TODAY_SO_FAR_PREEMPTS)]
         if not preempt_alerts.empty:
             preempt_alerts = _attach_daily_counts(preempt_alerts, updated_preempt_history, report_day, rail_numbers)
         new_alerts['preempts'] = preempt_alerts
@@ -1296,6 +1349,8 @@ class ReportGenerator:
         # it got here; this adds its minutes to the running totals, picks the ones
         # to report and dates them to the report day.
         atspm_window = None
+        if today_so_far:
+            atspm_detector_findings = None
         updated_atspm_minutes = atspm_detector_minutes
         atspm_info = atspm_detector_info(atspm_detector_config)
         silent_phases = pd.DataFrame()
@@ -1538,8 +1593,14 @@ class ReportGenerator:
             runs = signal_phases(terminations, sorted(pd.concat([frame['DeviceId'] for frame in fault_frames]).astype(str).unique()),
                                  *atspm_window)
         problems, problem_information = collect_problems(
-            final_alerts, suppressed_alerts, alarm_alerts, atspm_info, self.config['phase_skip_retention_days'],
+            final_alerts, {} if today_so_far else suppressed_alerts, alarm_alerts, atspm_info,
+            self.config['phase_skip_retention_days'],
             detector_counts=focus_counts, signal_phases=runs, holding=holding_findings)
+        if today_so_far and problems is not None and len(problems):
+            # only what today shows that no report told before: new, and last seen today
+            day = pd.Timestamp(report_date).normalize()
+            problems = problems[problems['New'].astype(bool)
+                                & (pd.to_datetime(problems['LastDay'], errors='coerce') == day)].reset_index(drop=True)
         if report_end is not None and as_of is not None and problems is not None:
             problems = problems.copy()
             problems[today_check.TODAY_COLUMN] = (

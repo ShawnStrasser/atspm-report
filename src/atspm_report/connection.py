@@ -12,7 +12,9 @@ Two kinds of run:
   a deployment that writes its state only once a report went out does).
 * an analytics run (analytics_only=True), any time between reports: what a report would find for report_date, with
   the rows since its end up to as_of telling which problems still show today (signal_problems 'Today'). Nothing is
-  drawn and no state is touched, so it never files, suppresses or rotates anything before the next report.
+  drawn and no state is touched, so it never files, suppresses or rotates anything before the next report. With
+  report_date today (the day of as_of) it is a run on today so far: what started today up to as_of that no report told
+  (generator.TODAY_SO_FAR_OFF), written to signal_problems_today so the report's rows stay.
 
 ReportGenerator.generate() taking frames is unchanged; this module only feeds it.
 """
@@ -52,6 +54,7 @@ DETECTOR_MINUTES = 'detector_minutes'
 PREEMPT_CALLS = 'preempt_calls'
 ONGOING_LAST_SHOWN = 'ongoing_last_shown'
 SIGNAL_PROBLEMS = 'signal_problems'
+SIGNAL_PROBLEMS_TODAY = 'signal_problems_today'
 
 # The report day's timeline in full, plus this many days of alarm and preempt rows before it, so the six-week alarm
 # and preempt counts are rebuilt from the table every run (nothing to carry between runs).
@@ -121,12 +124,13 @@ def load_inputs(con, report_date, *, signals: pd.DataFrame, config: Optional[dic
     (DeviceId, Detector, phase, function, lanes). timezone: the IANA name the data's wall clock is in (TIMESTAMPTZ
     columns are converted to it). Missing tables are left out, as generate() takes every input but signals as optional.
     """
-    from .generator import ReportGenerator
+    from .generator import ReportGenerator, is_today_so_far
     names = {**TABLES, **(tables or {})}
     settings = ReportGenerator(config or {}).config
     report_end = _midnight(report_date) + timedelta(days=1)
     end = report_end
-    if as_of is not None and pd.Timestamp(as_of) > pd.Timestamp(report_end):
+    today_so_far = is_today_so_far(report_date, as_of)
+    if as_of is not None and (today_so_far or pd.Timestamp(as_of) > pd.Timestamp(report_end)):
         end = pd.Timestamp(as_of).to_pydatetime()
     start = report_end - timedelta(days=int(settings['historical_window_days']))
     skip_start = report_end - timedelta(days=int(settings['phase_skip_retention_days']))
@@ -164,7 +168,8 @@ def load_inputs(con, report_date, *, signals: pd.DataFrame, config: Optional[dic
         con, f'SELECT DeviceId, CAST(TimeStamp AS DATE) AS Date FROM "{t["has_data"]}" WHERE TimeStamp >= ? AND TimeStamp < ? '
              'GROUP BY ALL HAVING COUNT(*) * 15 >= ? ORDER BY Date, DeviceId', [history_start, report_end, DEVICE_DAY_MIN_MINUTES],
         timezone)
-    data.update(_detector_health_inputs(con, t, report_end, detector_health_days, detector_config, timezone))
+    if not today_so_far:    # its days are atspm-detector's whole-day checks
+        data.update(_detector_health_inputs(con, t, report_end, detector_health_days, detector_config, timezone))
     for name, query in {
         'split_failures': f'SELECT TimeStamp, DeviceId, Phase, Split_Failure, Cycles, Green_Occupancy, Red_Occupancy FROM "{t["split_failures"]}"',
         'arrival_on_green': f'SELECT TimeStamp, DeviceId, Phase, Total_Actuations, Percent_AOG FROM "{t["platoon_ratio"]}"',
@@ -178,7 +183,7 @@ def load_inputs(con, report_date, *, signals: pd.DataFrame, config: Optional[dic
     events = _controller_events(con, t['raw_events'], settings, report_day, report_end, end)
     if events is not None:
         data['controller_events'] = events
-    data['expected_data_end'] = report_end
+    data['expected_data_end'] = end if today_so_far else report_end
     return {key: value for key, value in data.items() if value is not None}
 
 
@@ -317,9 +322,12 @@ def write_problems(con, result: Dict[str, Any], report_date, *, as_of=None, anal
                    schema: str = STATE_SCHEMA) -> int:
     """
     Replace the signal_problems table with this run's: one row per signal and area (signal_focus.PROBLEM_COLUMNS), plus
-    ReportDate, AsOf (None for a report run without one), Mode ('report' or 'analytics'), RunAt and Today (whether it still
-    shows today; None when that cannot be told). Lines, Harm and Phases are JSON. Returns the rows written.
+    ReportDate, AsOf (None for a report run without one), Mode ('report', 'analytics' or 'today'), RunAt and Today (whether
+    it still shows today; None when that cannot be told). Lines, Harm and Phases are JSON. A run on today so far replaces
+    signal_problems_today instead. Returns the rows written.
     """
+    from .generator import is_today_so_far
+    today_so_far = is_today_so_far(report_date, as_of)
     problems = result.get('signal_problems')
     frame = problems.copy() if problems is not None else pd.DataFrame()
     for col in ('Lines', 'Harm', 'Phases', 'OnPhases'):
@@ -331,9 +339,9 @@ def write_problems(con, result: Dict[str, Any], report_date, *, as_of=None, anal
     frame['DeviceId'] = frame['DeviceId'].astype(str) if 'DeviceId' in frame.columns else pd.Series(dtype=str)
     frame['ReportDate'] = pd.Timestamp(report_date).date()
     frame['AsOf'] = pd.Timestamp(as_of).to_pydatetime() if as_of is not None else None
-    frame['Mode'] = 'analytics' if analytics_only else 'report'
+    frame['Mode'] = 'today' if today_so_far else ('analytics' if analytics_only else 'report')
     frame['RunAt'] = datetime.now()
-    _replace(con, schema, SIGNAL_PROBLEMS, frame)
+    _replace(con, schema, SIGNAL_PROBLEMS_TODAY if today_so_far else SIGNAL_PROBLEMS, frame)
     return len(frame)
 
 

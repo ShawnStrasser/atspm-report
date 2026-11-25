@@ -5,12 +5,20 @@ from .duckdb_utils import TableLike, run_sql
 # Inputs may be pandas DataFrames or DuckDB relations; results are pandas DataFrames.
 
 
-def process_maxout_data(df: TableLike):
+def _hours_of_day(day_end) -> str:
+    """A WHERE clause keeping every day's rows before day_end (a time of day, as a Timedelta from midnight), or ''."""
+    if day_end is None:
+        return ''
+    return f"WHERE TimeStamp - DATE_TRUNC('day', TimeStamp) < INTERVAL '{int(pd.Timedelta(day_end).total_seconds())} seconds'"
+
+
+def process_maxout_data(df: TableLike, day_end=None):
     """Process the max out data to calculate daily and hourly aggregates.
 
-    Returns (daily, hourly) DataFrames.
+    day_end: a today-so-far run's time of day (a Timedelta from midnight): each day's share is of its hours before it, so
+    the part of today there is is set against the same hours of the other days. Returns (daily, hourly) DataFrames.
     """
-    daily = run_sql("""
+    daily = run_sql(f"""
         SELECT
             Date, DeviceId, Phase,
             SUM(MaxOutTotal) / SUM(Total) AS "Percent MaxOut",
@@ -19,7 +27,7 @@ def process_maxout_data(df: TableLike):
             SELECT
                 CAST(TimeStamp AS DATE) AS Date, DeviceId, Phase, Total,
                 CASE WHEN PerformanceMeasure IN ('MaxOut', 'ForceOff') THEN Total ELSE 0 END AS MaxOutTotal
-            FROM t
+            FROM t {_hours_of_day(day_end)}
         )
         GROUP BY 1, 2, 3
         ORDER BY 1, 2, 3
@@ -104,7 +112,7 @@ def mark_open_periods(alerts: pd.DataFrame, stop) -> pd.DataFrame:
     return alerts.assign(Periods=alerts['Periods'].map(marked))
 
 
-def process_missing_data(has_data_df: TableLike, stop=None):
+def process_missing_data(has_data_df: TableLike, stop=None, day_end=None):
     """Process the missing data to calculate daily percent missing data.
 
     Every device gets a row for every date between the first and last date in
@@ -113,15 +121,24 @@ def process_missing_data(has_data_df: TableLike, stop=None):
 
     stop: when the whole feed stopped (detect_feed_stop). Nothing after it is missing: that day expects only the records up to
     it, and a device short of those has really lost them.
+
+    day_end: a today-so-far run's time of day (a Timedelta from midnight): every day expects only its records before it, so
+    the part of today there is is set against the same hours of the other days.
     """
-    keep, after_stop = '', '0'
+    keep, after_stop = [], '0'
+    day = pd.Timedelta(days=1) if day_end is None else pd.Timedelta(day_end)
+    full = ("(CASE WHEN month(dates.Date) = 11 AND day(dates.Date) <= 7 AND dayofweek(dates.Date) = 0 THEN 92.0 ELSE 96.0 END)"
+            if day_end is None else f"{day / BIN:.1f}")
+    if day_end is not None:
+        keep.append(_hours_of_day(day_end)[len('WHERE '):])
     if stop is not None:
         midnight = pd.Timestamp(stop).normalize()
         stop = pd.Timestamp(stop) if pd.Timestamp(stop) - midnight >= FEED_STOP_MIN_DAY else midnight
-        keep = f"WHERE TimeStamp < TIMESTAMP '{stop}'"
-        if stop > midnight:
-            bins = round((midnight + pd.Timedelta(days=1) - stop) / BIN)
+        keep.append(f"TimeStamp < TIMESTAMP '{stop}'")
+        if midnight < stop < midnight + day:
+            bins = round((midnight + day - stop) / BIN)
             after_stop = f"CASE WHEN dates.Date = DATE '{midnight.date()}' THEN {bins} ELSE 0 END"
+    keep = ('WHERE ' + ' AND '.join(keep)) if keep else ''
     return run_sql(f"""
         WITH d AS (
             SELECT DeviceId, CAST(TimeStamp AS DATE) AS Date FROM t {keep}
@@ -139,9 +156,7 @@ def process_missing_data(has_data_df: TableLike, stop=None):
         SELECT
             dev.DeviceId,
             dates.Date,
-            GREATEST(0.0, 1 - COALESCE(counts.RecordCount, 0)
-                / ((CASE WHEN month(dates.Date) = 11 AND day(dates.Date) <= 7 AND dayofweek(dates.Date) = 0
-                        THEN 92.0 ELSE 96.0 END) - {after_stop})) AS MissingData
+            GREATEST(0.0, 1 - COALESCE(counts.RecordCount, 0) / ({full} - {after_stop})) AS MissingData
         FROM (SELECT DISTINCT DeviceId FROM d) AS dev
         CROSS JOIN dates
         LEFT JOIN counts

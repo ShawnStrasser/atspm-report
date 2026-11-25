@@ -87,11 +87,12 @@ MAXOUT_DRAIN_DEFAULTS = {
 }
 
 
-def maxout_end_of_day_totals(days: pd.DataFrame, terminations: TableLike, drain_per_hour: float) -> pd.Series:
+def maxout_end_of_day_totals(days: pd.DataFrame, terminations: TableLike, drain_per_hour: float,
+                             hours: int = 24) -> pd.Series:
     """The running max-out total at the end of each (DeviceId, Phase, Date) in days, as described at MAXOUT_DRAIN_DEFAULTS.
 
-    terminations: the same rows the daily check used. Hours of the day with no terminations count as normal. Returns a
-    Series indexed like days.
+    terminations: the same rows the daily check used. Hours of the day with no terminations count as normal. hours: the
+    day's hours run through (a today-so-far run stops at the hours there are). Returns a Series indexed like days.
     """
     if days.empty:
         return pd.Series(dtype='float64', index=days.index)
@@ -116,7 +117,7 @@ def maxout_end_of_day_totals(days: pd.DataFrame, terminations: TableLike, drain_
             usual = before.groupby(before['Hour'].dt.hour)['Share'].mean()
             today = mine[(mine['Hour'] >= day) & (mine['Hour'] < day + pd.Timedelta(days=1))]
             shares = dict(zip(today['Hour'].dt.hour, today['Share']))
-            for hour in range(24):
+            for hour in range(hours):
                 normal = usual.get(hour, 0.0)
                 total = max(0.0, total + shares.get(hour, normal) - normal - drain_per_hour)
         totals[index] = total
@@ -124,15 +125,16 @@ def maxout_end_of_day_totals(days: pd.DataFrame, terminations: TableLike, drain_
 
 
 def drain_maxout_alerts(alerts: pd.DataFrame, terminations: TableLike, drain_per_hour: float, threshold: float,
-                        recency_days: int = None) -> pd.DataFrame:
+                        recency_days: int = None, hours: int = 24) -> pd.DataFrame:
     """alert()'s max-out result without the flagged days whose running total had drained to threshold or less by the day's
-    end, and without the phases left with no recent flagged day. Adds MaxOutEndTotal on the flagged days."""
+    end (hours: the hours of it there are), and without the phases left with no recent flagged day. Adds MaxOutEndTotal on
+    the flagged days."""
     if alerts.empty:
         return alerts
     recency_days = DEFAULT_ALERT_RECENCY_DAYS if recency_days is None else recency_days
     alerts = alerts.copy()
     flagged = alerts[(alerts['Alert'] == 1) & (alerts['days_from_max'] <= recency_days)]
-    totals = maxout_end_of_day_totals(flagged, terminations, drain_per_hour)
+    totals = maxout_end_of_day_totals(flagged, terminations, drain_per_hour, hours)
     alerts['MaxOutEndTotal'] = totals.reindex(alerts.index)
     drained = totals.index[totals <= threshold]
     alerts.loc[drained, 'Alert'] = 0
