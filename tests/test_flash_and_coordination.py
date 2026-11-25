@@ -104,9 +104,10 @@ def test_flash_verification_grades_signal_problems_and_today():
 def test_coordination_holding_finds_walk_overruns_and_a_slow_transition_on_one_morning():
     walk = _events('10', _coordinated('10', walk_over=lambda k: k >= 36 and k % 3 == 0))
     slow = _events('11', _coordinated('11', late=lambda k: max(0.0, 90 - 6 * k)))
-    steady = _events('12', _coordinated('12'))
+    # the plan of the evening before (read as the lead-in) neither makes cycles nor a change before the data starts
+    steady = _events('12', _coordinated('12') + [(-7200.0, 131, 9), (-7200.0, 132, 100), (-7200.0, 133, 0)])
     found = holding_findings(pd.concat([walk, slow, steady], ignore_index=True), DAY).set_index('DeviceId')
-    assert set(found.index) == {'10', '11'}
+    assert set(found.index) == {'10', '11'} and (pd.to_datetime(found['Start']) >= DAY).all()
     assert found.loc['10', 'Issue'] == 'not holding coordination' and found.loc['10', 'Cause'] == 'walk'
     assert found.loc['10', 'Text'].startswith('The phase 4 walk runs past its split and keeps the signal out of step: '
                                               'pattern 1 (100 s cycle) was out of step on ')
