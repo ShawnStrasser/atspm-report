@@ -124,3 +124,46 @@ def test_today_so_far_finds_only_what_the_whole_day_finds_on_clean_data(inputs, 
     assert problems is None or problems.empty or set(problems['LastDay']) == {latest}
     for category in DAY_CATEGORIES:
         assert _found(part, category) <= _found(whole, category), category
+
+
+def test_a_phase_maxing_out_again_today_is_found_though_a_report_told_it_ten_days_ago(inputs):
+    frames, latest = inputs
+    terminations = frames['terminations'].copy()
+    stamps = pd.to_datetime(terminations['TimeStamp'])
+    maxed = terminations['PerformanceMeasure'].isin(['MaxOut', 'ForceOff']) * terminations['Total']
+    by_phase = terminations.assign(Maxed=maxed).groupby([terminations['DeviceId'].astype(str), 'Phase'])[['Maxed', 'Total']].sum()
+    device, phase = by_phase[by_phase['Maxed'] / by_phase['Total'] < 0.05]['Total'].idxmax()
+    mine = ((terminations['DeviceId'].astype(str) == device) & (terminations['Phase'] == phase)
+            & (stamps >= latest + pd.Timedelta(hours=6)) & (stamps < latest + pd.Timedelta(hours=10)))
+    terminations.loc[mine, 'PerformanceMeasure'] = 'MaxOut'
+    told = {'maxout': pd.DataFrame({'DeviceId': [device], 'Phase': [phase], 'Date': [latest - pd.Timedelta(days=10)]})}
+    as_of = latest + pd.Timedelta(hours=10)
+    result = ReportGenerator(CONFIG).generate(**_upto({**frames, 'terminations': terminations}, as_of), past_alerts=told,
+                                              report_date=latest.date(), as_of=as_of, analytics_only=True)
+    assert device in _found(result, 'Max outs')
+
+
+def test_a_flash_today_is_found_though_the_signal_flashed_three_weeks_ago():
+    from test_flash_and_coordination import DAY, SIGNALS, _flash_rows, _timeline
+    events = _flash_rows()
+    events = events[events['TimeStamp'] < DAY + pd.Timedelta(hours=6)]
+    timeline = _timeline(events)
+    earlier = timeline[timeline['DeviceId'] == '3'].assign(StartTime=lambda f: f['StartTime'] - pd.Timedelta(days=21),
+                                                          EndTime=lambda f: f['EndTime'] - pd.Timedelta(days=21))
+    as_of = DAY + pd.Timedelta(hours=6)
+    result = ReportGenerator({'verbosity': 0}).generate(
+        signals=SIGNALS, timeline=pd.concat([earlier, timeline], ignore_index=True), controller_events=events,
+        report_date=DAY.date(), as_of=as_of, analytics_only=True)
+    problems = result['signal_problems'].set_index('DeviceId')
+    assert '3' in problems.index
+    assert [line['grade'] for line in problems.loc['3', 'Lines']] == ['urgent']      # still in flash at as_of
+    assert problems.loc['3', 'Today'] is True
+
+
+def test_bins_not_in_yet_are_not_missing(inputs):
+    """At 10:20 the last bins come in a little late: the run judges up to where the data reaches."""
+    frames, latest = inputs
+    as_of = latest + pd.Timedelta(hours=10, minutes=20)
+    upto = _upto(frames, latest + pd.Timedelta(hours=9, minutes=30))     # every signal's data ends at 09:30
+    result = ReportGenerator(CONFIG).generate(**upto, report_date=latest.date(), as_of=as_of, analytics_only=True)
+    assert _found(result, 'Missing data') == set()

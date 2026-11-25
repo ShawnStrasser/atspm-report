@@ -104,6 +104,8 @@ from .phase_conflict_processing import (
 )
 from .detector_triage import attach_triage, rank_detectors, silent_ped_phases, usual_detector_counts
 from .signal_focus import (
+    ALARMS as FOCUS_ALARMS,
+    COORDINATION as FOCUS_COORDINATION,
     active_detectors,
     detectors_down_together,
     known_detectors,
@@ -1038,12 +1040,23 @@ class ReportGenerator:
         today_so_far = is_today_so_far(report_date, as_of)
         if today_so_far and not analytics_only:
             raise ValueError("A run on today so far (report_date is as_of's day) is analytics_only: no report of part of a day")
-        day_end = (pd.Timestamp(as_of).floor(f'{today_check.BIN_MINUTES}min') - pd.Timestamp(as_of).normalize()
-                   if today_so_far else None)
+        day_end = None
         if report_date is not None:
             report_end = pd.Timestamp(report_date).normalize() + pd.Timedelta(days=1)
             # today so far: the day's data up to as_of's bin; else the whole report day
             cut = pd.Timestamp(as_of).floor(f'{today_check.BIN_MINUTES}min') if today_so_far else report_end
+            if today_so_far and not _is_empty(has_data):
+                # where the data reaches (the last bins come in a little after their time), so nothing reads as missing
+                # that is only not in yet
+                newest = pd.to_datetime(_to_pandas(has_data)['TimeStamp'], errors='coerce').max()
+                if pd.notna(newest):
+                    newest = newest.tz_localize(None) if newest.tzinfo else newest
+                    cut = min(cut, newest.floor(f'{today_check.BIN_MINUTES}min')
+                              + pd.Timedelta(minutes=today_check.BIN_MINUTES))
+            if today_so_far:
+                # at least a bin of today
+                cut = max(cut, pd.Timestamp(report_date).normalize() + pd.Timedelta(minutes=today_check.BIN_MINUTES))
+                day_end = cut - cut.normalize()
             if expected_data_end is None or today_so_far:
                 expected_data_end = cut.to_pydatetime()
             if not today_so_far and as_of is not None and today_check.window(report_end, as_of) is not None:
@@ -1087,8 +1100,9 @@ class ReportGenerator:
         verbosity = self.config['verbosity']
         log_message("Starting signal analysis...", 1, verbosity)
         
-        # Initialize past alerts if not provided
-        if past_alerts is None:
+        # Initialize past alerts if not provided. Today so far holds nothing back: what shows today is told, a problem
+        # the report told too included (the application shows them once), so a repeat is never lost.
+        if past_alerts is None or today_so_far:
             past_alerts = {}
         for alert_type in ALERT_CONFIG:
             if alert_type not in past_alerts:
@@ -1597,10 +1611,11 @@ class ReportGenerator:
             self.config['phase_skip_retention_days'],
             detector_counts=focus_counts, signal_phases=runs, holding=holding_findings)
         if today_so_far and problems is not None and len(problems):
-            # only what today shows that no report told before: new, and last seen today
+            # only what shows today: last seen today, and the alarms and coordination holding (judged on today alone; an
+            # alarm also seen in the last six weeks is no first one, so has no LastDay)
             day = pd.Timestamp(report_date).normalize()
-            problems = problems[problems['New'].astype(bool)
-                                & (pd.to_datetime(problems['LastDay'], errors='coerce') == day)].reset_index(drop=True)
+            problems = problems[problems['Category'].isin([FOCUS_ALARMS, FOCUS_COORDINATION])
+                                | (pd.to_datetime(problems['LastDay'], errors='coerce') == day)].reset_index(drop=True)
         if report_end is not None and as_of is not None and problems is not None:
             problems = problems.copy()
             problems[today_check.TODAY_COLUMN] = (
