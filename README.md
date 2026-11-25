@@ -332,8 +332,8 @@ Pass a plain dict; every key has a default.
 | `split_failure_trend_enabled` / `platoon_ratio_trend_enabled` | `False` | Rising split failures, falling platoon ratio |
 | `ongoing_figures` / `ongoing_preempt_figures` / `ongoing_coordination_figures` | `None` | Charts per Ongoing Issues table, Ongoing preempt charts per section, Ongoing coordination groups (0: none; `None`: `figures_per_device`, `ongoing_figures`, `coordination_figures`) |
 | `timing_insights_enabled` / `timing_insights_rows` | `False` / `3` | The Timing Insights section and its rows (each with a chart) per table and report |
-| `flash_verification_enabled` | `False` | Flash alarms checked against the raw events: a flipping flash input is a review item, a flash urgent only while still on, Today for alarms |
-| `coordination_holding_enabled` | `False` | Coordination holding from the raw events: out-of-step patterns and slow transitions (`signal_problems` category `Coordination`) |
+| `flash_verification_enabled` | `True` | Flash alarms checked against the raw events: a flipping flash input is a review item, a flash urgent only while still on, Today for alarms |
+| `coordination_holding_enabled` | `True` | Coordination holding from the raw events: out-of-step patterns and slow transitions (`signal_problems` category `Coordination`) |
 | `preempt_rail_numbers` | `None` | Preempt inputs that are rail (the Rail section, longer stuck-on limit); `None` holds every preempt to the rail limit |
 | `custom_logo_path` | `None` | Logo for the PDF header |
 | `verbosity` | `1` | `0` silent, `1` info, `2` debug |

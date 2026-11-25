@@ -452,10 +452,12 @@ class PageNumCanvas(canvas.Canvas):
 
 class HeaderFooter:
     """Handles header for the PDF report"""
-    def __init__(self, logo_path: str, signal_head_path: str, region: str = None):
+    def __init__(self, logo_path: str, signal_head_path: str, region: str = None,
+                 title: str = 'Signal Health Report'):
         self.logo_path = logo_path
         self.signal_head_path = signal_head_path
         self.region = region
+        self.title = title
 
     def draw_header(self, canvas, doc):
         """Draw the header on the first page"""
@@ -476,7 +478,7 @@ class HeaderFooter:
         # Title 
         canvas.setFont('Helvetica-Bold', 24)
         canvas.setFillColor(colors.black)
-        title_text = "ATSPM Report"
+        title_text = self.title
         title_width = canvas.stringWidth(title_text, "Helvetica-Bold", 24)
         title_x = doc.width + doc.leftMargin - title_width - 0.5*inch  # Move title left to make room for icon
         canvas.drawString(title_x,
@@ -630,6 +632,8 @@ def _generate_pdf_report(
         table_row_limits: Optional[Dict[str, int]] = None,
         joke_index: int = None,
         custom_logo_path: str = None,
+        report_title: str = 'Signal Health Report',
+        all_regions_label: str = 'All Regions',
         ongoing_alerts: Optional[Dict[str, pd.DataFrame]] = None,
         ongoing_phase_figures: Optional[List[tuple[plt.Figure, str]]] = None,
         ongoing_missing_data_figures: Optional[List[tuple[plt.Figure, str]]] = None,
@@ -888,7 +892,8 @@ def _generate_pdf_report(
         header_footer = HeaderFooter(
             logo_path=logo_path if logo_path else "",
             signal_head_path=signal_head_path if signal_head_path else "",
-            region=region
+            region=region,
+            title=report_title
         )
 
         # Create document with custom canvas
@@ -942,7 +947,7 @@ def _generate_pdf_report(
         content.append(Spacer(1, 0.3*inch))
 
         # Header: Report for this region
-        content.append(Paragraph(f"{region}", styles['Title']))
+        content.append(Paragraph(all_regions_label if region == "All Regions" else f"{region}", styles['Title']))
         content.append(Spacer(1, 0.2*inch))
 
         # Introduction text: what it says of recurring issues depends on what ends up in this report.

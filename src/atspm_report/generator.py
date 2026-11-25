@@ -747,8 +747,10 @@ class ReportGenerator:
             timing_insights.CONFIG_SWITCH: False,
             timing_insights.ROWS_CONFIG: 3,
             # Checks on the raw controller events (controller_events). Off until approved.
-            'flash_verification_enabled': False,
-            coordination_holding.CONFIG_SWITCH: False,
+            'flash_verification_enabled': True,
+            coordination_holding.CONFIG_SWITCH: True,
+            'report_title': 'Signal Health Report',
+            'all_regions_label': 'All Regions',
         }
         return {**defaults, **config}
     
@@ -1743,6 +1745,8 @@ class ReportGenerator:
         # Generate PDF reports
         log_message("Generating PDF reports...", 1, verbosity)
         reports = generate_pdf_report(
+            report_title=self.config.get('report_title', 'Signal Health Report'),
+            all_regions_label=self.config.get('all_regions_label', 'All Regions'),
             report_today=today,
             filtered_df_maxouts=final_alerts['maxout'],
             filtered_df_missing_data=final_alerts['missing_data'],

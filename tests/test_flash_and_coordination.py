@@ -1,4 +1,4 @@
-"""Flash verification and coordination holding, from the raw controller events (both off by default)."""
+"""Flash verification and coordination holding, from the raw controller events (both on by default)."""
 import json
 import os
 import sys
@@ -86,7 +86,8 @@ def test_flash_verification_grades_signal_problems_and_today():
     events = _flash_rows()
     timeline = _timeline(events)
     as_of = DAY + pd.Timedelta(days=1, hours=2)
-    off = ReportGenerator({'verbosity': 0}).generate(signals=SIGNALS, timeline=timeline, controller_events=events,
+    off = ReportGenerator({'verbosity': 0, 'flash_verification_enabled': False, 'coordination_holding_enabled': False}).generate(
+        signals=SIGNALS, timeline=timeline, controller_events=events,
                                                      report_date=DAY.date(), as_of=as_of, analytics_only=True)
     assert 'KeptCycling' not in off['alarms'].columns and 'coordination_holding' not in off
     assert set(off['signal_problems']['Points']) == {4.0}      # without the switch, every MMU flash is urgent
@@ -123,7 +124,7 @@ def test_connection_mode_reads_the_raw_events_only_when_switched_on():
     con.register('t', _timeline(events))
     con.execute('CREATE TABLE timeline AS SELECT * FROM t')
     signals = pd.concat([SIGNALS, pd.DataFrame({'DeviceId': ['10'], 'Name': ['Ten'], 'Region': 'R'})])
-    assert 'controller_events' not in connection.load_inputs(con, DAY.date(), signals=signals, config={'verbosity': 0})
+    assert 'controller_events' not in connection.load_inputs(con, DAY.date(), signals=signals, config={'verbosity': 0, 'flash_verification_enabled': False, 'coordination_holding_enabled': False})
     config = {'verbosity': 0, 'flash_verification_enabled': True, 'coordination_holding_enabled': True}
     result = connection.run(con, DAY.date(), signals=signals, config=config, as_of=DAY + pd.Timedelta(days=1, hours=2),
                             analytics_only=True)
